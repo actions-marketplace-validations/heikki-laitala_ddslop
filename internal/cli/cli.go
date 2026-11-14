@@ -476,7 +476,7 @@ func openFiles(root string) (*index.DB, []index.File, index.Stats, error) {
 	if err != nil {
 		return nil, nil, stats, err
 	}
-	files, err := loadFiles(db)
+	files, err := loadFiles(root, db)
 	if err != nil {
 		_ = db.Close()
 		return nil, nil, stats, err
@@ -589,7 +589,7 @@ func check(root string, opts options) (report.Report, error) {
 		Kinds:    pattern.StringKinds(units),
 		Params:   pattern.ParameterGroups(units, decls.FuncTypes),
 		Drifts:   drifts(units, packages(root, files)),
-		Cycles:   dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files)),
+		Cycles:   dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files), opts.tests),
 	}, summary)
 	return r, recordHealth(db, root, r.Summary.Health)
 }
@@ -597,7 +597,7 @@ func check(root string, opts options) (report.Report, error) {
 // drifts finds the convention drifts in the units check analyses (no
 // generated code, test code only with --tests), each language on its own
 // (see codemap.Drifts): Go's and Rust's forms are never compared.
-func drifts(units []unit.Unit, crates map[string]string) []report.Drift {
+func drifts(units []unit.Unit, crates *codemap.Packages) []report.Drift {
 	g := &flow.Graph{Units: units}
 	var out []report.Drift
 	for _, lang := range []string{"go", "rust"} {
@@ -615,27 +615,32 @@ func drifts(units []unit.Unit, crates map[string]string) []report.Drift {
 	return out
 }
 
-// dependencyCycles finds the modules of each Rust crate calling each other
-// in a loop (see codemap.Cycles), in the code check reports on: no
-// generated files. A pair calling each other is one cycle, closed by its
-// two calls; a group with no such pair is one, closed by each step of a
-// shortest loop. A cycle any of whose calls a ddslop:ignore marks is
-// deliberate, and left out. Go packages and Rust crates cannot form one.
-func dependencyCycles(g *flow.Graph, files []index.File, crates map[string]string) []report.Cycle {
+// dependencyCycles finds the modules of each Rust crate depending on each
+// other in a loop (see codemap.Cycles), in the code check reports on: no
+// generated files, and test code only with tests. A module depends on
+// another it calls or names in a path: a constant, a type or a use is a
+// dependency as much as a call. A pair depending on each other is one
+// cycle, closed by its two sites; a group with no such pair is one, closed
+// by each step of a shortest loop. A cycle any of whose sites a
+// ddslop:ignore marks is deliberate, and left out. Go packages and Rust
+// crates cannot form one.
+func dependencyCycles(g *flow.Graph, files []index.File, crates *codemap.Packages, tests bool) []report.Cycle {
 	generated := map[string]bool{}
 	for _, f := range files {
 		generated[f.Path] = f.Generated
 	}
+	libraries := libraryCrates(files, crates)
 	var out []report.Cycle
 	for _, name := range crateNames(files, crates) {
 		in := codemap.InCrate(name, crates)
 		group := codemap.Grouping(func(u unit.Unit) string {
-			if generated[u.File] {
+			// a binary, a build script or an example is a crate of its own
+			if generated[u.File] || !inLibrary(u.File, crates, libraries) {
 				return ""
 			}
 			return in(u)
 		})
-		for _, c := range codemap.Cycles(g, group) {
+		for _, c := range codemap.Cycles(g, group, dependencies(files, crates, name, generated, libraries, tests)) {
 			for _, l := range c.Links {
 				out = appendCycle(out, g, name+"\x00"+l.A+"\x00"+l.B,
 					[]string{l.A + " -> " + l.B, l.B + " -> " + l.A}, []codemap.Site{l.AB, l.BA})
@@ -654,6 +659,82 @@ func dependencyCycles(g *flow.Graph, files []index.File, crates map[string]strin
 	return out
 }
 
+// dependencies lists what the modules of one crate's library depend on
+// besides their calls: the modules their paths name (see
+// codemap.ReferencedModule), in files order and each file's source order.
+func dependencies(files []index.File, crates *codemap.Packages, name string, generated, libraries map[string]bool, tests bool) []codemap.Dependency {
+	modules := map[string]bool{}
+	for _, f := range files {
+		if codemap.Crate(f.Path, crates) == name {
+			modules[codemap.Module(f.Path, crates)] = true
+		}
+	}
+	rootValues, selfAliases := map[string]bool{}, map[string]bool{}
+	for _, f := range files {
+		crate, rel := codemap.CratePath(f.Path, crates)
+		root := rel == "lib.rs" || rel == "main.rs" && !libraries[crate]
+		if crate != name || !root {
+			continue
+		}
+		for _, u := range f.Units {
+			if u.Module == "" && !strings.Contains(u.Name, "::") {
+				rootValues[strings.TrimPrefix(u.Name, "r#")] = true
+			}
+		}
+		for _, k := range f.Decls.Consts {
+			rootValues[strings.TrimPrefix(k.Name, "r#")] = true
+		}
+		// a name the root imports (pub use values::foo) beside its mod foo
+		// cannot be a module too: it is a value
+		for name := range f.Imports {
+			rootValues[strings.TrimPrefix(name, "r#")] = true
+		}
+		for _, r := range f.References {
+			if r.Alias != "" && (tests || !r.Test) {
+				selfAliases[r.Alias] = true
+			}
+		}
+	}
+	facts := codemap.CrateFacts{Modules: modules, RootValues: rootValues, SelfAliases: selfAliases}
+	var deps []codemap.Dependency
+	for _, f := range files {
+		if generated[f.Path] || codemap.Crate(f.Path, crates) != name || !inLibrary(f.Path, crates, libraries) {
+			continue
+		}
+		from := codemap.Module(f.Path, crates)
+		for _, r := range f.References {
+			if r.Test && !tests {
+				continue
+			}
+			if to := codemap.ReferencedModule(f.Path, crates, r, facts); to != "" && to != from {
+				deps = append(deps, codemap.Dependency{From: from, To: to, File: f.Path, Item: r.Item, Line: r.Line, Ignored: r.Ignored})
+			}
+		}
+	}
+	return deps
+}
+
+// libraryCrates returns the crates whose package has a library target
+// (src/lib.rs).
+func libraryCrates(files []index.File, crates *codemap.Packages) map[string]bool {
+	libraries := map[string]bool{}
+	for _, f := range files {
+		if crate, rel := codemap.CratePath(f.Path, crates); rel == "lib.rs" {
+			libraries[crate] = true
+		}
+	}
+	return libraries
+}
+
+// inLibrary reports whether a Rust file belongs to its package's library
+// target, whose crate:: paths name the modules Module names: a file under
+// src/, but no binary's (src/bin, or src/main.rs beside a library). A
+// build script, an example or a binary is a crate of its own.
+func inLibrary(file string, crates *codemap.Packages, libraries map[string]bool) bool {
+	crate, rel := codemap.CratePath(file, crates)
+	return rel != "" && !strings.HasPrefix(rel, "bin/") && (rel != "main.rs" || !libraries[crate])
+}
+
 // cycleGraph is the call graph cycles are found in: the non-test code's,
 // or, with --tests, that of the units check analyses, test code included.
 func cycleGraph(g *flow.Graph, root string, files []index.File, units []unit.Unit, tests bool) *flow.Graph {
@@ -663,11 +744,18 @@ func cycleGraph(g *flow.Graph, root string, files []index.File, units []unit.Uni
 	return flow.Build(graphInputs(root, true, files), units)
 }
 
-// appendCycle adds a cycle closed by the calls at sites, unless a
-// ddslop:ignore marks one of those calls or their callers.
+// appendCycle adds a cycle closed by the calls and paths at sites, unless
+// a ddslop:ignore marks one of them or the callers.
 func appendCycle(out []report.Cycle, g *flow.Graph, key string, steps []string, sites []codemap.Site) []report.Cycle {
 	c := report.Cycle{Key: key, Steps: steps}
 	for _, s := range sites {
+		if d := s.Dependency; d != nil {
+			if d.Ignored {
+				return out
+			}
+			c.Sites = append(c.Sites, report.CycleSite{Unit: unit.Unit{File: d.File, Name: d.Item}, Line: d.Line})
+			continue
+		}
 		if s.Caller < 0 || g.Units[s.Caller].Ignored {
 			return out
 		}
@@ -711,19 +799,24 @@ func wordCounts(files []index.File) map[string]int {
 // Rust workspace manifest is the one at root.
 func internalCrates(root string, files []index.File) func(file string) bool {
 	workspace := manifest(root, ".")
+	libraries := packages(root, files).Libraries
 	internal := map[string]bool{}
 	for _, f := range files {
-		dir := flow.CrateOf(f.Path)
+		dir := libraries.CrateOf(f.Path)
 		if _, done := internal[dir]; done {
 			continue
 		}
 		if languageOf(f.Path) == "go" {
 			internal[dir] = golang.Internal(f.Path, f.Decls.Package)
 		} else {
-			internal[dir] = rust.Unpublished(manifest(root, dir), workspace)
+			pkg := libraries.PackageOf(f.Path) // a placed target's crate is not its package
+			if pkg == "" {
+				pkg = dir
+			}
+			internal[dir] = rust.Unpublished(manifest(root, pkg), workspace)
 		}
 	}
-	return func(file string) bool { return internal[flow.CrateOf(file)] }
+	return func(file string) bool { return internal[libraries.CrateOf(file)] }
 }
 
 // frequentBlockNodes, frequentBlockLines and frequentBlockDuplicated keep
@@ -865,9 +958,12 @@ func parallelFlows(g *flow.Graph, traits map[string]bool, minNodes int) []report
 // test modules ("#[cfg(test)] mod name;" in a parent file) as test code:
 // their functions become test units and their imports are not
 // dependencies. Submodules of a test module are test code too.
-func loadFiles(db *index.DB) ([]index.File, error) {
+func loadFiles(root string, db *index.DB) ([]index.File, error) {
 	files, err := db.Files()
 	if err != nil {
+		return nil, err
+	}
+	if err := parseLibrariesUnderTestPaths(root, files); err != nil {
 		return nil, err
 	}
 	testFiles := map[string]bool{}
@@ -890,10 +986,39 @@ func loadFiles(db *index.DB) ([]index.File, error) {
 	return files, nil
 }
 
+// parseLibrariesUnderTestPaths parses again, as the library code they
+// are, the files of a library its manifest roots in a directory Cargo
+// otherwise keeps for tests or benches (autotests = false, path =
+// "tests/lib.rs"): indexed alone, a file there is read as test code.
+func parseLibrariesUnderTestPaths(root string, files []index.File) error {
+	libraries := packages(root, files).Libraries
+	for i, f := range files {
+		if !rust.IsTestPath(f.Path) || languageOf(f.Path) != "rust" {
+			continue
+		}
+		if _, _, _, ok := libraries.Locate(f.Path); !ok {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(root, f.Path)) //nolint:gosec // a file under the analysed root
+		if err != nil {
+			return err
+		}
+		parsed, err := parseSource(syntax.Source{Path: f.Path, Src: src})
+		if err != nil {
+			return err
+		}
+		files[i].Parsed = parsed
+	}
+	return nil
+}
+
 // markTest marks everything a file declares as test code.
 func markTest(f *index.File) {
 	for i := range f.Units {
 		f.Units[i].Test = true
+	}
+	for i := range f.References {
+		f.References[i].Test = true
 	}
 	d := &f.Decls
 	for i := range d.Structs {
@@ -934,6 +1059,13 @@ const indexPath = ".ddslop/index.db"
 // Generated code is not analysed, but the traits or interfaces it declares
 // (such as an OpenAPI server's) mark the entry points of features.
 func parseFile(path string, src []byte) (index.Parsed, error) {
+	return parseSource(syntax.Source{Path: path, Src: src, Test: rust.IsTestPath(path)})
+}
+
+// parseSource is parseFile with whether a Rust file is test code by its
+// place given (see rust.ParseAs).
+func parseSource(file syntax.Source) (index.Parsed, error) {
+	path, src := file.Path, file.Src
 	golangFile := languageOf(path) == "go"
 	if syntax.IsGenerated(src) {
 		entries := rust.Traits(src)
@@ -947,7 +1079,7 @@ func parseFile(path string, src []byte) (index.Parsed, error) {
 	if golangFile {
 		parsed.Units, parsed.Decls, err = golang.Parse(path, src)
 	} else {
-		parsed, err = parseRust(path, src)
+		parsed, err = parseRust(file)
 	}
 	for i := range parsed.Units {
 		parsed.Units[i].Signature = similarity.Signature(parsed.Units[i].Seq)
@@ -965,16 +1097,17 @@ func languageOf(path string) string {
 }
 
 // parseRust adds what only Rust files have: out-of-line test modules, the
-// traits a file declares, and its imports.
-func parseRust(path string, src []byte) (index.Parsed, error) {
-	units, decls, err := rust.Parse(path, src)
-	parsed := index.Parsed{Units: units, Decls: decls, TestModules: rust.TestModules(src)}
+// traits a file declares, its imports and the paths naming other modules.
+func parseRust(file syntax.Source) (index.Parsed, error) {
+	units, decls, err := rust.ParseAs(file)
+	parsed := index.Parsed{Units: units, Decls: decls, TestModules: rust.TestModules(file.Src),
+		Modules: rust.DeclaredModules(file.Src), References: rust.ReferencesAs(file)}
 	for _, t := range decls.Traits {
 		parsed.Traits = append(parsed.Traits, t.Name)
 	}
-	if !rust.IsTestPath(path) {
+	if !file.Test {
 		// Test files' imports are not dependencies of the code.
-		parsed.Imports = rust.Imports(src)
+		parsed.Imports = rust.Imports(file.Src)
 	}
 	return parsed, err
 }

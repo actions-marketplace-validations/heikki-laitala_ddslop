@@ -51,6 +51,7 @@ type index struct {
 	deps        map[string]map[string]bool      // crate directory -> workspace crates it imports from
 	fields      map[string]map[string]FieldType // package or crate directory -> "Struct.field" -> its type
 	modules     map[string]string               // go.mod directory -> module path
+	libraries   Libraries                       // Rust libraries moved out of src/lib.rs
 }
 
 // FieldType is a struct field's type, as unit.Call.Type writes types,
@@ -79,6 +80,9 @@ type Inputs struct {
 	RustFiles []string
 	// Impls are the Rust trait implementations of the code in the graph.
 	Impls []unit.Impl
+	// Libraries are the Rust libraries whose manifests move their root
+	// file out of src/lib.rs.
+	Libraries Libraries
 }
 
 // Build resolves every unit's calls. A call finds only functions of its
@@ -91,19 +95,19 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 			langs[ext] = &index{free: map[string][]int{}, methods: map[string][]int{}, owned: map[string][]int{}, owners: map[string]bool{},
 				impls: map[string][]string{}, rustModules: map[string]map[string]bool{},
 				crates: map[string]string{}, imports: in.Imports, deps: map[string]map[string]bool{},
-				fields: in.Fields, modules: in.Modules}
+				fields: in.Fields, modules: in.Modules, libraries: in.Libraries}
 		}
 		return langs[ext]
 	}
 	for i, u := range units {
 		ix := indexOf(u.File)
-		dir := CrateOf(u.File)
+		dir := in.Libraries.CrateOf(u.File)
 		name, ok := in.Crates[dir]
 		if !ok {
 			name = strings.ReplaceAll(filepath.Base(dir), "-", "_")
 		}
 		ix.crates[name] = dir
-		if m, ok := unitModule(u); ok {
+		if m, ok := in.Libraries.unitModule(u); ok {
 			ix.addModules(m, dir)
 		}
 		owner, name := split(u.Name)
@@ -117,7 +121,7 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 	}
 
 	for _, im := range in.Impls {
-		ix, crate := indexOf(im.File), CrateOf(im.File)
+		ix, crate := indexOf(im.File), in.Libraries.CrateOf(im.File)
 		ix.impls[im.Trait] = append(ix.impls[im.Trait], crate)
 		// impl api::Store for Disk, without a use: a dependency all the same.
 		if dir, ok := ix.crates[firstSegment(im.TraitPath)]; ok && dir != crate && strings.Contains(im.TraitPath, "::") {
@@ -128,12 +132,12 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 		}
 	}
 	for _, file := range in.RustFiles {
-		if m, ok := moduleOf(file); ok {
-			indexOf(file).addModules(m, CrateOf(file))
+		if m, ok := in.Libraries.ModuleOf(file); ok {
+			indexOf(file).addModules(m, in.Libraries.CrateOf(file))
 		}
 	}
 	for file, imported := range in.Imports {
-		ix, crate := indexOf(file), CrateOf(file)
+		ix, crate := indexOf(file), in.Libraries.CrateOf(file)
 		for _, path := range imported {
 			if dir, ok := ix.crates[firstSegment(path)]; ok && dir != crate {
 				if ix.deps[crate] == nil {
@@ -249,7 +253,7 @@ func (r *callResolver) resolveCall(c unit.Call) (int, bool) {
 					if strings.HasSuffix(producer.File, ".rs") {
 						return r.ix.resolveRust(r.units, r.caller, home, typ, c.Name)
 					}
-					return r.ix.resolveTyped(r.units, CrateOf(producer.File), typ, c.Name)
+					return r.ix.resolveTyped(r.units, r.ix.libraries.CrateOf(producer.File), typ, c.Name)
 				}
 				if u, known := resolve(); known {
 					return u, false
@@ -277,7 +281,7 @@ func (ix index) resolve(units []unit.Unit, caller unit.Unit, owner string, c uni
 		}
 		typ, home = ix.followFields(typ, home, c.Field)
 	default:
-		typ = ix.fields[CrateOf(caller.File)][owner+"."+c.Field].Type
+		typ = ix.fields[ix.libraries.CrateOf(caller.File)][owner+"."+c.Field].Type
 	}
 	switch {
 	case typ == "":
@@ -286,7 +290,7 @@ func (ix index) resolve(units []unit.Unit, caller unit.Unit, owner string, c uni
 			return u, false
 		}
 	default:
-		if u, known := ix.resolveTyped(units, CrateOf(caller.File), typ, c.Name); known {
+		if u, known := ix.resolveTyped(units, ix.libraries.CrateOf(caller.File), typ, c.Name); known {
 			return u, false
 		}
 	}
@@ -316,16 +320,16 @@ func (ix index) resolveRust(units []unit.Unit, caller, home unit.Unit, typ, meth
 	if !ix.owners[name] || !inRepo {
 		return -1, true
 	}
-	cands := slices.DeleteFunc(slices.Clone(ix.owned[name+"::"+method]), func(u int) bool { return CrateOf(units[u].File) != dir })
+	cands := slices.DeleteFunc(slices.Clone(ix.owned[name+"::"+method]), func(u int) bool { return ix.libraries.CrateOf(units[u].File) != dir })
 	// Two types of one name in a crate: the module the path names (db::Db
 	// read in server is server::db's; a bare name, home's own module;
 	// b::foo::Db is crate b's foo's).
 	module, named := "", true
 	switch root := firstSegment(typ); {
-	case dir == CrateOf(home.File) || pathKeyword(root):
-		module, _ = unitModule(home)
+	case dir == ix.libraries.CrateOf(home.File) || pathKeyword(root):
+		module, _ = ix.libraries.unitModule(home)
 		if i := strings.LastIndex(typ, "::"); i >= 0 {
-			module = modulePath(typ[:i], home)
+			module = ix.libraries.modulePath(typ[:i], home)
 		}
 	case ix.crates[root] == dir:
 		module = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSuffix(typ, name), root), "::")
@@ -334,14 +338,14 @@ func (ix index) resolveRust(units []unit.Unit, caller, home unit.Unit, typ, meth
 		named = false
 	}
 	if named {
-		if u := inModule(units, cands, dir, module); u >= 0 {
+		if u := ix.libraries.inModule(units, cands, dir, module); u >= 0 {
 			return u, true
 		}
 	}
 	// The path fixed the crate, which a value's type may come from without
 	// the caller depending on it (b::make_c() returns c's type): prefer
 	// the caller's file, else take the crate's only candidate.
-	u := pickLocal(units, caller, cands)
+	u := ix.libraries.pickLocal(units, caller, cands)
 	if u < 0 {
 		u = only(units, cands, func(unit.Unit) bool { return true })
 	}
@@ -366,12 +370,12 @@ func (ix index) resolveTrait(units []unit.Unit, trait, dir, method string) (int,
 		}
 	}
 	cands := slices.DeleteFunc(slices.Clone(ix.methods[method]), func(u int) bool {
-		return units[u].Trait != trait || !sees(CrateOf(units[u].File))
+		return units[u].Trait != trait || !sees(ix.libraries.CrateOf(units[u].File))
 	})
 	if len(cands) < impls {
 		// An implementation leaves the method to the trait's default.
 		cands = append(cands, slices.DeleteFunc(slices.Clone(ix.owned[trait+"::"+method]), func(u int) bool {
-			return units[u].Trait != "" || CrateOf(units[u].File) != dir
+			return units[u].Trait != "" || ix.libraries.CrateOf(units[u].File) != dir
 		})...)
 	}
 	switch len(cands) {
@@ -426,7 +430,7 @@ func (ix index) followFields(typ string, home unit.Unit, path string) (string, u
 // is outside.
 func (ix index) crateOfPath(path string, caller unit.Unit) (string, bool) {
 	if !strings.Contains(path, "::") {
-		return CrateOf(caller.File), true
+		return ix.libraries.CrateOf(caller.File), true
 	}
 	root := firstSegment(path)
 	if dir, ok := ix.crates[root]; ok && !pathKeyword(root) {
@@ -434,7 +438,7 @@ func (ix index) crateOfPath(path string, caller unit.Unit) (string, bool) {
 	}
 	// model::Client: a child module of the caller's, else another crate.
 	if pathKeyword(root) || ix.isChildModule(caller, root) {
-		return CrateOf(caller.File), true
+		return ix.libraries.CrateOf(caller.File), true
 	}
 	return "", false
 }
@@ -463,8 +467,8 @@ func (ix index) addModules(module, crate string) {
 
 // unitModule returns the module a Rust unit is in within its crate: its
 // file's module, and the inline module it is declared in inside the file.
-func unitModule(u unit.Unit) (string, bool) {
-	module, ok := moduleOf(u.File)
+func (l Libraries) unitModule(u unit.Unit) (string, bool) {
+	module, ok := l.ModuleOf(u.File)
 	switch {
 	case !ok || u.Module == "":
 	case module == "":
@@ -484,29 +488,46 @@ func moduleOf(file string) (string, bool) {
 	if !strings.HasSuffix(file, ".rs") || !ok {
 		return "", false
 	}
-	segments := strings.Split(strings.TrimSuffix(rest, ".rs"), "/")
-	switch last := segments[len(segments)-1]; {
-	case last == "mod":
-		segments = segments[:len(segments)-1]
-	case len(segments) == 1 && (last == "lib" || last == "main"):
-		segments = nil
+	if rest == "lib.rs" || rest == "main.rs" {
+		return "", true
 	}
-	return strings.Join(segments, "::"), true
+	return modulePathOf(rest), true
+}
+
+// modulePathOf returns the module path of a file's path within its
+// crate's source directory: a/b.rs and a/b/mod.rs are a::b.
+func modulePathOf(rel string) string {
+	segments := strings.Split(strings.TrimSuffix(rel, ".rs"), "/")
+	if segments[len(segments)-1] == "mod" {
+		segments = segments[:len(segments)-1]
+	}
+	return strings.Join(segments, "::")
 }
 
 // modulePath returns the module a Rust path in the caller's crate names,
 // from the module the caller is in: crate::a::b names a::b, self::x the
 // file's module's x, super::x (super::super::x) its parent's
 // (grandparent's), and a relative x its child x.
-func modulePath(path string, caller unit.Unit) string {
-	here, _ := unitModule(caller)
+func (l Libraries) modulePath(path string, caller unit.Unit) string {
+	here, _ := l.unitModule(caller)
+	if resolved, ok := ResolvePath(path, here); ok {
+		return resolved
+	}
+	return joinModule(here, path)
+}
+
+// ResolvePath returns the module path a Rust path rooted at crate, self or
+// super names, read from the module here it is written in: crate::a::b is
+// a::b, self::x is here's x, super::x (super::super::x) its parent's
+// (grandparent's). ok is false for a path with no such root.
+func ResolvePath(path, here string) (resolved string, ok bool) {
 	root, rest, _ := strings.Cut(path, "::")
 	switch root {
 	case "crate":
-		return rest
+		return rest, true
 	case "super":
 		for {
-			here = parentModule(here)
+			here = parentOf(here, "::", "")
 			next, more, found := strings.Cut(rest, "::")
 			if next != "super" {
 				break
@@ -518,8 +539,13 @@ func modulePath(path string, caller unit.Unit) string {
 		}
 	case "self":
 	default:
-		rest = path
+		return "", false
 	}
+	return joinModule(here, rest), true
+}
+
+// joinModule joins a module path and a path within it.
+func joinModule(here, rest string) string {
 	switch {
 	case here == "":
 		return rest
@@ -529,20 +555,22 @@ func modulePath(path string, caller unit.Unit) string {
 	return here + "::" + rest
 }
 
-// parentModule returns a module path's parent: "" for a top module.
-func parentModule(module string) string {
-	if i := strings.LastIndex(module, "::"); i >= 0 {
-		return module[:i]
+// parentOf returns the parent of a path whose parts sep separates, or none
+// for a path of one part: a module's parent (crate::a for crate::a::b) or
+// a file's directory.
+func parentOf(path, sep, none string) string {
+	if i := strings.LastIndex(path, sep); i >= 0 {
+		return path[:i]
 	}
-	return ""
+	return none
 }
 
 // inModule returns the only candidate in the crate directory whose file
 // is the module, or -1.
-func inModule(units []unit.Unit, cands []int, dir, module string) int {
+func (l Libraries) inModule(units []unit.Unit, cands []int, dir, module string) int {
 	return only(units, cands, func(u unit.Unit) bool {
-		m, ok := unitModule(u)
-		return ok && CrateOf(u.File) == dir && m == module
+		m, ok := l.unitModule(u)
+		return ok && l.CrateOf(u.File) == dir && m == module
 	})
 }
 
@@ -550,14 +578,14 @@ func inModule(units []unit.Unit, cands []int, dir, module string) int {
 // caller is in: a relative path (bar::read) names one of those, or a
 // crate.
 func (ix index) isChildModule(caller unit.Unit, name string) bool {
-	module, ok := unitModule(caller)
+	module, ok := ix.libraries.unitModule(caller)
 	if !ok {
 		return false
 	}
 	if module != "" {
 		name = module + "::" + name
 	}
-	return ix.rustModules[CrateOf(caller.File)][name]
+	return ix.rustModules[ix.libraries.CrateOf(caller.File)][name]
 }
 
 // resolveTyped resolves a Go method call on an operand of type typ
@@ -580,7 +608,7 @@ func (ix index) resolveTyped(units []unit.Unit, home, typ, method string) (int, 
 			return -1, true
 		}
 	}
-	u := only(units, ix.owned[name+"::"+method], func(u unit.Unit) bool { return CrateOf(u.File) == dir })
+	u := only(units, ix.owned[name+"::"+method], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
 	return u, u >= 0
 }
 
@@ -632,24 +660,24 @@ func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, 
 		root := firstSegment(c.Qualifier)
 		dir, ok := ix.crates[root]
 		switch {
-		case ok && dir != CrateOf(caller.File):
+		case ok && dir != ix.libraries.CrateOf(caller.File):
 			// acme_auth::tokens::verify: the module after the crate's name.
 			_, module, _ := strings.Cut(c.Qualifier, "::")
-			if u := inModule(units, ix.free[c.Name], dir, module); u >= 0 {
+			if u := ix.libraries.inModule(units, ix.free[c.Name], dir, module); u >= 0 {
 				return u
 			}
-			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return CrateOf(u.File) == dir })
+			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
 		case strings.HasSuffix(caller.File, ".go"):
 			return -1 // Go qualifies only with package names: an outside package
 		case ok, pathKeyword(root), ix.isChildModule(caller, root):
 			// The path names a module of the caller's crate: its function,
 			// else (a re-export, say) the crate's only one of that name,
 			// never the caller's own file's by preference.
-			if u := inModule(units, ix.free[c.Name], CrateOf(caller.File), modulePath(c.Qualifier, caller)); u >= 0 {
+			if u := ix.libraries.inModule(units, ix.free[c.Name], ix.libraries.CrateOf(caller.File), ix.libraries.modulePath(c.Qualifier, caller)); u >= 0 {
 				return u
 			}
-			crate := CrateOf(caller.File)
-			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return CrateOf(u.File) == crate })
+			crate := ix.libraries.CrateOf(caller.File)
+			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == crate })
 		}
 		return -1
 	case unit.MethodCall:
@@ -670,7 +698,7 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 			return -1
 		}
 	}
-	if u := pickLocal(units, caller, ix.free[name]); u >= 0 {
+	if u := ix.libraries.pickLocal(units, caller, ix.free[name]); u >= 0 {
 		return u
 	}
 	path, ok := ix.imports[caller.File][name]
@@ -683,13 +711,13 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 	}
 	root := firstSegment(path)
 	if pathKeyword(root) {
-		return pickLocal(units, caller, ix.free[target])
+		return ix.libraries.pickLocal(units, caller, ix.free[target])
 	}
 	dir, ok := ix.crates[root]
 	if !ok {
 		return -1 // an outside crate, such as tokio
 	}
-	return only(units, ix.free[target], func(u unit.Unit) bool { return CrateOf(u.File) == dir })
+	return only(units, ix.free[target], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
 }
 
 // pick chooses among candidates the one in the caller's file, else the
@@ -697,21 +725,27 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 // the caller's crate imports from; -1 when the best tier is empty or
 // ambiguous. Code cannot call into a crate it does not depend on.
 func (ix index) pick(units []unit.Unit, caller unit.Unit, cands []int) int {
-	if u := pickLocal(units, caller, cands); u >= 0 {
+	if u := ix.libraries.pickLocal(units, caller, cands); u >= 0 {
 		return u
 	}
-	deps := ix.deps[CrateOf(caller.File)]
-	return only(units, cands, func(u unit.Unit) bool { return deps[CrateOf(u.File)] })
+	deps := ix.deps[ix.libraries.CrateOf(caller.File)]
+	return ix.libraries.onlyIn(units, cands, func(crate string) bool { return deps[crate] })
 }
 
 // pickLocal chooses the candidate in the caller's file, else the only one
 // in the caller's crate, or -1.
-func pickLocal(units []unit.Unit, caller unit.Unit, cands []int) int {
+func (l Libraries) pickLocal(units []unit.Unit, caller unit.Unit, cands []int) int {
 	if u := only(units, cands, func(u unit.Unit) bool { return u.File == caller.File }); u >= 0 {
 		return u
 	}
-	crate := CrateOf(caller.File)
-	return only(units, cands, func(u unit.Unit) bool { return CrateOf(u.File) == crate })
+	here := l.CrateOf(caller.File)
+	return l.onlyIn(units, cands, func(crate string) bool { return crate == here })
+}
+
+// onlyIn returns the single candidate whose crate directory in accepts,
+// or -1.
+func (l Libraries) onlyIn(units []unit.Unit, cands []int, in func(crate string) bool) int {
+	return only(units, cands, func(u unit.Unit) bool { return in(l.CrateOf(u.File)) })
 }
 
 // only returns the single candidate accepted by keep, or -1 when there is
@@ -742,6 +776,157 @@ func firstSegment(path string) string {
 // type: Rust modules are lower case, types upper case.
 func isModule(segment string) bool {
 	return segment != "" && !unicode.IsUpper(rune(segment[0]))
+}
+
+// Libraries maps the root file of each Rust library whose manifest moves
+// it out of src/lib.rs ([lib] path) to the crate directory holding the
+// manifest. Files under the root file's directory are that library's
+// modules, as files under src/ are a default library's.
+type Libraries struct {
+	// Roots maps each moved library's root file to its crate directory.
+	Roots map[string]string
+	// Packages are every package's directory: a moved library's files
+	// never reach into another package.
+	Packages map[string]bool
+	// Targets are the files of the targets manifests place themselves
+	// ([[bin]], [[example]], [[test]], [[bench]] paths), each mapped to its
+	// target's root file: the root, the modules it declares (x.rs, and x/
+	// for a directory, ending in /), and the directory of a main.rs root.
+	Targets map[string]string
+}
+
+// CrateOf is the package CrateOf, knowing the libraries.
+func (l Libraries) CrateOf(file string) string {
+	if crate, _, _, ok := l.Locate(file); ok {
+		return crate
+	}
+	if target := l.targetOf(filepath.ToSlash(file)); target != "" {
+		return target // a target the manifest places: a crate of its own
+	}
+	if pkg := l.MovedPackage(file); pkg != "" {
+		// another target of the package: a crate of its own, apart from
+		// the library's (src for its binary, build.rs for its build script)
+		if pkg == "." {
+			first, _, _ := strings.Cut(filepath.ToSlash(file), "/")
+			return first
+		}
+		first, _, _ := strings.Cut(strings.TrimPrefix(filepath.ToSlash(file), pkg+"/"), "/")
+		return pkg + "/" + first
+	}
+	return CrateOf(file)
+}
+
+// targetOf returns the root file of the target a manifest places that a
+// file belongs to (see Targets), or "": the file itself, else the deepest
+// directory holding it.
+func (l Libraries) targetOf(file string) string {
+	if root := l.Targets[file]; root != "" {
+		return root
+	}
+	found, depth := "", -1
+	for entry, root := range l.Targets {
+		if strings.HasSuffix(entry, "/") && strings.HasPrefix(file, entry) && strings.Count(entry, "/") > depth {
+			found, depth = root, strings.Count(entry, "/")
+		}
+	}
+	return found
+}
+
+// MovedPackage returns the directory of the package a Rust file belongs
+// to, its nearest, when that package's library is a moved one, or "".
+func (l Libraries) MovedPackage(file string) string {
+	if !strings.HasSuffix(file, ".rs") {
+		return "" // a Go package keeps its directory
+	}
+	pkg := l.PackageOf(file)
+	for _, crate := range l.Roots {
+		if pkg != "" && crate == pkg {
+			return pkg
+		}
+	}
+	return ""
+}
+
+// PackageOf returns the directory of the package a file belongs to, the
+// nearest one holding it, or "" for none.
+func (l Libraries) PackageOf(file string) string {
+	for d := parentOf(filepath.ToSlash(file), "/", "."); ; d = parentOf(d, "/", ".") {
+		if l.Packages[d] {
+			return d
+		}
+		if d == "." {
+			return ""
+		}
+	}
+}
+
+// ModuleOf is moduleOf, knowing the libraries: a moved library's root
+// file is its crate's root, and the files beside and below it are its
+// modules, as files under src/ are a default library's.
+func (l Libraries) ModuleOf(file string) (string, bool) {
+	_, rel, root, ok := l.Locate(file)
+	switch {
+	case !ok:
+		return moduleOf(file)
+	case root:
+		return "", true
+	}
+	return modulePathOf(rel), true
+}
+
+// owns reports whether a file under the directory of a moved library's
+// root file, dir, is that library's: not in another package nested in its
+// crate's, nor one of that package's other Cargo targets (a binary, a
+// build script, an example, a test or a bench) outside the library's own
+// directory. A library moved out of src/ leaves src/ to the package's
+// binary.
+func (l Libraries) owns(file, dir, crate string) bool {
+	for d := parentOf(file, "/", "."); d != crate && d != "."; d = parentOf(d, "/", ".") {
+		if l.Packages[d] {
+			return false
+		}
+	}
+	within := func(p string) string {
+		if crate == "." {
+			return p
+		}
+		return strings.TrimPrefix(p, crate+"/")
+	}
+	rel, home := within(file), within(dir)+"/"
+	if rel == "build.rs" || rel == "src/main.rs" || l.targetOf(file) != "" {
+		return false
+	}
+	// A target directory is another target's, unless the manifest roots
+	// the library in it (autoexamples = false, path = "examples/lib.rs").
+	for _, target := range []string{"src/bin/", "examples/", "benches/", "tests/"} {
+		if strings.HasPrefix(rel, target) && !strings.HasPrefix(home, target) {
+			return false
+		}
+	}
+	inSrc := within(dir) == "src" || strings.HasPrefix(within(dir), "src/")
+	return inSrc || !strings.HasPrefix(rel, "src/")
+}
+
+// Locate returns the moved library a Rust file belongs to, the one whose
+// root file's directory is the deepest holding it: its crate directory,
+// the file's path within that directory, and whether it is the root file.
+func (l Libraries) Locate(file string) (crate, rel string, root, ok bool) {
+	file = filepath.ToSlash(file)
+	if !strings.HasSuffix(file, ".rs") {
+		return "", "", false, false
+	}
+	depth := -1
+	for r, c := range l.Roots {
+		dir := parentOf(r, "/", ".")
+		inside, found := file, dir == "."
+		if !found {
+			inside, found = strings.CutPrefix(file, dir+"/")
+		}
+		if found && strings.Count(dir, "/") > depth && (file == r || l.owns(file, dir, c)) {
+			crate, rel, root, ok, depth = c, inside, file == r, true, strings.Count(dir, "/")
+		}
+	}
+	return crate, rel, root, ok
 }
 
 // CrateOf returns the crate directory of a file: for Rust the path before

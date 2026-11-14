@@ -894,7 +894,7 @@ func TestModulePathFollowsSelfSuperAndChildren(t *testing.T) {
 		{"child", "x/src/a.rs", "a::child"},
 		{"child", "x/src/lib.rs", "child"},
 	} {
-		if got := modulePath(c.path, unit.Unit{File: c.file}); got != c.want {
+		if got := (Libraries{}).modulePath(c.path, unit.Unit{File: c.file}); got != c.want {
 			t.Errorf("modulePath(%q, %q) = %q, want %q", c.path, c.file, got, c.want)
 		}
 	}
@@ -1165,5 +1165,171 @@ func TestRustTraitImplsWrittenWithTheCratePathCount(t *testing.T) {
 	}
 	if got := callees(Build(in, units), "api/src/server.rs Server::run"); got != "[]" {
 		t.Errorf("Server::run calls %s, want nothing: two implementations", got)
+	}
+}
+
+// svc's manifest roots its library at lib/core.rs instead of src/lib.rs.
+var movedLibrary = Libraries{Roots: map[string]string{"svc/lib/core.rs": "svc"}}
+
+func TestALibraryMovedOutOfSrcKeepsItsCrateAndModules(t *testing.T) {
+	for file, want := range map[string]string{
+		"svc/lib/core.rs":         "svc",
+		"svc/lib/store/client.rs": "svc",
+		"svc/src/main.rs":         "svc",
+		"other/src/lib.rs":        "other",
+	} {
+		if got := movedLibrary.CrateOf(file); got != want {
+			t.Errorf("CrateOf(%s) = %s, want %s", file, got, want)
+		}
+	}
+	for file, want := range map[string]string{
+		"svc/lib/core.rs":         "",
+		"svc/lib/config.rs":       "config",
+		"svc/lib/store/mod.rs":    "store",
+		"svc/lib/store/client.rs": "store::client",
+		"other/src/a/b.rs":        "a::b",
+	} {
+		if got, ok := movedLibrary.ModuleOf(file); !ok || got != want {
+			t.Errorf("ModuleOf(%s) = %q, %v, want %q", file, got, ok, want)
+		}
+	}
+}
+
+func TestCratePathsResolveInALibraryMovedOutOfSrc(t *testing.T) {
+	g := Build(Inputs{Libraries: movedLibrary}, []unit.Unit{
+		fn("svc/lib/core.rs", "version"),
+		fn("svc/lib/config.rs", "load"),
+		fn("other/src/config.rs", "load"),
+		fn("svc/lib/store/client.rs", "open", path("crate::config", "load"), path("crate", "version")),
+	})
+	if got, want := callees(g, "svc/lib/store/client.rs open"), "[svc/lib/config.rs load svc/lib/core.rs version]"; got != want {
+		t.Errorf("open calls %s, want %s", got, want)
+	}
+}
+
+// A library rooted at its package's top (core.rs) claims only its own
+// files: not the package's other Cargo targets, nor a nested package.
+func TestALibraryRootedAtItsPackageTopClaimsOnlyItsFiles(t *testing.T) {
+	l := Libraries{
+		Roots:    map[string]string{"svc/core.rs": "svc", "core.rs": "."},
+		Packages: map[string]bool{".": true, "svc": true, "svc/member": true, "crates/x": true},
+	}
+	for file, want := range map[string]bool{
+		"svc/core.rs":           true,
+		"svc/store.rs":          true,
+		"svc/store/client.rs":   true,
+		"svc/src/main.rs":       false,
+		"svc/src/cli.rs":        false,
+		"svc/src/bin/tool.rs":   false,
+		"svc/build.rs":          false,
+		"svc/examples/demo.rs":  false,
+		"svc/tests/api.rs":      false,
+		"svc/benches/b.rs":      false,
+		"svc/member/src/lib.rs": false,
+		"crates/x/src/lib.rs":   false,
+		"store.rs":              true,
+		"src/main.rs":           false,
+	} {
+		if _, _, _, got := l.Locate(file); got != want {
+			t.Errorf("Locate(%s) found = %v, want %v", file, got, want)
+		}
+	}
+	if got := l.CrateOf("svc/member/src/lib.rs"); got != "svc/member" {
+		t.Errorf("CrateOf(nested member) = %s, want its own crate", got)
+	}
+}
+
+// A library its manifest roots inside a target directory (autoexamples =
+// false, path = "examples/lib.rs") owns that directory: the configured
+// root wins over the target-directory rules.
+func TestALibraryRootedInATargetDirectoryOwnsIt(t *testing.T) {
+	l := Libraries{
+		Roots:    map[string]string{"svc/examples/lib.rs": "svc"},
+		Packages: map[string]bool{"svc": true},
+	}
+	for file, want := range map[string]bool{
+		"svc/examples/lib.rs":         true,
+		"svc/examples/store.rs":       true,
+		"svc/examples/store/inner.rs": true,
+		"svc/tests/api.rs":            false,
+	} {
+		if _, _, _, got := l.Locate(file); got != want {
+			t.Errorf("Locate(%s) found = %v, want %v", file, got, want)
+		}
+	}
+}
+
+// A file a moved library rejects is another target's: it neither shares
+// the library's crate nor answers its crate:: calls.
+func TestFilesAMovedLibraryRejectsAreAnotherCrate(t *testing.T) {
+	l := Libraries{Roots: map[string]string{"svc/core.rs": "svc"}, Packages: map[string]bool{"svc": true}}
+	for _, file := range []string{"svc/src/cli.rs", "svc/src/main.rs", "svc/build.rs"} {
+		if got := l.CrateOf(file); got == "svc" {
+			t.Errorf("CrateOf(%s) = svc, want a crate apart from the library's", file)
+		}
+	}
+	g := Build(Inputs{Libraries: l}, []unit.Unit{
+		fn("svc/core.rs", "start", path("crate::cli", "run")),
+		fn("svc/src/cli.rs", "run"),
+		fn("svc/src/main.rs", "main", path("crate::cli", "run")),
+	})
+	if got := callees(g, "svc/core.rs start"); got != "[]" {
+		t.Errorf("the library's crate::cli::run resolved to %s, want nothing: cli is the binary's", got)
+	}
+	if got := callees(g, "svc/src/main.rs main"); got != "[svc/src/cli.rs run]" {
+		t.Errorf("the binary's crate::cli::run resolved to %s, want its own cli", got)
+	}
+}
+
+// A moved library's package rules are for its Rust files: Go packages in
+// the same directory keep their own.
+func TestGoFilesBesideAMovedLibraryKeepTheirPackages(t *testing.T) {
+	l := Libraries{Roots: map[string]string{"svc/core.rs": "svc"}, Packages: map[string]bool{"svc": true}}
+	for file, want := range map[string]string{"svc/go/api/h.go": "svc/go/api", "svc/go/store/s.go": "svc/go/store"} {
+		if got := l.CrateOf(file); got != want {
+			t.Errorf("CrateOf(%s) = %s, want its Go package %s", file, got, want)
+		}
+	}
+}
+
+// A target its manifest places beside a moved library ([[bin]] path =
+// "tool.rs") is not the library's, nor is the directory of one below it.
+func TestTargetsAManifestPlacesBesideAMovedLibraryAreNotIts(t *testing.T) {
+	l := Libraries{
+		Roots:    map[string]string{"svc/core.rs": "svc"},
+		Packages: map[string]bool{"svc": true},
+		Targets: map[string]string{
+			"svc/tool.rs": "svc/tool.rs", "svc/cli.rs": "svc/tool.rs", "svc/cli/": "svc/tool.rs",
+			"svc/tools/run/main.rs": "svc/tools/run/main.rs", "svc/tools/run/": "svc/tools/run/main.rs",
+		},
+	}
+	for file, want := range map[string]bool{
+		"svc/store.rs":          true,
+		"svc/tool.rs":           false,
+		"svc/cli.rs":            false,
+		"svc/cli/args.rs":       false,
+		"svc/tools/run/main.rs": false,
+		"svc/tools/run/cli.rs":  false,
+	} {
+		if _, _, _, got := l.Locate(file); got != want {
+			t.Errorf("Locate(%s) found = %v, want %v", file, got, want)
+		}
+	}
+}
+
+// Each target a manifest places is a crate of its own, though two share a
+// top directory.
+func TestEachPlacedTargetIsACrateOfItsOwn(t *testing.T) {
+	l := Libraries{
+		Roots:    map[string]string{"pkg/core.rs": "pkg"},
+		Packages: map[string]bool{"pkg": true},
+		Targets: map[string]string{
+			"pkg/tools/admin/main.rs": "pkg/tools/admin/main.rs", "pkg/tools/admin/": "pkg/tools/admin/main.rs",
+			"pkg/tools/worker/main.rs": "pkg/tools/worker/main.rs", "pkg/tools/worker/": "pkg/tools/worker/main.rs",
+		},
+	}
+	admin, worker := l.CrateOf("pkg/tools/admin/db.rs"), l.CrateOf("pkg/tools/worker/db.rs")
+	if admin == worker || admin == "pkg" {
+		t.Errorf("CrateOf = %s and %s, want two crates apart from each other and the library", admin, worker)
 	}
 }

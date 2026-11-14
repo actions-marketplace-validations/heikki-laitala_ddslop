@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -323,7 +324,7 @@ func buildMap(root, lang string, files []index.File, opts mapOptions) (mapJSON, 
 		}
 		m.Breaks = append(m.Breaks, bj)
 	}
-	m.Cycles = cyclesJSON(g, codemap.Cycles(g, layerGroup), limit)
+	m.Cycles = cyclesJSON(g, codemap.Cycles(g, layerGroup, nil), limit)
 	helpers := codemap.Helpers(g, helperGroup, g.Entries(traits))
 	for _, h := range helpers[:min(limit, len(helpers))] {
 		u := g.Units[h.Unit]
@@ -397,10 +398,14 @@ func located(u unit.Unit) string {
 	return fmt.Sprintf("%s:%d %s", u.File, u.StartLine, u.Name)
 }
 
-// packages maps the directories under root holding a package's Cargo.toml
-// to the crate's name, for every directory above a Rust file.
-func packages(root string, files []index.File) map[string]string {
-	out := map[string]string{}
+// packages finds the packages under root holding a Rust file: each
+// directory above one holding a Cargo.toml, with the crate's name, and the
+// libraries whose manifests move their root file out of src/lib.rs.
+func packages(root string, files []index.File) *codemap.Packages {
+	var placed []string // the root files of targets manifests place
+	out := &codemap.Packages{Names: map[string]string{}, Libraries: flow.Libraries{
+		Roots: map[string]string{}, Packages: map[string]bool{}, Targets: map[string]string{},
+	}}
 	seen := map[string]bool{}
 	for _, f := range files {
 		if languageOf(f.Path) != "rust" {
@@ -408,24 +413,65 @@ func packages(root string, files []index.File) map[string]string {
 		}
 		for dir := filepath.Dir(f.Path); !seen[dir]; dir = filepath.Dir(dir) {
 			seen[dir] = true
-			if name := rust.CrateName(manifest(root, dir)); name != "" {
-				out[filepath.ToSlash(dir)] = name
+			manifest := manifest(root, dir)
+			if name := rust.CrateName(manifest); name != "" {
+				out.Names[filepath.ToSlash(dir)] = name
+				out.Libraries.Packages[filepath.ToSlash(dir)] = true
+				for _, target := range rust.TargetPaths(manifest) {
+					placed = append(placed, path.Join(filepath.ToSlash(dir), target))
+				}
+				if lib := rust.LibPath(manifest); lib != "" && path.Clean(lib) != "src/lib.rs" {
+					out.Libraries.Roots[path.Join(filepath.ToSlash(dir), lib)] = filepath.ToSlash(dir)
+				}
 			}
 			if dir == "." || dir == string(filepath.Separator) {
 				break
 			}
 		}
 	}
+	addTargets(out.Libraries, placed, files)
 	return out
+}
+
+// addTargets maps each placed target's files to its root file (see
+// flow.Libraries.Targets): the root, the modules it declares beside it,
+// and the directory of a main.rs root, unless a library is rooted there.
+func addTargets(libraries flow.Libraries, roots []string, files []index.File) {
+	declared := map[string][]string{}
+	for _, f := range files {
+		declared[filepath.ToSlash(f.Path)] = f.Modules
+	}
+	libraryDirs := map[string]bool{}
+	for root := range libraries.Roots {
+		libraryDirs[path.Dir(root)] = true
+	}
+	for _, root := range roots {
+		dir := path.Dir(root)
+		libraries.Targets[root] = root
+		if path.Base(root) == "main.rs" && !libraryDirs[dir] {
+			libraries.Targets[dir+"/"] = root
+		}
+		for _, m := range declared[root] {
+			if strings.HasSuffix(m, ".rs") { // #[path = "commands/run.rs"]
+				libraries.Targets[path.Join(dir, m)] = root
+				if path.Base(m) == "mod.rs" {
+					libraries.Targets[path.Join(dir, path.Dir(m))+"/"] = root
+				}
+				continue
+			}
+			libraries.Targets[path.Join(dir, m+".rs")] = root
+			libraries.Targets[path.Join(dir, m)+"/"] = root
+		}
+	}
 }
 
 // crateNames returns the crates of the Rust files outside test paths,
 // sorted: a crate of only types or constants is a crate too, though no
 // function of it is in the call graph.
-func crateNames(files []index.File, crates map[string]string) []string {
+func crateNames(files []index.File, crates *codemap.Packages) []string {
 	var names []string
 	for _, f := range files {
-		if c := codemap.Crate(f.Path, crates); c != "" && !rust.IsTestPath(f.Path) {
+		if c := codemap.Crate(f.Path, crates); c != "" && !isTestFile(f.Path, crates) {
 			names = append(names, c)
 		}
 	}
@@ -433,8 +479,15 @@ func crateNames(files []index.File, crates map[string]string) []string {
 	return slices.Compact(names)
 }
 
+// isTestFile reports whether a Rust file holds tests by its place, unless
+// a manifest roots its library there (see rust.IsTestPath).
+func isTestFile(file string, crates *codemap.Packages) bool {
+	_, _, _, library := crates.Libraries.Locate(file)
+	return rust.IsTestPath(file) && !library
+}
+
 // crateSummary counts a crate's modules and the layers they form.
-func crateSummary(g *flow.Graph, crates map[string]string, name string) crateJSON {
+func crateSummary(g *flow.Graph, crates *codemap.Packages, name string) crateJSON {
 	in := codemap.InCrate(name, crates)
 	var modules []string
 	for _, u := range g.Units {
@@ -444,7 +497,7 @@ func crateSummary(g *flow.Graph, crates map[string]string, name string) crateJSO
 	}
 	slices.Sort(modules)
 	cycled := 0
-	for _, c := range codemap.Cycles(g, in) {
+	for _, c := range codemap.Cycles(g, in, nil) {
 		cycled += len(c.Modules)
 	}
 	return crateJSON{Name: name, Modules: len(slices.Compact(modules)), Layers: len(codemap.Layers(g, in).Layers), CycleModules: cycled}

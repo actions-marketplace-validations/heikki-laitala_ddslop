@@ -750,12 +750,19 @@ func Units(path string, src []byte) ([]unit.Unit, error) {
 // other declarations, in source order. Declarations inside functions are
 // not seen.
 func Parse(path string, src []byte) ([]unit.Unit, unit.Decls, error) {
+	return ParseAs(syntax.Source{Path: path, Src: src, Test: IsTestPath(path)})
+}
+
+// ParseAs is Parse with whether the file is test code by its place (see
+// IsTestPath) given: a library a manifest roots under tests/ is not.
+func ParseAs(file syntax.Source) ([]unit.Unit, unit.Decls, error) {
+	path, src := file.Path, file.Src
 	var units []unit.Unit
 	var decls unit.Decls
 	var marked error
 	err := syntax.Parse(language, src, func(root *sitter.Node) {
 		e := extractor{path: path, src: src, uses: map[[2]uint]map[string]string{}}
-		e.walk(root, scope{}, IsTestPath(path), nil)
+		e.walk(root, scope{}, file.Test, nil)
 		units, decls = e.units, e.decls
 		marked = syntax.MarkIgnored(root, src, units, &decls)
 	})
@@ -1760,25 +1767,86 @@ func isUpper(name string) bool {
 // Cargo.toml: the [lib] name if set, otherwise the [package] name, with
 // dashes as underscores. It returns "" when there is no package.
 func CrateName(cargoToml []byte) string {
-	section := ""
-	names := map[string]string{} // section -> name
-	for line := range strings.Lines(string(cargoToml)) {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "[") {
-			section = strings.Trim(line, "[] ")
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "name" || (section != "package" && section != "lib") {
-			continue
-		}
-		names[section] = strings.Trim(strings.TrimSpace(value), `"'`)
-	}
-	name := names["lib"]
+	name := manifestValue(cargoToml, "lib", "name")
 	if name == "" {
-		name = names["package"]
+		name = manifestValue(cargoToml, "package", "name")
 	}
 	return strings.ReplaceAll(name, "-", "_")
+}
+
+// tableHeader returns the table a TOML line opens ([lib], [[bin]]), its
+// comment left out, or false for a line that opens none.
+func tableHeader(line string) (string, bool) {
+	if !strings.HasPrefix(line, "[") {
+		return "", false
+	}
+	header, _, _ := strings.Cut(line, "#")
+	return strings.Trim(strings.TrimSpace(header), "[] "), true
+}
+
+// tomlString returns a TOML value as written: a quoted string's contents,
+// up to its closing quote, or a bare value up to a comment.
+func tomlString(value string) string {
+	if value != "" && (value[0] == '"' || value[0] == '\'') {
+		if end := strings.IndexByte(value[1:], value[0]); end >= 0 {
+			return value[1 : 1+end]
+		}
+	}
+	bare, _, _ := strings.Cut(value, "#")
+	return strings.TrimSpace(bare)
+}
+
+// manifestValue returns a string key's value in one section of a
+// Cargo.toml, unquoted, or "" when the section does not set it.
+func manifestValue(cargoToml []byte, section, key string) string {
+	if values := manifestValues(cargoToml, key, section); len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// manifestValues returns a string key's values in the given sections of a
+// Cargo.toml, unquoted, in manifest order: an array of tables ([[bin]])
+// repeats its section.
+func manifestValues(cargoToml []byte, key string, sections ...string) []string {
+	var out []string
+	current := ""
+	for line := range strings.Lines(string(cargoToml)) {
+		line = strings.TrimSpace(line)
+		if header, ok := tableHeader(line); ok {
+			current = header
+			continue
+		}
+		k, value, ok := strings.Cut(line, "=")
+		if ok && slices.Contains(sections, current) && strings.TrimSpace(k) == key {
+			out = append(out, tomlString(strings.TrimSpace(value)))
+		}
+	}
+	return out
+}
+
+// DeclaredModules returns the modules a file declares out of line (mod
+// name;), at its top level, in source order: each one's name, or the file
+// a #[path] attribute places it in, ending in .rs.
+func DeclaredModules(src []byte) []string {
+	return outOfLineModules(src, func(name string, attrs []string) string {
+		for _, attr := range attrs {
+			if file, ok := pathAttribute(attr); ok {
+				return file
+			}
+		}
+		return name
+	})
+}
+
+// pathAttribute returns the file a #[path = "..."] attribute names.
+func pathAttribute(attr string) (string, bool) {
+	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(attr, "#["), "]"))
+	key, value, ok := strings.Cut(inner, "=")
+	if !ok || strings.TrimSpace(key) != "path" {
+		return "", false
+	}
+	return tomlString(strings.TrimSpace(value)), true
 }
 
 // TestModules returns the names of the modules a file declares out of
@@ -1787,6 +1855,18 @@ func CrateName(cargoToml []byte) string {
 //
 // Only declarations at the top level of the file are considered.
 func TestModules(src []byte) []string {
+	return outOfLineModules(src, func(name string, attrs []string) string {
+		if slices.ContainsFunc(attrs, isCfgTest) {
+			return name
+		}
+		return ""
+	})
+}
+
+// outOfLineModules returns, for the modules a file declares out of line at
+// its top level, what entry makes of each one's name and attributes, ""
+// leaving it out.
+func outOfLineModules(src []byte, entry func(name string, attrs []string) string) []string {
 	var names []string
 	_ = syntax.Parse(language, src, func(root *sitter.Node) {
 		var attrs []string
@@ -1798,9 +1878,11 @@ func TestModules(src []byte) []string {
 				continue
 			case child.IsExtra():
 				continue
-			case child.Kind() == "mod_item" && child.ChildByFieldName("body") == nil && slices.ContainsFunc(attrs, isCfgTest):
+			case child.Kind() == "mod_item" && child.ChildByFieldName("body") == nil:
 				if name := child.ChildByFieldName("name"); name != nil {
-					names = append(names, name.Utf8Text(src))
+					if e := entry(name.Utf8Text(src), attrs); e != "" {
+						names = append(names, e)
+					}
 				}
 			}
 			attrs = nil
@@ -1830,8 +1912,8 @@ func publishValue(manifest []byte, want string) string {
 	section := ""
 	for line := range strings.Lines(string(manifest)) {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "[") {
-			section = strings.Trim(line, "[] ")
+		if header, ok := tableHeader(line); ok {
+			section = header
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
@@ -1848,4 +1930,17 @@ func publishValue(manifest []byte, want string) string {
 		}
 	}
 	return ""
+}
+
+// TargetPaths returns the paths a Cargo.toml sets for its other targets'
+// root files ([[bin]], [[example]], [[test]], [[bench]]), relative to the
+// package, in manifest order.
+func TargetPaths(cargoToml []byte) []string {
+	return manifestValues(cargoToml, "path", "bin", "example", "test", "bench")
+}
+
+// LibPath returns the [lib] path a Cargo.toml sets for its library's root
+// file, relative to the package, or "" when it keeps Cargo's default.
+func LibPath(cargoToml []byte) string {
+	return manifestValue(cargoToml, "lib", "path")
 }

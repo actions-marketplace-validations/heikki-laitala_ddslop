@@ -1345,7 +1345,7 @@ gathered once, by the detectors that exist; `map` describes it and
 | Kinds and states | `string-kinds` matches, enums | the enum, or the strings flagged | `string-kinds`; `convention-drift` for strings matched where the enum exists |
 | Parameter groups | `parameter-group` | the groups flagged; a struct that already holds a group is not recognised yet, so this concern has no conventional or drift state | `parameter-group` |
 | Errors | per-adapter error forms (section 4) | the form of each error concern | `convention-drift` |
-| Layers | the module graph | the layers, and the cycles they collapse | `dependency-cycle` for modules of a Rust crate calling each other in a loop; `convention-drift` for bypasses |
+| Layers | the module graph | the layers, and the cycles they collapse | `dependency-cycle` for modules of a Rust crate depending on each other in a loop, by calls or paths; `convention-drift` for bypasses |
 | Helpers | the call graph, clone groups | the shared helpers, a helper with copies flagged | the clone candidate |
 
 Every occurrence of a concern is exactly one of:
@@ -1492,7 +1492,22 @@ crate's modules), which names each file once.
   under `src/` (`acme_orders::store`), `lib.rs` and `main.rs` being the
   crate itself, and a crate at the repository root (`src/` at the top)
   unnamed (`store`), whatever its manifest says, so adding a root
-  `build.rs` renames nothing. Modules are those with functions: a module
+  `build.rs` renames nothing. A library whose manifest moves its root
+  file (`[lib] path = "lib/core.rs"`, read by `rust.LibPath`) keeps its
+  modules beside that file instead: `lib/store/client.rs` is
+  `acme_orders::store`, and `lib/core.rs` the crate itself. The same
+  libraries (`flow.Libraries`) place its files in their crate for call
+  resolution, which otherwise reads a crate from where `src/` is, so
+  `crate::` calls between them resolve; without them such a library had
+  no modules at all. Its files stop at its package: a nested package's,
+  and the package's other Cargo targets (`src/main.rs`, `src/bin/`,
+  `build.rs`, `examples/`, `tests/`, `benches/`, and all of `src/` when
+  the library is outside it), are not the library's: they are a crate
+  apart for call resolution and have no module of the library's crate.
+  A library rooted under `tests/` or `benches/` (auto-discovery off) is
+  parsed again as the production code it is, since the index reads a
+  file there as test code by its place alone.
+  Modules are those with functions: a module
   of only types or constants takes part in no call, so it has no place
   in the layers, and placing it on top as a source would be wrong.
 - Only calls that name their callee count: `f()`, `Type::f()`,
@@ -1608,6 +1623,27 @@ which call is the wrong way. Generated files are left out, and a
 `ddslop:ignore` on one of the calls marks a deliberate pair. Measured:
 25 candidates on the 739k-line workspace and 10 on the 188k-line
 service, among them the configuration and store pair.
+
+A call graph sees only calls, and modules depend on each other through
+more than calls: in a 726k-line Rust workspace, two modules read each
+other's constants and called nothing, and a third added methods to a
+type of a module that called it.
+So `check` adds every path a module writes naming another module of its
+crate (`rust.References`: `crate::`, `super::` and `self::` paths in
+code, types, `use` declarations and macro arguments, a `pub(in ..)`
+visibility excepted) as an edge beside the calls
+(`codemap.ReferencedModule` resolves `super` and `self` from the file's
+place in the crate and its inline module; a path naming an item of the
+root module names the root; only the library target's files count,
+since a binary, a build script or an example is a crate of its own,
+whose `crate::` names its own modules). A site is a call where one makes the edge, else the first line
+naming the module, under the item it is written in; test code counts only
+with `--tests`, and a `ddslop:ignore` on the line leaves the cycle out.
+A `pub use` re-export is no dependency: a crate root re-exporting its
+children while they use its items is Rust's facade, not a cycle.
+The map's cycles stay those of calls, as its layers are. Measured on
+that workspace: 139 candidates where calls alone gave 31, the constants
+pair among them.
 
 Section 3 is built for its flagged families only (`codemap.Features`,
 `features` in JSON). Each `parallel-flow` family `check` reports, found

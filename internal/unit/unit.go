@@ -130,6 +130,39 @@ type Scope struct {
 	Nodes int
 }
 
+// Reference is a path naming another module of the same crate, such as
+// crate::store::Endpoint or super::config::load: a dependency on that
+// module whether or not it calls a function there, as a constant, a type
+// or a use does too. Rust only.
+type Reference struct {
+	// Path is the reference's leading segments, up to the first name
+	// after crate, self and super: "crate::store", "super::super::config".
+	Path string
+	Line int
+	// Module is the inline module the path is written in within its file
+	// (outer::inner), "" for none: where super and self are read from.
+	Module string
+	// Item is the item the path is written in, named as a unit is
+	// (Type::method) or by its own name (a constant, a type), or "use".
+	Item string
+	// Leaf is true when the path ends at its last segment outside a use
+	// (crate::foo, not crate::foo::Bar): it may name a value of the module
+	// it is in rather than a module of that name. A use imports every
+	// namespace of a name, so its paths are never leaves.
+	Leaf bool
+	// Macro is true when the path is a macro's (crate::foo!()): macros
+	// are never modules.
+	Macro bool
+	// Relative is true for a path beginning with a name its file does not
+	// bind (root::foo): it names the crate only through an alias the
+	// crate's root declares (extern crate self as root).
+	Relative bool
+	// Alias, on a crate's root file, is a name extern crate self as Alias
+	// gives the crate in every module.
+	Alias         string
+	Test, Ignored bool
+}
+
 // CallKind says how a call names its callee.
 type CallKind int
 
