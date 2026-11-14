@@ -311,14 +311,23 @@ are left out, since they may satisfy an interface. The rule "the
 arguments are the parameters, in order, as is or borrowed" lives once in
 `syntax.PassesOn`; the per-grammar rest of wrapper detection and of the
 grammar hooks stays per adapter until a third language (extract on the
-third occurrence), recorded in ddslop's own baseline. Go functions also
+third occurrence), marked `ddslop:ignore` in ddslop's own code. Go functions also
 record their parameters (a `context.Context` left out: Go passes it
 explicitly and never stores it in a struct, so it is never part of a
 parameter object) and their switches on strings (`case "a", "b":`), so
 parameter groups and string kinds work for Go; methods are left out of
 parameter groups, as they may implement an interface whose signature they
-must keep. On a 100-file Go service, every raw group hinged on a Context
-or an HTTP handler's dictated signature, so none remain.
+must keep, and so are functions with the parameter and result types of
+a function type their package declares outside test code (`type command func(args
+[]string, stdout, stderr io.Writer) int`): they are its values, such as a
+command table's commands. The whole signature must match, a Context
+included, and aliases (`type visit = func(path string)`) count. A type in
+another package may only share the spelling of its types, so it dictates
+nothing; spellings are compared as written, as parameter groups compare
+them, so two files of a package importing different packages under one
+name can still be confused. On a 100-file
+Go service, every raw group hinged on a Context or an HTTP handler's
+dictated signature, so none remain.
 
 Feature flows work for Go too. A generated file's interfaces give the
 entry points: Go implements interfaces implicitly, so a method named like
@@ -330,6 +339,55 @@ on the code's one `Header` method; on the Go service that dropped 72 of
 795 name-resolved calls that had pointed at the wrong function. That
 service has 37 entry points and no parallel flows: its handlers are thin
 and delegate to different services.
+
+Go method calls resolve by type where the code states it. The adapter
+records the type of a method call's operand (`unit.Call.Type`) when it
+is a parameter or named result, a `var x T`, or a variable set from a composite literal
+(`x := T{}`, `&T{}`, `var x = T{}`), qualified by the file's imports
+(`example.com/app/store.DB`), and the field for a call on a receiver's
+field (`s.store.Save()`, `unit.Call.Field`), whose type comes from the
+struct's declaration (`Decls.FieldTypes`), qualified by its own file's
+imports; a test file's fields are left out. Variables keep to their
+lexical scope: a block, statement or function literal that declares one
+restores the outer one when it ends, an outer variable assigned in a
+nested scope is unknown after it (the scope may not have run), though
+each branch of an `if` or `switch` starts from the types before the
+statement, a variable shadowing the receiver or an imported package
+makes calls on it ordinary method calls (type-switch aliases and select
+receives included), a type parameter is no type, and a declaration
+takes effect
+after its value, so `x = x.Reset()` calls `Reset` on the old `x`. Such a call resolves to that type's
+method in its package: the directory its import path names under the
+`go.mod` whose module path starts it (the longest, for nested modules),
+or the `go.mod` above the analysed directory when it is inside a module.
+It counts as named, not guessed. A type from outside the repository's
+modules (`*sql.DB`, `strings.Builder`) resolves to nothing rather than
+to a repository method of the same name; a repository type without the
+method, such as an interface, and any type in a repository with no
+`go.mod`, fall back to the guess by name.
+A variable set from a call (`db, err := store.Open(..)`, or `var db =
+store.Open(..)`) and a chained call (`s.Store().Save()`) take the type
+of the producing call's result at their position: the adapter records
+each function's result types (`Unit.Results`, as operand types are
+written) and, on the method call, which call produced the operand
+(`unit.Call.From`, `Result`). The graph resolves the producing call
+first, then the method on that result type, read in the producing
+function's package when written without one. A producing call that does
+not resolve, such as a standard-library one, leaves the operand untyped.
+
+On the Go service this resolved 882 of 2820 calls (723 before, some of
+them guesses): the store package, which handlers and the dashboard reach
+through fields, moved from the second layer to the bottom, and the map's
+shared helpers went from 1 to 7, all store methods both callers use. It
+also let `check` see two parallel flows: ingesting, updating and pushing
+a memory run one pipeline (real), and getting and deleting a document
+share only a thin handler's shape (arguable). On ddslop, 752 of 3058
+(742): `pattern` moved under `codemap`, which calls it. Typing variables
+set from a call then resolved 896 calls on the Go service (882) and 779
+of 3089 on ddslop (765): the service's `main`, which builds the store
+with `pg, err := store.NewPostgres(..)`, joined `api` and the dashboard
+as a caller of its shared methods (`CreateAPIKey`, `EnsureTenant`,
+`AllTenantIDs`); layers and `check` stayed the same.
 
 Setup-teardown is not built for Go: `defer x.Close()` is Go's own idiom
 for it (18 times in that service, 2 in ddslop), and transactions, the
@@ -650,13 +708,27 @@ duplication, and are dropped below a threshold.
 - Test code is skipped by default and counted in the summary (`test_units`);
   `--tests` includes it. In Rust, test code is a function with a test
   attribute (`#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case]`), a
-  function in a `#[cfg(test)]` module, a function in a `tests/` or
+  function, `impl` block or struct marked `#[cfg(test)]`, a function in
+  a `#[cfg(test)]` module, a function in a `tests/` or
   `benches/` directory or a `tests.rs` module, or a function in the file
   of an out-of-line test module declared in its parent
-  (`#[cfg(test)] mod real_ledger;`) and in that module's submodules.
-  a large Rust codebase has 124 such declarations. Analysing tests separately with
-  looser thresholds comes later, since table-driven tests are intentionally
-  repetitive.
+  (`#[cfg(test)] mod real_store;`) and in that module's submodules.
+  a large Rust codebase has 124 such declarations. Without `--tests`, test
+  code is still checked for one thing: helpers copied between test files.
+  A test helper is test code that is no test case (`Unit.TestCase`: a
+  function with a test attribute, or Go's `TestXxx`, `BenchmarkXxx`,
+  `FuzzXxx` and `ExampleXxx` in a test file), such as a fixture, a fake's
+  method or a builder; exact and renamed copies of one in at least two
+  files are reported at 80 nodes (`minTestHelperNodes`, or `--min-nodes`
+  when larger), and the helpers count as analysed code in the health
+  figures. Test cases,
+  near misses, blocks and constants stay out, as tests repeat on purpose.
+  Measured on a 739k-line Rust workspace: 297 groups of helper copies at
+  50 nodes, the smallest mostly one-line fakes and accessors, and 156 at
+  80, 124 of them across files, such as a 33-line event builder in three test files and one
+  fixture in three crates' test support; with everything in test code
+  checked (`--tests`) it reports about 3,300 candidates against 819.
+  ddslop itself had four JSON decoders repeating one in its tests.
 
 ### Additional detectors
 
@@ -807,9 +879,11 @@ and its fallback idiom for a concern is the proposal's pattern.
   pattern `parameter-object`; Fowler's "introduce parameter object"): the
   same parameters, names and types, taken by at least 4 functions, at
   least 3 of them. Trait methods are left out, since the trait dictates
-  their parameters. For each set of functions sharing 3 parameters, the
-  group is everything they share, so no group repeats inside a larger one
-  taken by the same functions; then groups sharing 2 parameters are one
+  their parameters, and so are Go functions whose parameter and result
+  types are those of a function type their package declares, its values. For each
+  set of functions sharing 3 parameters, the group is everything they
+  share, so no group repeats inside a larger one taken by the same
+  functions; then groups sharing 2 parameters are one
   concept, represented by the largest (an ingest context taken as four
   overlapping groups of three or four of its fields). The candidate lists
   the parameters in `values`. Measured: 32 and 60 raw groups became 15
@@ -864,29 +938,135 @@ that crosses it.
   caller's type. Other paths fall back to free functions only when the
   qualifier is a module (lower case), so `Utc::now()` does not resolve to
   a repository function named `now`; a module path naming a workspace
-  crate (`acme_token_credentials::is_canonical_key_id`) resolves into that
-  crate, any other into the caller's own.
-- `self.m()` resolves to the caller's type. `x.m()` resolves only when one
-  method of that name exists, and never for common standard-library method
-  names (`as_ref`, `len`, `push`, `find`, `collect`, ...): on
-  a large Rust codebase, resolving those by uniqueness put `ModelId::as_ref`
-  into 80 feature slices.
+  crate (`acme_auth::verify_token`) resolves into that crate, and one
+  rooted in `crate`, `self`, `super` or one of the caller's crate's
+  modules into the caller's crate: a relative root names a child of the
+  caller's module (from the crate root, `bar` only when `src/bar.rs`
+  exists, not `src/foo/bar.rs`), by the module paths of the crate's
+  files. The adapter
+  writes a root imported where the call is (`use crate::util as
+  helpers`) as its import's path. Any other root is an outside crate's:
+  `std::fs::read` never resolves to the crate's own `read`. Before that
+  rule, such calls linked modules that never call each other. Of the
+  free functions with the called name, the one in the module the path
+  names wins (`crate::store::endpoint` is `store.rs`'s `endpoint`, not
+  `config.rs`'s); a function re-exported from elsewhere falls back to
+  the crate's only one of that name. Before, a name several modules
+  define (`plan`, `resolve`, `new`) stayed unresolved, or went to the
+  caller's own file's: on the 739k-line workspace, naming the module
+  resolved 362 more calls and found 4 more real cycles. On a
+  188k-line Rust service 206 of 6,736 resolved calls were of this kind,
+  and on a 739k-line workspace 41. A type path in a call
+  (`chrono::Utc::now()`) keeps to its crate, as a typed method call
+  does.
+- `self.m()` resolves to the caller's type. `x.m()` on a value whose type
+  the code states resolves as `Type::m()` does: a parameter (`store: &mut
+  Store`, `Self`), a typed `let` or one bound to a struct literal, a
+  field chain from the impl, a typed variable or a call's result
+  (`self.ctx.db.query()`, `req.store.get()`, `make().inner.run()`, each
+  field's type read where its struct is declared, in its file and inline
+  module, and of two types of one name in a crate the one in the module
+  the path names, `b::foo::Db` crate `b`'s `foo`), or
+  a value built by a call (`let s = Store::new()`, `Db::connect().await?`,
+  a chained `Store::open()?.get()`, also through `map_err`, `context`,
+  `unwrap` or `expect`, the last two unwrapping as `?` does, when the
+  repository defines no method of that name for the value; an adapter
+  or a `?` after a field unwraps the field (`make().inner.unwrap().run()`,
+  `self.inner.unwrap().run()`, `self.ctx?.db.query()`, each field
+  recording what unwrapping leaves of it): its own
+  `unwrap` is a call like any other, with its own result). For the last, each function records
+  its result types (`Unit.Results`): as returned, and what a `?` leaves,
+  the type inside a `Result` or `Option`; an `async fn` returns a future,
+  of no type here, and records apart what its `.await` and `.await?`
+  give, so a future's own methods (`make().map(..)`) never reach its
+  output's. The graph resolves the producing call first, unless
+  it was only guessed, and reads the result's path where the producer is
+  (`Self` and `crate::` are the producer's crate). The
+  adapter strips references and looks through `Box`, `Arc` and `Rc`, gives
+  a trait object (`dyn Store + Send`, `impl Store`) or a type parameter
+  (`S: Store`, also in a `where` clause) its trait's path when one trait
+  that is no marker (`Send`, `Clone`, `'static`) bounds it, and
+  primitives, closures (`Fn(u8)`) and other type parameters no type. A
+  call on a trait (its type marked as one, so a struct of the name is
+  not taken for it) reaches the method of the trait's only non-test
+  implementation in its crate or a crate importing from it, or the
+  trait's default when that implementation leaves it out; with several,
+  which one runs is not known, and the call resolves to nothing rather
+  than to a method guessed by its name. A method neither the trait nor
+  an implementation declares (a supertrait's) is guessed by its name, as
+  supertraits are not followed. It
+  drops a
+  variable's type where a `let`, a pattern (`match`, `if let`, `for`) or a
+  closure parameter shadows it, until its block ends, except that `Some(x)`
+  or `Ok(x)` (in `if let`, `while let`, a let-else or a `match` arm) binds
+  what a `?` leaves of the call it matches, or of a variable holding one
+  (`if let Some(s) = find()`), unless an imported variant of another
+  enum is named so; a `let` takes effect
+  after its value, a `for` pattern in its body alone, and an `if let`'s
+  or `while let`'s bindings from right after their value (so later
+  operands of a let chain see them), not in an `else`. A field whose struct name two modules of a crate
+  declare with different types, or one of them with none it can tell
+  (`db: T`), is unknown. A type keeps its path,
+  qualified by the `use` imports visible where it is written (its
+  module's, not a parent module's, and, in a function's body, those of
+  each enclosing block): `Client` imported from reqwest is
+  `reqwest::Client`, and `m::Client` after `use crate::model as m` is
+  `crate::model::Client`. A bare name is then the caller's crate's own
+  type (a glob import, `use b::*`, is not followed). A path rooted in a
+  workspace crate, in
+  `crate`, `self` or `super`, or in one of the caller's crate's modules
+  (`model::Client`, by the paths of all its files and the inline `mod x
+  { .. }` blocks holding functions, each function recording the inline
+  module it is in, `Unit.Module`) resolves in that crate alone;
+  one rooted anywhere else is an outside crate's, and calls on it, as on
+  a type with no methods in the repository (`Vec`, `Option`, serde's
+  `Value`), resolve to nothing. An untyped `x.m()`, or one on a repository
+  type without that method (a trait's default, perhaps), resolves only
+  when one method of that name exists, and never for common
+  standard-library method names (`as_ref`, `len`, `push`, `find`,
+  `collect`, ...): on a large Rust codebase, resolving those by
+  uniqueness put one identifier type's `as_ref` into 80 feature slices.
 - Outside its own crate, a call resolves only into workspace crates the
   caller's crate imports from in its code, not in its tests: a crate used
   only as a dev-dependency is not a dependency.
 - Crates are named as code names them, from `Cargo.toml` (`[lib] name`,
   else `[package] name`, dashes as underscores), not after their
-  directory: `crates/token-credentials` is `acme_token_credentials`.
+  directory: `crates/auth` is `acme_auth`.
 - Calls inside macros are not visible.
 
 On a large Rust codebase these rules left 13 distinct cross-crate links
-in feature slices, all into crates the services really use
-(`token-credentials`, `traces`, the translation crates). Before them,
+in feature slices, all into crates the services really use (its
+credential, tracing and protocol-translation crates). Before them,
 about half of 134 cross-crate links were wrong.
 
 On a large Rust codebase, 84% of free calls to repository functions
 resolve; most unresolved method and path calls are standard-library calls
 whose names the repository also defines.
+
+Typing method calls, measured on the 739k-line Rust workspace: most
+method calls with a stated operand type are on types from outside the
+repository (`Vec` 1,009, `Option` 849, serde's `Value`, maps,
+`Formatter`), which no longer get guessed. Resolved calls went from
+13,770 to 14,322 of 73,038. In its largest crate (138 modules) the
+layers went from 15 to 12, the shared helpers gained methods reached
+through fields, and three upward calls appeared, each a real cycle
+between two modules that call each other: in two of them a low-level
+module calls a method of a type a module above it defines, on a value
+it holds. Whether the map shows the weaker direction of such a cycle
+as a break depends on the weights of both, so one of them came and went
+as review fixes changed which calls resolve. `check` reported the same
+candidates. Typing values built by calls then resolved 14,524 calls
+(14,322); the layers, breaks, helpers and `check` stayed the same.
+Following field chains past the impl's own fields, each type read where
+its struct is declared, resolved 129 more on the workspace (14,891 to
+15,020) and 45 on the service, and showed two more real cycles, each
+reached through a field of a typed variable. Typing values of a trait
+and binding `Some(x)` and `Ok(x)` to what unwrapping a call leaves
+resolved 109 more calls by type rather than by name alone there
+(13,607 to 13,716) and 13 on the service (2,769 to 2,782); with calls
+on traits of several implementations no longer guessed, all resolved
+calls went from 15,057 to 15,085. `check` reported the same
+candidates.
 
 ### Entry points
 
@@ -904,7 +1084,7 @@ As built: entry points are methods implementing a trait declared in a
 generated file, which covers OpenAPI-generated server traits (the index
 keeps each file's declared traits, including generated files'). On
 a large Rust codebase that finds 189 entry points, including the 81
-operations of its development mock ledger. `ddslop flows` lists each entry
+operations of a development mock service. `ddslop flows` lists each entry
 point and its slice (breadth first, `--depth`, default 6; test code is left
 out), as text or JSON.
 
@@ -989,12 +1169,13 @@ comparison adds about 0.35 s to a warm check there.
 ## Map layer
 
 Sections 1 and 2 are built (`internal/codemap`, `ddslop map` with text
-and JSON output; see As built below), and section 3 in part: the
+and JSON output; see As built below), section 1 with the cycles its
+layers collapse, and section 3 in part: the
 flagged `parallel-flow` families, as measurement left the other two
 rules nothing real to report yet. Section 4 is built for error checks
-and error wrapping in Go and Rust, and section 5 for drift from those
-idioms; their other concerns and sources, Markdown output and `--lang`
-are planned.
+and error wrapping in Go and Rust and error values in Rust, and section
+5 for drift from those idioms, and `--lang`; their other concerns and
+sources and Markdown output are planned.
 
 The fragment and flow layers find copies after they are written. Most of
 them were written because the agent did not know how the codebase already
@@ -1164,7 +1345,7 @@ gathered once, by the detectors that exist; `map` describes it and
 | Kinds and states | `string-kinds` matches, enums | the enum, or the strings flagged | `string-kinds`; `convention-drift` for strings matched where the enum exists |
 | Parameter groups | `parameter-group` | the groups flagged; a struct that already holds a group is not recognised yet, so this concern has no conventional or drift state | `parameter-group` |
 | Errors | per-adapter error forms (section 4) | the form of each error concern | `convention-drift` |
-| Layers | the module graph | the layers | `convention-drift` (upward calls, bypasses) |
+| Layers | the module graph | the layers, and the cycles they collapse | `dependency-cycle` for modules of a Rust crate calling each other in a loop; `convention-drift` for bypasses |
 | Helpers | the call graph, clone groups | the shared helpers, a helper with copies flagged | the clone candidate |
 
 Every occurrence of a concern is exactly one of:
@@ -1220,18 +1401,18 @@ The JSON output for one language, shortened:
   "resolved_calls": 43800,
   "layers": [
     {"depth": 0, "modules": ["api::handlers"]},
-    {"depth": 1, "modules": ["ledger::service"]},
-    {"depth": 2, "modules": ["ledger::store"]}
+    {"depth": 1, "modules": ["orders::service"]},
+    {"depth": 2, "modules": ["orders::store"]}
   ],
   "breaks": [
-    {"kind": "bypass", "from": "api::handlers", "to": "ledger::store",
-     "via": "ledger::service", "calls": 3, "usual_calls": 40,
+    {"kind": "bypass", "from": "api::handlers", "to": "orders::store",
+     "via": "orders::service", "calls": 3, "usual_calls": 40,
      "functions": ["api/src/handlers.rs:212 refund_status"]}
   ],
   "helpers": [
-    {"name": "with_tx", "file": "ledger/src/store.rs", "line": 31,
+    {"name": "with_tx", "file": "orders/src/store.rs", "line": 31,
      "signature": "pub async fn with_tx<T, F>(pool: &Pool, f: F) -> Result<T>",
-     "modules": ["api::handlers", "billing::service", "ledger::service"]}
+     "modules": ["api::handlers", "billing::service", "orders::service"]}
   ],
   "features": [
     {"pipeline": "handle_write", "example": "create_order", "members": 6},
@@ -1240,7 +1421,7 @@ The JSON output for one language, shortened:
   ],
   "idioms": [
     {"concern": "scopes", "convention": "closure-helper", "share": 0.9,
-     "example": "ledger/src/store.rs:31 with_tx", "others": 6},
+     "example": "orders/src/store.rs:31 with_tx", "others": 6},
     {"concern": "kinds", "convention": null, "flagged": "string-kinds",
      "pattern": "enum", "candidates": 3}
   ]
@@ -1289,7 +1470,9 @@ uses, and `ddslop map` prints them per language (`{"maps": [...]}`, each
 map with `lang`, `scope`, `calls` and `resolved_calls` counts as in
 `flows`, `layers`, `unplaced`, `breaks` and `helpers`), each list capped
 by `--limit` (default 10; left-out modules are counted in `more` and
-`unplaced_more`).
+`unplaced_more`). `--lang go` or `--lang rust` prints that language's map
+alone (an empty list when it has no code there), and `--crate` with
+`--lang go` is refused, as a crate is Rust's.
 
 The map has two levels for Rust. A workspace is described by crate
 (`"scope": "crates"`): the layers the crates form, the breaks between
@@ -1306,7 +1489,7 @@ crate's modules), which names each file once.
 
 - A Go module is the package directory; a Rust module is the crate's
   name (as `flows` reads it from `Cargo.toml`) with the module directly
-  under `src/` (`acme_ledger::store`), `lib.rs` and `main.rs` being the
+  under `src/` (`acme_orders::store`), `lib.rs` and `main.rs` being the
   crate itself, and a crate at the repository root (`src/` at the top)
   unnamed (`store`), whatever its manifest says, so adding a root
   `build.rs` renames nothing. Modules are those with functions: a module
@@ -1315,12 +1498,15 @@ crate's modules), which names each file once.
 - Only calls that name their callee count: `f()`, `Type::f()`,
   `module::f()` and calls on `self`. A call `x.m()` that the call graph
   resolved because one repository method is named `m` (marked in
-  `Graph.ByName`) is left out: on `lens-artifact-hub` such guesses made
+  `Graph.ByName`) is left out: on the 188k-line Rust service such guesses made
   `Option::or`, `bool::then`, a query builder's `.name()`, a middleware
   chain's `next.run()` and reqwest's `.build()` look like shared helpers.
-  The price is real methods reached the same way (`to_hex`, `is_open`),
-  and in Go most calls between packages, which go through methods on
-  struct fields, so Go layers are shallow until the call graph has types.
+  The price is real methods reached the same way, such as a hash's
+  `to_hex`.
+  A call on an operand whose type the code states counts (see Parsing
+  and language adapters, and the Rust rules under Symbol index and call
+  graph), so calls through struct fields and parameters shape the
+  layers, in Go also through values built by a call.
 - A module no counted call goes to or comes from is unplaced (listed
   apart): nothing says where it belongs, and as a source it would land
   on top. Types-only crates are most of them.
@@ -1350,34 +1536,78 @@ Then on the reference codebases, by module, before the crate view:
 
 | Codebase | Layers | Unplaced | Breaks | Helpers |
 | --- | --- | --- | --- | --- |
-| `lns-inference-router` (739k lines of Rust) | 19 | 31 | 3: 2 real cycles, 1 arguable | 25 listed, all real |
-| `lens-artifact-hub` (188k lines of Rust) | 9 | 18 | 0 | 25 listed, all real |
-| `searchbox` (103 Go files) | 4 | 0 | 0 | 1, real |
+| A Rust workspace (739k lines) | 19 | 31 | 3: 2 real cycles, 1 arguable | 25 listed, all real |
+| A Rust service (188k lines) | 9 | 18 | 0 | 25 listed, all real |
+| A Go service (103 files) | 4 | 0 | 0 | 1, real |
 
-The breaks judged real are two dependency cycles between modules
-(`realtime` reaching into `hosting::plan` while `hosting` calls
-`realtime`; `generator` calling `client_generator`, which uses
-`generator::CodeGenerator`); the arguable one is `startup`, the
-composition root, constructing a `batch` value directly. Before calls
+The breaks judged real are two dependency cycles between modules (a
+realtime module reaching into a hosting module's plan while the hosting
+module calls it; a code generator calling a client generator that uses
+the first generator's type); the arguable one is the composition root
+constructing a batch value directly. Before calls
 by method name were left out, 6 of the 25 helpers listed on
-`lens-artifact-hub` were such guesses, and before the bypass target had
+the Rust service were such guesses, and before the bypass target had
 to be reached from the skipped layer alone, ddslop reported `rust`
 calling `unit` past `syntax`.
 
-The 19 layers came almost all from one crate, `lns_ledger` (138 modules
-over 18 layers; every other crate had 5 or fewer), so the global module
-view mixed the architecture between crates with one crate's insides. By
-crate, `lns-inference-router` has 5 layers of 17 crates (the services
-`lns_insights` and `lns_price_controller` on top, then `lns_ledger` and
-`lns_router`, the API, credential and trace crates, the translation
-crates, and `switchyard_protocol` at the bottom) and 7 unplaced, all test
-fakes and tools that run as their own binaries; `lens-artifact-hub` has
-the main crate over its contract and types crates. Warm, `map` takes
-0.94 s on `lns-inference-router`, about as long as `flows` (0.88 s), which
-loads the same index and builds the same call graph, against 1.8 s for
-`check`; `--crate lns_ledger` takes 0.89 s. Naming a file's crate and
+The 19 layers came almost all from one crate (138 modules over 18
+layers; every other crate had 5 or fewer), so the global module view
+mixed the architecture between crates with one crate's insides. By
+crate, the workspace has 5 layers of 17 crates (two services on top,
+then the core services, the API, credential and trace crates, the
+protocol-translation crates, and a protocol crate at the bottom) and 7
+unplaced, all test fakes and tools that run as their own binaries; the
+Rust service has its main crate over its contract and types crates.
+Warm, `map` takes 0.94 s on the workspace, about as long as `flows`
+(0.88 s), which loads the same index and builds the same call graph,
+against 1.8 s for `check`; `--crate` for its largest crate takes 0.89 s. Naming a file's crate and
 module once per grouping rather than once per function took the crate
 view from 1.7 s to 0.94 s.
+
+Cycles (`codemap.Cycles`, `cycles` in JSON) are the groups of modules
+whose calls form a loop, every call counted, also the weak ones the
+layers set aside as upward breaks: each module of a group reaches every
+other. The layers collapse such a group into one layer without saying
+so, and inside it the map says nothing about direction. For each group
+the map lists the pairs that call each other directly, with the calls
+each way and a call site each way, those with the fewest calls one way
+first, or, when no pair does, a shortest loop through the group; a
+workspace map counts each crate's modules in cycles (`cycle_modules`).
+Only Rust modules within a crate can form one: Go's compiler forbids
+import cycles between packages, and Cargo cycles between crates.
+
+The map does not say which side of a pair is wrong. A weighted greedy
+feedback arc set (Eades, Lin and Smyth) was measured for that: it broke
+a 43-module group with 10 of its links (23 of 395 calls) and a 26-module
+one with 16 (37 of 430), short enough to act on, but it chose against
+what the modules are for. It kept a configuration module's calls into a
+store and cut the store's calls into the configuration, and it cut nine
+modules' calls into a provider module rather than the provider's one
+call back; counting each link once instead of each call was no better.
+Which way a dependency should point takes knowing what each module is
+for, which the agent or a person reading the pairs has.
+
+Measured on a 739k-line Rust workspace: its largest crate has 47 of 144
+modules in cycles, a group of 43 with 5 pairs calling each other
+directly and one of 4 with 1; a second service crate 26 of 50, in one
+group with 12 pairs; its code generator 6 of 19. A 188k-line service has 31
+of its main crate's 62 modules in cycles. The largest crate's pairs
+include its configuration module and its store calling each other, the
+configuration building the store's endpoint, which is the kind of call
+the map exists to point at. Go codebases have none.
+
+`check` reports each cycle as a `dependency-cycle` candidate (action
+`break-cycle`, concern `layers`): a pair calling each other, with its
+two calls as occurrences, or a group with no such pair, with each step
+of its shortest loop. Each occurrence is the call's line, so diff mode
+reports a cycle when a change touched one of its calls, the change that
+closed the loop, and CI fails on it; a cycle the code already had goes
+into the baseline, which knows it by its fingerprint (the crate and the
+modules) whichever calls close it later. Like the map, it does not say
+which call is the wrong way. Generated files are left out, and a
+`ddslop:ignore` on one of the calls marks a deliberate pair. Measured:
+25 candidates on the 739k-line workspace and 10 on the 188k-line
+service, among them the configuration and store pair.
 
 Section 3 is built for its flagged families only (`codemap.Features`,
 `features` in JSON). Each `parallel-flow` family `check` reports, found
@@ -1396,25 +1626,24 @@ and other members.
 
 The other two rules of section 3 were measured first and wait:
 
-- **A shared pipeline.** On `lns-inference-router` (193 entry points in
+- **A shared pipeline.** On the Rust workspace (193 entry points in
   24 traits) no trait group's entry points call one shared helper
-  directly; the most common, `Origin::current`, is called by 7 of the 20
-  `RealtimeApi` entry points and reads the request origin. Within the
-  slice depth, the helpers most members reach are `StoreFault::of_command`
-  (an error conversion, 17 of 40 `ManagementApi` entry points) and
-  `caller` (the sign-in check, which belongs to the opening-checks
-  concern of sections 4 and 5). Neither is a pipeline to follow.
+  directly; the most common, one reading the request's origin, is called
+  by 7 of the 20 entry points of one API. Within the slice depth, the
+  helpers most members reach are an error conversion (17 of 40 entry
+  points of another API) and the sign-in check, which belongs to the
+  opening-checks concern of sections 4 and 5. Neither is a pipeline to
+  follow.
 - **An example per trait group.** The member reaching the most shared
   helpers was the largest feature of its group rather than a typical one
-  (`reverse_credit`, 84 functions in its slice; `create_message`, 274),
-  and 2 of the 16 examples were members of a flagged family, which must
-  never be shown as an example.
+  (84 and 274 functions in their slices), and 2 of the 16 examples were
+  members of a flagged family, which must never be shown as an example.
 
-`lens-artifact-hub` and ddslop have no entry points from generated
-traits, and the 37 of `searchbox` form no family, so only
-`lns-inference-router` has families: six, the six `parallel-flow` candidates of `check`, with
-shapes whose steps read as the pipeline (`authorize`, `admissible`,
-`attempt`, `interpret`, `refusal`). The workspace map grew to 125 lines
+The Rust service and ddslop have no entry points from generated
+traits, and the 37 of the Go service form no family, so only the
+workspace has families: six, the six `parallel-flow` candidates of
+`check`, with shapes whose steps read as the pipeline (authorise, check
+admissibility, attempt, interpret the outcome, refuse). The workspace map grew to 125 lines
 of text, and computing the families takes about 0.27 s warm (0.97 s to
 1.24 s for the map).
 
@@ -1433,14 +1662,14 @@ idiomatic form (`golang.IdiomaticForms`: `errors.Is/As` and `%w`). Every
 form is listed with its count and first occurrence, so an occurrence of
 another form is visible before section 5 reports it.
 
-Measured on `searchbox` and ddslop: errors are checked with `errors.Is`
+Measured on the Go service and ddslop: errors are checked with `errors.Is`
 or `errors.As` in all 27 and 7 checks and wrapped with `%w` in all 24
 and 10 wraps; the `==` and message comparisons the adapter recognised
 were all in tests (5 and 15), which the map leaves out. The threshold
 of 5 is not yet tested by a codebase near it. Scopes and kinds wait: on
 the Rust codebases their only form was the duplicated one, already a
 `setup-teardown` or `string-kinds` candidate, so the map would add
-nothing to `check`; and on `lns-inference-router` the 6 functions of
+nothing to `check`; and on the Rust workspace the 6 functions of
 its one `setup-teardown` candidate turned out to open two different
 values (`client.transaction()` and `bounded(...)`), grouped by the
 `map_err` after them until the opener looked through it.
@@ -1461,19 +1690,47 @@ as `map_err` to a typed error and anyhow's `context` are both idiomatic,
 one for libraries and one for applications, so a Rust map without a
 wrapping convention names none.
 
-Measured: `lns-inference-router` checks errors by variant in 476 of 477
-checks, and the one message check (`yaml_to_json_value` matching
-`"tab character"` in a tool) is real drift; it wraps with `map_err` in
+Measured: the Rust workspace checks errors by variant in 476 of 477
+checks, and the one message check (a tool matching a YAML parser's
+error message) is real drift; it wraps with `map_err` in
 all 2190 wraps. Before `matches!` and qualified paths were read, 43 of
 those variant checks were missed, and before `context` needed anyhow's
 arguments, 3 OpenTelemetry calls counted as wraps in a codebase that
-does not use anyhow. `lens-artifact-hub` checks by variant in all 95, and wraps
+does not use anyhow. The Rust service checks by variant in all 95, and wraps
 with `map_err` in 183 of 265. The rest is anyhow's `context`, and not
 only in binaries: the main crate depends on both anyhow and thiserror
 and uses `context` across its modules (74 of 249 wraps there), while
-`lens_emulator` mostly uses `context`. That mix is real, and the map
+its emulator crate mostly uses `context`. That mix is real, and the map
 reports it as such: a 70% convention with the other form listed beside
 it, and each crate's own convention under `--crate`.
+
+Error values, how a function makes a new error, are built for Rust
+(`error-values`): `Err(..)` holding a variant (`Fault::Busy`,
+`Fault::Write(e)`, `Fault::Long { .. }`) is `variant`; one holding a
+string (`format!`, a literal, `.to_string()`, `.into()` or `.to_owned()`
+on one, `String::from`) is `string`; anyhow's `bail!` and `anyhow!` are
+`anyhow`. An error passed on (`Err(e)`) or made by a constructor
+(`Fault::new(..)`) is no form, nor is an error made inside another
+macro, whose arguments the parser leaves as tokens. Binaries
+(`src/main.rs` and files under `src/bin/`) record no error values: their
+errors are printed, not matched by callers. The adapter knows a binary
+by its path alone, so a module that only `main.rs` declares (`mod cli;`
+in `src/cli.rs`) or a `[[bin]]` at another path counts as library code;
+none of the measured codebases has one with string errors. Like wrapping, the concern
+has no idiomatic form, as variants and anyhow are both idiomatic, so a
+map without a convention names none.
+
+Measured on six Rust codebases: the workspace makes errors from
+variants in 1586 of 1704 (93%), and the Rust service with anyhow in
+278 of 414, the rest variants; of four smaller codebases, two lean to
+variants (59% and 51%), one to strings, and one has no
+majority. Before binaries were left out, the workspace's command-line tools added
+48 string errors, mostly usage messages, which made 29 of its 90 drift
+candidates. Go waits: its forms (a sentinel such as `io.EOF`, a custom
+error type, or an ad hoc `errors.New` or `fmt.Errorf`) work together
+rather than as alternatives, sentinels for the errors callers check and
+ad hoc errors for the rest, so a convention among them would make every
+sentinel drift.
 
 Section 5 is built for the error idioms (`codemap.Drifts`, kind
 `convention-drift`, action `follow-convention`). `check` finds, per
@@ -1482,7 +1739,7 @@ another form in a concern whose convention holds at least 90% of at
 least 5 occurrences across the repository. The map names a convention
 at a simple majority, which describes the code; drift needs more,
 because below it the forms are a mix the code chose, not a slip:
-`lens-artifact-hub` wraps errors with `map_err` in 69% and anyhow's
+the Rust service wraps errors with `map_err` in 69% and anyhow's
 `context` in the rest, throughout its main crate. The candidate gives
 the drifting form in `values`, the concern in `concern`, the
 convention's form as the suggestion's `pattern`, and as `target` the
@@ -1500,14 +1757,21 @@ drift, and a drift's entry hide a new candidate of another kind. No other candid
 error concern, so rule 3 of the concerns model (one candidate per
 occurrence and concern) has nothing to suppress yet.
 
-Measured on the four codebases: one candidate, on
-`lns-inference-router`, where a tool checks a `serde_yaml` error with
-`error.to_string().contains("tab character")`. That is drift from a
+Measured on the four codebases: one candidate, on the Rust workspace,
+where a tool checks a `serde_yaml` error by searching its
+`to_string()` for a phrase. That is drift from a
 99.8% convention, but not a slip: the library's error has no variant
 for it, so the message is the only thing to match. Without types ddslop
 cannot tell an outside library's error from the codebase's own, so such
 a place is left to a `ddslop:ignore` comment saying why, which the
-rule's description and the skill ask for. Bypasses, skipped helpers in
+rule's description and the skill ask for.
+
+Error values drift on the Rust workspace alone (the other five have
+no convention at 90%): 61 functions making string errors in a workspace
+that makes them from variants elsewhere, such as a protocol translation
+returning its error kinds as string literals and a constructor
+returning the name of the argument it refused, which is the stringly
+typed error the convention exists to avoid. Bypasses, skipped helpers in
 `parallel-flow` families and drift from the scope and kind idioms are
 the design's other sources and wait for their sections.
 
@@ -1531,8 +1795,8 @@ candidate.
 - Conventions across languages, as for the other layers.
 
 Open question: whether name-based resolution resolves enough method
-calls for the layers to hold without SCIP or, for Go, the typed call
-graph; Go layers stay shallow until then.
+calls for the layers to hold without SCIP; Go's are typed from the
+syntax where its types are stated.
 
 ## Modes
 
@@ -1555,7 +1819,7 @@ graph; Go layers stay shallow until then.
   changed-versus-all is left until the full analysis gets too slow. A bad
   ref, or a path outside Git, is an error rather than an empty report. On
   a large Rust codebase, `--diff HEAD~20` reported 5 candidates, such as
-  recently edited near copies `Credits::attempt` and `Reversals::attempt`.
+  two recently edited near copies of one operation's attempt step.
 
 ```mermaid
 sequenceDiagram
@@ -1996,7 +2260,15 @@ Built, following pruner's release setup:
 
 - **CI** (`.github/workflows/ci.yml`): golangci-lint and markdownlint;
   tests with the race detector and the coverage gate on Linux and macOS;
-  an end-to-end smoke test of the built binary (`scripts/smoke-test.sh`).
+  an end-to-end smoke test of the built binary (`scripts/smoke-test.sh`);
+  ddslop on its own code with no baseline, both the built binary and the
+  latest release through the action, failing on any candidate; the
+  action uploads its SARIF to code scanning, so pull requests carry the
+  same annotations as users'. Pull requests from forks and Dependabot,
+  whose token cannot upload, and `upload-sarif: "false"` get workflow annotations from the
+  SARIF instead. The action job also runs the action on a sample with a
+  renamed copy, whole and in diff mode on a sample history. The repository has the ddslop skill
+  installed for Claude Code and Codex (`ddslop init --claude --codex`).
 - **Releases** (`.github/workflows/release.yml`, on `vX.Y.Z` tags): Linux and
   macOS binaries for x86_64 and aarch64, built with cgo and each
   platform's C compiler on GitHub runners. aarch64 Linux is cross-compiled
@@ -2088,8 +2360,8 @@ seconds, 713 candidates (60 exact, 166 renamed, 189 near-miss families,
 traits).
 
 Next: the map layer (see Map layer). Layers, shared helpers and the
-flagged pipeline families are built, idioms for error checks and
-wrapping, and drift from them; the other concerns and deviations follow
+flagged pipeline families are built, idioms for error checks,
+wrapping and (in Rust) values, and drift from them; the other concerns and deviations follow
 once they are measured on the Rust codebases.
 
 1. **v1, fragment layer as a linter:** tree-sitter adapters for all three

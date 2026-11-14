@@ -3,6 +3,8 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -251,6 +253,60 @@ func TestMapOfGoKeepsPackages(t *testing.T) {
 	r := mapOf(t, repo(t, layeredService))
 	if len(r.Maps) != 1 || r.Maps[0].Scope != "packages" {
 		t.Errorf("maps = %+v, want Go's map of packages", r.Maps)
+	}
+}
+
+// goAndRust is a repository with a Go service and a Rust workspace.
+func goAndRust() map[string]string {
+	files := map[string]string{}
+	maps.Copy(files, layeredService)
+	maps.Copy(files, workspace)
+	return files
+}
+
+func TestMapOfGoAndRustHasAMapEach(t *testing.T) {
+	r := mapOf(t, repo(t, goAndRust()))
+	var langs []string
+	for _, m := range r.Maps {
+		langs = append(langs, m.Lang)
+	}
+	if want := []string{"go", "rust"}; !reflect.DeepEqual(langs, want) {
+		t.Errorf("maps = %v, want %v", langs, want)
+	}
+}
+
+func TestMapLangPicksOneLanguage(t *testing.T) {
+	root := repo(t, goAndRust())
+	for _, lang := range []string{"go", "rust"} {
+		r := mapOf(t, "--lang", lang, root)
+		if len(r.Maps) != 1 || r.Maps[0].Lang != lang {
+			t.Errorf("--lang %s: maps = %+v, want only the %s map", lang, r.Maps, lang)
+		}
+	}
+}
+
+func TestMapLangWithoutItsCodeIsEmpty(t *testing.T) {
+	root := repo(t, layeredService)
+	if r := mapOf(t, "--lang", "rust", root); len(r.Maps) != 0 {
+		t.Errorf("--lang rust on Go code: maps = %+v, want none", r.Maps)
+	}
+	_, stdout, _ := run("map", "--format", "text", "--lang", "rust", root)
+	if !strings.Contains(stdout, "no Rust code found") {
+		t.Errorf("text = %q, want it to say there is no Rust code", stdout)
+	}
+}
+
+func TestMapOfAnUnknownLangFails(t *testing.T) {
+	code, _, stderr := run("map", "--lang", "typescript", repo(t, layeredService))
+	if code != 2 || !strings.Contains(stderr, `"go" or "rust"`) {
+		t.Errorf("exit %d, stderr %q; want 2 and the languages there are", code, stderr)
+	}
+}
+
+func TestMapOfACrateInGoFails(t *testing.T) {
+	code, _, stderr := run("map", "--lang", "go", "--crate", "service", repo(t, goAndRust()))
+	if code != 2 || !strings.Contains(stderr, "--crate") {
+		t.Errorf("exit %d, stderr %q; want 2: a crate is Rust's", code, stderr)
 	}
 }
 
@@ -528,5 +584,179 @@ func TestMapNamesRustErrorIdioms(t *testing.T) {
 	_, text, _ := run("map", "--format", "text", root)
 	if !strings.Contains(text, "error-wrapping: no convention in 1 occurrence(s)\n") {
 		t.Errorf("text map does not say wrapping has no convention, without an idiomatic form:\n%s", text)
+	}
+}
+
+// A Go service whose layers call each other through struct fields and
+// parameters, as Go code mostly does, rather than through package
+// functions.
+var fieldService = map[string]string{
+	"go.mod": "module example.com/app\n",
+	"api/h.go": `package api
+
+import "example.com/app/internal/service"
+
+type Handlers struct{ svc *service.Orders }
+
+func (h *Handlers) Create() { h.svc.Place() }
+func (h *Handlers) Cancel() { h.svc.Cancel() }
+`,
+	"internal/service/orders.go": `package service
+
+import "example.com/app/internal/store"
+
+type Orders struct{}
+
+func (o *Orders) Place()  { o.save(&store.DB{}) }
+func (o *Orders) Cancel() { db := &store.DB{}; db.Delete() }
+func (o *Orders) save(db *store.DB) { db.Insert() }
+`,
+	"internal/store/db.go": `package store
+
+type DB struct{}
+
+func (d *DB) Insert() {}
+func (d *DB) Delete() {}
+`,
+}
+
+func TestMapLayersGoCallsThroughFieldsAndParameters(t *testing.T) {
+	m := mapOf(t, repo(t, fieldService)).Maps[0]
+	var layers [][]string
+	for _, l := range m.Layers {
+		layers = append(layers, l.Modules)
+	}
+	if want := [][]string{{"api"}, {"internal/service"}, {"internal/store"}}; !reflect.DeepEqual(layers, want) {
+		t.Errorf("layers = %v, want api over service over store", layers)
+	}
+}
+
+// Mapping a subdirectory of a Go module still reads the module's go.mod
+// above it, so typed calls between its packages resolve.
+func TestMapOfASubdirectoryUsesTheModuleAboveIt(t *testing.T) {
+	root := repo(t, fieldService)
+	m := mapOf(t, filepath.Join(root, "internal")).Maps[0]
+	var layers [][]string
+	for _, l := range m.Layers {
+		layers = append(layers, l.Modules)
+	}
+	if want := [][]string{{"service"}, {"store"}}; !reflect.DeepEqual(layers, want) {
+		t.Errorf("layers = %v, want service over store", layers)
+	}
+}
+
+// A Go service whose handlers get their service from a constructor and
+// call it through the variable, and chain calls on a getter's result.
+var constructedService = map[string]string{
+	"go.mod": "module example.com/app\n",
+	"api/h.go": `package api
+
+import "example.com/app/internal/service"
+
+func Create() { svc := service.New(); svc.Place() }
+func Cancel() { service.Default().Cancel() }
+`,
+	"internal/service/orders.go": `package service
+
+type Orders struct{}
+
+func New() *Orders     { return &Orders{} }
+func Default() *Orders { return &Orders{} }
+
+func (o *Orders) Place()  {}
+func (o *Orders) Cancel() {}
+`,
+	"other/orders.go": `package other
+
+type Orders struct{}
+
+func (o *Orders) Place()  {}
+func (o *Orders) Cancel() {}
+`,
+}
+
+func TestMapLayersGoCallsOnConstructedValues(t *testing.T) {
+	m := mapOf(t, repo(t, constructedService)).Maps[0]
+	if m.ResolvedCalls != m.Calls {
+		t.Errorf("resolved %d of %d calls, want all: Place and Cancel are Orders' through New and Default", m.ResolvedCalls, m.Calls)
+	}
+}
+
+// A crate whose config and store call each other, and whose api calls
+// down into both.
+var cyclicCrate = map[string]string{
+	"Cargo.toml": "[package]\nname = \"app\"\n",
+	"src/lib.rs": "pub mod api;\npub mod config;\npub mod store;\n",
+	"src/api.rs": `pub fn serve() { crate::config::load(); crate::store::open(); }
+`,
+	"src/config.rs": `pub fn load() { crate::store::endpoint(); }
+pub fn value() -> u32 { 1 }
+`,
+	"src/store.rs": `pub fn open() { crate::config::value(); }
+pub fn endpoint() {}
+`,
+}
+
+func TestMapListsModulesCallingEachOtherInALoop(t *testing.T) {
+	root := repo(t, cyclicCrate)
+	code, stdout, stderr := run("map", "--format", "json", root)
+	if code != 0 {
+		t.Fatalf("map: exit %d, stderr %s", code, stderr)
+	}
+	var r struct {
+		Maps []struct {
+			Cycles []struct {
+				Modules []string `json:"modules"`
+				Links   []struct {
+					A       string `json:"a"`
+					B       string `json:"b"`
+					CallsAB int    `json:"calls_ab"`
+					CallsBA int    `json:"calls_ba"`
+					AB      string `json:"ab"`
+					BA      string `json:"ba"`
+				} `json:"links"`
+			} `json:"cycles"`
+		} `json:"maps"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, stdout)
+	}
+	cs := r.Maps[0].Cycles
+	if len(cs) != 1 || !reflect.DeepEqual(cs[0].Modules, []string{"config", "store"}) || len(cs[0].Links) != 1 {
+		t.Fatalf("cycles = %+v, want config and store linked both ways", cs)
+	}
+	l := cs[0].Links[0]
+	if l.A != "config" || l.B != "store" || l.CallsAB != 1 || l.CallsBA != 1 ||
+		l.AB != "src/config.rs:1 load -> endpoint" || l.BA != "src/store.rs:1 open -> value" {
+		t.Errorf("link = %+v, want config -> store at load, store -> config at open", l)
+	}
+	_, text, _ := run("map", "--format", "text", root)
+	if !strings.Contains(text, "Cycles") || !strings.Contains(text, "config <-> store") {
+		t.Errorf("text map does not show the cycle:\n%s", text)
+	}
+}
+
+func TestMapLimitCapsACyclesLoop(t *testing.T) {
+	// a -> b -> c -> d -> a: a loop with no pair calling each other.
+	files := map[string]string{
+		"Cargo.toml": "[package]\nname = \"ring\"\n",
+		"src/lib.rs": "pub mod a;\npub mod b;\npub mod c;\npub mod d;\n",
+		"src/a.rs":   "pub fn fa() { crate::b::fb(); }\n",
+		"src/b.rs":   "pub fn fb() { crate::c::fc(); }\n",
+		"src/c.rs":   "pub fn fc() { crate::d::fd(); }\n",
+		"src/d.rs":   "pub fn fd() { crate::a::fa(); }\n",
+	}
+	_, stdout, _ := run("map", "--format", "json", "--limit", "2", repo(t, files))
+	var r struct {
+		Maps []struct {
+			Cycles []struct {
+				Loop     []struct{} `json:"loop"`
+				LoopMore int        `json:"loop_more"`
+			} `json:"cycles"`
+		} `json:"maps"`
+	}
+	decodeInto(t, stdout, &r)
+	if cs := r.Maps[0].Cycles; len(cs) != 1 || len(cs[0].Loop) != 2 || cs[0].LoopMore != 2 {
+		t.Errorf("cycles = %+v, want a loop of 4 steps capped at 2, 2 more", cs)
 	}
 }

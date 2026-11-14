@@ -42,13 +42,33 @@ jobs:
       - name: Build
         run: make build
       - name: ddslop on its own code
-        run: bin/ddslop check --format text --baseline .ddslop-baseline.json .
+        run: bin/ddslop check --format text .
       - name: Smoke test
         run: scripts/smoke-test.sh bin/ddslop
 
-  action:
-    name: Action
+  latest-release:
+    name: Latest release
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The latest published ddslop on this code, with no baseline: a
+      # candidate it finds fails the job until it is fixed or marked
+      # ddslop:ignore with a reason, and annotates the pull request as it
+      # does for users: the action's defaults, as users run it.
+      - uses: ./
+        with:
+          version: latest
+
+  action:
+    name: Action (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Sample project with a renamed copy
@@ -84,3 +104,49 @@ jobs:
           test "$OUTCOME" = failure || { echo "outcome $OUTCOME, want failure" >&2; exit 1; }
           test "$CODE" = 1 || { echo "exit code $CODE, want 1" >&2; exit 1; }
           grep -q '"ruleId": "renamed-clone"' "$SARIF" || { echo "the SARIF report has no renamed-clone result" >&2; cat "$SARIF"; exit 1; }
+      # Diff mode, as pull requests use it: the copy is reported when the
+      # change adds it, not when it was there before.
+      - name: Sample history, the copy added by the last commit
+        working-directory: ${{ runner.temp }}/sample
+        run: |
+          git init -q
+          git add src/users.rs
+          git -c user.name=ci -c user.email=ci@example.com commit -qm users
+          git add src/orders.rs
+          git -c user.name=ci -c user.email=ci@example.com commit -qm orders
+      - name: Run the action on the change adding the copy
+        id: added
+        uses: ./
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/sample
+          diff: HEAD~1
+          args: --min-nodes 20
+          upload-sarif: "false"
+      - name: Run the action on no change
+        id: unchanged
+        uses: ./
+        with:
+          path: ${{ runner.temp }}/sample
+          diff: HEAD
+          args: --min-nodes 20
+          upload-sarif: "false"
+      # Below fail-over the check passes, its candidates annotated as
+      # warnings.
+      - name: Run the action under a duplication limit
+        id: limit
+        uses: ./
+        with:
+          path: ${{ runner.temp }}/sample
+          fail-over: "100"
+          args: --min-nodes 20
+          upload-sarif: "false"
+      - name: Diff mode reported only the added copy, and the limit passed
+        env:
+          ADDED: ${{ steps.added.outputs.exit-code }}
+          UNCHANGED: ${{ steps.unchanged.outputs.exit-code }}
+          LIMIT: ${{ steps.limit.outputs.exit-code }}
+        run: |
+          test "$ADDED" = 1 || { echo "exit code $ADDED for the change adding the copy, want 1" >&2; exit 1; }
+          test "$UNCHANGED" = 0 || { echo "exit code $UNCHANGED for no change, want 0" >&2; exit 1; }
+          test "$LIMIT" = 0 || { echo "exit code $LIMIT under the duplication limit, want 0" >&2; exit 1; }

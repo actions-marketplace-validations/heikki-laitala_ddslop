@@ -422,3 +422,583 @@ func load(err error) error {
 		t.Errorf("forms:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
+
+func TestParseRecordsTheParameterTypesOfFunctionTypes(t *testing.T) {
+	src := `package cli
+
+type command func(args []string, stdout, stderr io.Writer) int
+
+type (
+	handler func(context.Context, *Request) error
+	options struct{ verbose bool }
+)
+
+type visit = func(path string)
+`
+	_, decls, err := Parse("cli/cli.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Named or not, each parameter and result counts by its type, a
+	// Context too; an alias declares a function type as well.
+	if want := "[{cli/cli.go ([]string, io.Writer, io.Writer) (int) false} {cli/cli.go (context.Context, *Request) (error) false} {cli/cli.go (string) () false}]"; fmt.Sprint(decls.FuncTypes) != want {
+		t.Errorf("FuncTypes = %v, want %s", decls.FuncTypes, want)
+	}
+}
+
+func TestUnitsRecordTheirSignatures(t *testing.T) {
+	src := `package store
+
+func none() {}
+
+func one() error { return nil }
+
+func named(ctx context.Context, a, b string) (n, m int, err error) { return 0, 0, nil }
+
+func variadic(a int, rest ...string) {}
+`
+	units, _, err := Parse("store/store.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, u := range units {
+		got = append(got, u.Name+" "+u.Types)
+	}
+	if want := "[none () () one () (error) named (context.Context, string, string) (int, int, error) variadic (int, ...string) ()]"; fmt.Sprint(got) != want {
+		t.Errorf("signatures = %v, want %s", got, want)
+	}
+}
+
+func TestMethodCallsRecordTheTypeTheCodeStates(t *testing.T) {
+	src := `package api
+
+import (
+	"strings"
+
+	st "example.com/app/internal/store"
+)
+
+func (s *Server) Get(db *st.DB, q Query, names []string, n int) {
+	db.Load()
+	q.Run()
+	var b strings.Builder
+	b.WriteString("x")
+	c := &Cache{}
+	c.Fill()
+	d := st.Index{}
+	d.Find()
+	s.store.Save()
+	s.Flush()
+	names[0].Trim()
+	n.String()
+	c = other()
+	c.Fill()
+	unknown.Do()
+}
+`
+	units, _, err := Parse("api/server.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		if c.Kind == unit.MethodCall {
+			got = append(got, fmt.Sprintf("%s type=%q field=%q", c.Name, c.Type, c.Field))
+		}
+	}
+	want := []string{
+		`Load type="example.com/app/internal/store.DB" field=""`,
+		`Run type="Query" field=""`,
+		`WriteString type="strings.Builder" field=""`,
+		`Fill type="Cache" field=""`,
+		`Find type="example.com/app/internal/store.Index" field=""`,
+		`Save type="" field="store"`,
+		`Flush type="" field=""`,
+		`Trim type="" field=""`,
+		`String type="" field=""`,
+		`Fill type="" field=""`,
+		`Do type="" field=""`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("method calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestStructFieldTypesAreQualifiedByTheFileImports(t *testing.T) {
+	src := `package api
+
+import st "example.com/app/internal/store"
+
+type Server struct {
+	store *st.Store
+	cache Cache
+	names []string
+	st.Logger
+}
+`
+	_, decls, err := Parse("api/server.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range decls.FieldTypes {
+		got = append(got, fmt.Sprintf("%s.%s %s", f.Struct, f.Field, f.Type))
+	}
+	want := []string{
+		"Server.store example.com/app/internal/store.Store",
+		"Server.cache Cache",
+		"Server.Logger example.com/app/internal/store.Logger",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("field types:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestOperandTypesKeepToTheirScope(t *testing.T) {
+	src := `package api
+
+func run(db *DB, items []Item) {
+	{
+		db := &Other{}
+		db.Save()
+	}
+	db.Save()
+	if db := (&Other{}); true {
+		db.Save()
+	}
+	db.Save()
+	go func(db *Remote) {
+		db.Save()
+	}(nil)
+	db.Save()
+	for _, db := range items {
+		db.Save()
+	}
+	db.Save()
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		if c.Kind == unit.MethodCall {
+			got = append(got, fmt.Sprintf("%d %s", c.Line, c.Type))
+		}
+	}
+	want := []string{"6 Other", "8 DB", "10 ", "12 DB", "14 Remote", "16 DB", "18 ", "20 DB"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("types:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestFieldTypesOfTestFilesAreMarked(t *testing.T) {
+	_, decls, err := Parse("api/server_test.go", []byte("package api_test\n\ntype Server struct{ store Fake }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decls.FieldTypes) != 1 || !decls.FieldTypes[0].Test {
+		t.Errorf("field types = %+v, want one marked as test code", decls.FieldTypes)
+	}
+}
+
+func TestModulePathReadsGoMod(t *testing.T) {
+	for gomod, want := range map[string]string{
+		"module example.com/app\n\ngo 1.25\n":         "example.com/app",
+		"// comment\nmodule \"example.com/q\" // x\n": "example.com/q",
+		"go 1.25\n": "",
+	} {
+		if got := ModulePath([]byte(gomod)); got != want {
+			t.Errorf("ModulePath(%q) = %q, want %q", gomod, got, want)
+		}
+	}
+}
+
+func TestAnAssignmentsRightSideSeesTheTypeBeforeIt(t *testing.T) {
+	src := `package api
+
+func run(x *DB) {
+	x = x.Reset()
+	x.Close()
+	y := &Cache{}
+	y = y.Clone()
+	y.Fill()
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		got = append(got, fmt.Sprintf("%d %s %q", c.Line, c.Name, c.Type))
+	}
+	want := []string{`4 Reset "DB"`, `5 Close ""`, `7 Clone "Cache"`, `8 Fill ""`}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestAssignmentsInANestedScopeLeaveTheOuterTypeUnknown(t *testing.T) {
+	src := `package api
+
+func run(ok bool, items []*Other) {
+	x := &DB{}
+	{
+		x = &Other{}
+	}
+	x.Save()
+	y := &DB{}
+	if ok {
+		y = &Other{}
+	}
+	y.Save()
+	z := &DB{}
+	for _, z = range items {
+	}
+	z.Save()
+	w := &DB{}
+	{
+		w := &Other{}
+		w.Save()
+	}
+	w.Save()
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		got = append(got, fmt.Sprintf("%d %q", c.Line, c.Type))
+	}
+	want := []string{`8 ""`, `13 ""`, `17 ""`, `21 "Other"`, `23 "DB"`}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestEachBranchStartsFromTheTypesBeforeIt(t *testing.T) {
+	src := `package api
+
+func run(ok bool, n int) {
+	x := &DB{}
+	if ok {
+		x = &Other{}
+	} else {
+		x.Save()
+	}
+	x.Save()
+	y := &DB{}
+	switch n {
+	case 1:
+		y = &Other{}
+	case 2:
+		y.Save()
+	}
+	y.Save()
+	z := &DB{}
+	if ok {
+		{
+			z = &Other{}
+		}
+		z.Save()
+	} else {
+		z.Save()
+	}
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		got = append(got, fmt.Sprintf("%d %q", c.Line, c.Type))
+	}
+	want := []string{`8 "DB"`, `10 ""`, `16 "DB"`, `18 ""`, `24 ""`, `26 "DB"`}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestAShadowedReceiverIsAnOrdinaryVariable(t *testing.T) {
+	src := `package api
+
+func (s *Server) Run() {
+	s.store.Save()
+	s.Flush()
+	{
+		s := &Other{}
+		s.store.Save()
+		s.Flush()
+	}
+	go func(s *Remote) {
+		s.Flush()
+	}(nil)
+	s.Flush()
+	var db = &DB{}
+	db.Load()
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		if c.Kind == unit.MethodCall {
+			got = append(got, fmt.Sprintf("%d %s qualifier=%q type=%q field=%q", c.Line, c.Name, c.Qualifier, c.Type, c.Field))
+		}
+	}
+	want := []string{
+		`4 Save qualifier="" type="" field="store"`,
+		`5 Flush qualifier="self" type="" field=""`,
+		`8 Save qualifier="" type="" field=""`,
+		`9 Flush qualifier="" type="Other" field=""`,
+		`12 Flush qualifier="" type="Remote" field=""`,
+		`14 Flush qualifier="self" type="" field=""`,
+		`16 Load qualifier="" type="DB" field=""`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("method calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestVariablesShadowImportsAndNamedResultsAreTyped(t *testing.T) {
+	src := `package api
+
+import "encoding/json"
+
+func run(json *Codec) (db *DB) {
+	json.Marshal()
+	db.Save()
+	return
+}
+
+func plain() {
+	json.Marshal()
+	{
+		json := &Codec{}
+		json.Marshal()
+	}
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, u := range units {
+		for _, c := range u.Calls {
+			got = append(got, fmt.Sprintf("%d kind=%d qualifier=%q type=%q", c.Line, c.Kind, c.Qualifier, c.Type))
+		}
+	}
+	want := []string{
+		fmt.Sprintf(`6 kind=%d qualifier="" type="Codec"`, unit.MethodCall),
+		fmt.Sprintf(`7 kind=%d qualifier="" type="DB"`, unit.MethodCall),
+		fmt.Sprintf(`12 kind=%d qualifier="json" type=""`, unit.PathCall),
+		fmt.Sprintf(`15 kind=%d qualifier="" type="Codec"`, unit.MethodCall),
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestSelectReceivesAndLiteralResultsDeclareVariables(t *testing.T) {
+	src := `package api
+
+import "encoding/json"
+
+func (s *Server) run(ch chan *Codec) {
+	select {
+	case json := <-ch:
+		json.Marshal()
+	case s := <-ch:
+		s.Flush()
+	}
+	_ = func() (db *DB) {
+		db.Save()
+		return
+	}
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range units[0].Calls {
+		got = append(got, fmt.Sprintf("%d kind=%d qualifier=%q type=%q", c.Line, c.Kind, c.Qualifier, c.Type))
+	}
+	want := []string{
+		fmt.Sprintf(`8 kind=%d qualifier="" type=""`, unit.MethodCall),
+		fmt.Sprintf(`10 kind=%d qualifier="" type=""`, unit.MethodCall),
+		fmt.Sprintf(`13 kind=%d qualifier="" type="DB"`, unit.MethodCall),
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestTypeParametersAndTypeSwitchAliasesAreNotConcreteTypes(t *testing.T) {
+	src := `package api
+
+import "encoding/json"
+
+type Box[T any] struct {
+	v T
+	c Cache
+}
+
+func run[T any](x T, c Cache) {
+	x.Save()
+	c.Fill()
+}
+
+func (s *Set[E]) Add(x E) {
+	x.Save()
+}
+
+func (s *Server) kind(v any) {
+	switch json := v.(type) {
+	case *Codec:
+		json.Marshal()
+	}
+	switch s := v.(type) {
+	default:
+		s.Flush()
+	}
+}
+`
+	units, decls, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, u := range units {
+		for _, c := range u.Calls {
+			got = append(got, fmt.Sprintf("%d kind=%d qualifier=%q type=%q", c.Line, c.Kind, c.Qualifier, c.Type))
+		}
+	}
+	for _, f := range decls.FieldTypes {
+		got = append(got, fmt.Sprintf("field %s.%s %s", f.Struct, f.Field, f.Type))
+	}
+	want := []string{
+		fmt.Sprintf(`11 kind=%d qualifier="" type=""`, unit.MethodCall),
+		fmt.Sprintf(`12 kind=%d qualifier="" type="Cache"`, unit.MethodCall),
+		fmt.Sprintf(`16 kind=%d qualifier="" type=""`, unit.MethodCall),
+		fmt.Sprintf(`22 kind=%d qualifier="" type=""`, unit.MethodCall),
+		fmt.Sprintf(`26 kind=%d qualifier="" type=""`, unit.MethodCall),
+		"field Box.c Cache",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestUnitsRecordTheirResultTypes(t *testing.T) {
+	src := `package api
+
+import st "example.com/app/internal/store"
+
+func open() (*st.DB, error) { return nil, nil }
+func one() *Cache { return nil }
+func named() (db *st.DB, n int) { return }
+func generic[T any]() (T, Cache) { var t T; return t, Cache{} }
+func none() {}
+`
+	units, _, err := Parse("api/open.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, u := range units {
+		got = append(got, fmt.Sprintf("%s %q", u.Name, u.Results))
+	}
+	want := []string{
+		`open ["example.com/app/internal/store.DB" ""]`,
+		`one ["Cache"]`,
+		`named ["example.com/app/internal/store.DB" ""]`,
+		`generic ["" "Cache"]`,
+		`none []`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("results:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestMethodCallsRecordTheCallProducingTheirOperand(t *testing.T) {
+	src := `package api
+
+func run(s *Server) {
+	db, err := open()
+	db.Save()
+	err.Error()
+	c := one()
+	c.Fill()
+	s.Store().Save()
+	c = &Cache{}
+	c.Fill()
+	var d = one()
+	d.Fill()
+}
+`
+	units, _, err := Parse("api/run.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := units[0].Calls
+	var got []string
+	for _, c := range calls {
+		from := "-"
+		if c.From > 0 {
+			from = fmt.Sprintf("%s#%d", calls[c.From-1].Name, c.Result)
+		}
+		got = append(got, fmt.Sprintf("%d %s from=%s", c.Line, c.Name, from))
+	}
+	want := []string{
+		"4 open from=-",
+		"5 Save from=open#0",
+		"6 Error from=open#1",
+		"7 one from=-",
+		"8 Fill from=one#0",
+		"9 Save from=Store#0",
+		"9 Store from=-",
+		"11 Fill from=-",
+		"12 one from=-",
+		"13 Fill from=one#0",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// In Go, a test case is a TestXxx, BenchmarkXxx, FuzzXxx or ExampleXxx
+// function of a _test.go file; the rest there are helpers.
+func TestGoTestCasesAreToldFromTestHelpers(t *testing.T) {
+	src := `package store
+
+import "testing"
+
+func TestSave(t *testing.T) { fixture() }
+func BenchmarkSave(b *testing.B) {}
+func fixture() *Store { return nil }
+func Testify() {}
+func Testé() {}
+`
+	units, _, err := Parse("store/store_test.go", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, u := range units {
+		got = append(got, fmt.Sprintf("%s case=%v", u.Name, u.TestCase))
+	}
+	if want := "TestSave case=true\nBenchmarkSave case=true\nfixture case=false\nTestify case=false\nTesté case=false"; strings.Join(got, "\n") != want {
+		t.Errorf("units:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
+	}
+}

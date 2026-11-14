@@ -502,7 +502,8 @@ func check(root string, opts options) (report.Report, error) {
 	var structs []unit.Struct
 	var enums []unit.Enum
 	var consts []unit.Const
-	var decls unit.Decls // every file's, test code included, for traits
+	var decls unit.Decls    // every file's, test code included, for traits
+	var helpers []unit.Unit // test code's helpers, fakes and fixtures, without --tests
 	for _, f := range files {
 		if f.Generated {
 			summary.GeneratedFiles++
@@ -511,6 +512,8 @@ func check(root string, opts options) (report.Report, error) {
 		summary.Files++
 		for _, u := range f.Units {
 			switch {
+			case u.Test && !opts.tests && isHelper(u):
+				helpers = append(helpers, u)
 			case u.Test && !opts.tests:
 				summary.TestUnits++
 			case u.Ignored:
@@ -525,11 +528,25 @@ func check(root string, opts options) (report.Report, error) {
 		decls.Traits = append(decls.Traits, f.Decls.Traits...)
 		decls.Impls = append(decls.Impls, f.Decls.Impls...)
 		decls.TypeNames = append(decls.TypeNames, f.Decls.TypeNames...)
+		decls.FuncTypes = append(decls.FuncTypes, f.Decls.FuncTypes...)
 	}
-	summary.Units = len(units)
+	summary.Units = len(units) + len(helpers)
 	summary.Version = versionString()
-	summary.Health.AnalysedLines = report.AnalysedLines(units, structs, consts)
+	// The helpers compared for copies are analysed code too.
+	summary.Health.AnalysedLines = report.AnalysedLines(units, structs, consts) + report.AnalysedLines(helpers, nil, nil)
 	groups := clone.Groups(units, opts.minNodes)
+	// Without --tests, test code is checked for one thing: helpers copied
+	// between test files, a bigger bar than production code's. Test cases
+	// are repetitive by design and stay out. The helper groups join the
+	// report only: production's near-miss and block analysis never sees
+	// them.
+	var helperGroups []clone.Group
+	for _, g := range clone.Groups(helpers, max(minTestHelperNodes, opts.minNodes)) {
+		if inFiles(g.Units) > 1 { // copies within one test file are its own business
+			g.TestHelpers = true
+			helperGroups = append(helperGroups, g)
+		}
+	}
 	nearMisses := clone.NearMisses(units, max(opts.minNearNodes, opts.minNodes), opts.minSim, threads)
 	// Functions reported together. A near-miss member represents its whole
 	// shape, so a family also covers the member's exact and renamed copies.
@@ -560,7 +577,7 @@ func check(root string, opts options) (report.Report, error) {
 	internal := internalCrates(root, files)
 	flows := parallelFlows(g, traits, opts.minNodes)
 	r := report.Build(languageOf, report.Findings{
-		Groups: groups, NearMisses: nearMisses, Blocks: blocks, Flows: flows,
+		Groups: append(groups, helperGroups...), NearMisses: nearMisses, Blocks: blocks, Flows: flows,
 		Structs:  clone.Structs(structs, minStructFields),
 		Enums:    clone.Enums(enums),
 		Consts:   clone.Constants(consts),
@@ -570,8 +587,9 @@ func check(root string, opts options) (report.Report, error) {
 		Traits:   simplify.SingleImpl(decls, internal),
 		Scopes:   pattern.Scopes(units),
 		Kinds:    pattern.StringKinds(units),
-		Params:   pattern.ParameterGroups(units),
+		Params:   pattern.ParameterGroups(units, decls.FuncTypes),
 		Drifts:   drifts(units, packages(root, files)),
+		Cycles:   dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files)),
 	}, summary)
 	return r, recordHealth(db, root, r.Summary.Health)
 }
@@ -595,6 +613,75 @@ func drifts(units []unit.Unit, crates map[string]string) []report.Drift {
 		}
 	}
 	return out
+}
+
+// dependencyCycles finds the modules of each Rust crate calling each other
+// in a loop (see codemap.Cycles), in the code check reports on: no
+// generated files. A pair calling each other is one cycle, closed by its
+// two calls; a group with no such pair is one, closed by each step of a
+// shortest loop. A cycle any of whose calls a ddslop:ignore marks is
+// deliberate, and left out. Go packages and Rust crates cannot form one.
+func dependencyCycles(g *flow.Graph, files []index.File, crates map[string]string) []report.Cycle {
+	generated := map[string]bool{}
+	for _, f := range files {
+		generated[f.Path] = f.Generated
+	}
+	var out []report.Cycle
+	for _, name := range crateNames(files, crates) {
+		in := codemap.InCrate(name, crates)
+		group := codemap.Grouping(func(u unit.Unit) string {
+			if generated[u.File] {
+				return ""
+			}
+			return in(u)
+		})
+		for _, c := range codemap.Cycles(g, group) {
+			for _, l := range c.Links {
+				out = appendCycle(out, g, name+"\x00"+l.A+"\x00"+l.B,
+					[]string{l.A + " -> " + l.B, l.B + " -> " + l.A}, []codemap.Site{l.AB, l.BA})
+			}
+			if len(c.Loop) > 0 {
+				var steps []string
+				var sites []codemap.Site
+				for _, h := range c.Loop {
+					steps = append(steps, h.From+" -> "+h.To)
+					sites = append(sites, h.Site)
+				}
+				out = appendCycle(out, g, name+"\x00"+strings.Join(c.Modules, "\x00"), steps, sites)
+			}
+		}
+	}
+	return out
+}
+
+// cycleGraph is the call graph cycles are found in: the non-test code's,
+// or, with --tests, that of the units check analyses, test code included.
+func cycleGraph(g *flow.Graph, root string, files []index.File, units []unit.Unit, tests bool) *flow.Graph {
+	if !tests {
+		return g
+	}
+	return flow.Build(graphInputs(root, true, files), units)
+}
+
+// appendCycle adds a cycle closed by the calls at sites, unless a
+// ddslop:ignore marks one of those calls or their callers.
+func appendCycle(out []report.Cycle, g *flow.Graph, key string, steps []string, sites []codemap.Site) []report.Cycle {
+	c := report.Cycle{Key: key, Steps: steps}
+	for _, s := range sites {
+		if s.Caller < 0 || g.Units[s.Caller].Ignored {
+			return out
+		}
+		caller := g.Units[s.Caller]
+		line := caller.StartLine
+		if s.Call >= 0 {
+			if caller.Calls[s.Call].Ignored {
+				return out
+			}
+			line = caller.Calls[s.Call].Line
+		}
+		c.Sites = append(c.Sites, report.CycleSite{Unit: caller, Line: line})
+	}
+	return append(out, c)
 }
 
 // recordHealth adds a check's health to the index's history (see
@@ -680,6 +767,31 @@ var parallelFlowOptions = flow.ParallelOptions{
 	SharedFraction: 0.25,
 }
 
+// isHelper reports whether a test unit is a helper compared for copies
+// without --tests: no test case, not marked ignored, and not a Go file in
+// a testdata directory, a fixture the Go tool never builds (Rust reserves
+// no such directory).
+func isHelper(u unit.Unit) bool {
+	goFixture := strings.HasSuffix(u.File, ".go") && slices.Contains(strings.Split(filepath.ToSlash(u.File), "/"), "testdata")
+	return !u.TestCase && !u.Ignored && !goFixture
+}
+
+// inFiles counts the files units are in.
+func inFiles(units []unit.Unit) int {
+	files := map[string]bool{}
+	for _, u := range units {
+		files[u.File] = true
+	}
+	return len(files)
+}
+
+// minTestHelperNodes is the smallest test helper (a function in test code
+// that is no test case) reported as a copy without --tests. Measured on a
+// 739k-line Rust workspace: 297 groups of helper copies at 50 nodes, most
+// of the smallest one-line fakes and accessors, 156 at 80; ddslop had 5
+// and 2.
+const minTestHelperNodes = 80
+
 // appendAnalysed appends the declarations to analyse: test code only when
 // tests are asked for, and none a ddslop:ignore comment marks, which the
 // summary counts.
@@ -715,7 +827,7 @@ func callGraph(root string, files []index.File) (*flow.Graph, map[string]bool) {
 			}
 		}
 	}
-	return flow.Build(graphInputs(root, files), units), traits
+	return flow.Build(graphInputs(root, false, files), units), traits
 }
 
 // families finds the parallel-flow families among the entry points,
@@ -786,6 +898,9 @@ func markTest(f *index.File) {
 	d := &f.Decls
 	for i := range d.Structs {
 		d.Structs[i].Test = true
+	}
+	for i := range d.FieldTypes {
+		d.FieldTypes[i].Test = true
 	}
 	for i := range d.Consts {
 		d.Consts[i].Test = true

@@ -3,6 +3,7 @@ package rust
 
 import (
 	"errors"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -18,10 +19,24 @@ import (
 
 var language = sitter.NewLanguage(rustgrammar.Language())
 
-// grammar describes Rust to the shared flattening (see syntax.Grammar).
-type grammar struct{}
-
-var rustGrammar grammar
+// grammar describes Rust to the shared flattening (see syntax.Grammar),
+// for one function: the type its impl is for (Self), the type parameters
+// in scope, and the variables whose type the code states, by name, as
+// their declarations are visited.
+type grammar struct {
+	self    string
+	generic map[string]string
+	imports map[string]string
+	vars    map[string]syntax.Operand
+	// entries holds the variables as each open if found them, by the if's
+	// span, for its else.
+	entries *map[[2]uint]map[string]syntax.Operand
+	// calls maps a call's syntax node (its byte range) to its index among
+	// the unit's calls, and chains a method call's index to the call its
+	// operand is, recorded after it (Store::open()?.get()).
+	calls  map[[2]uint]int
+	chains map[int]produced
+}
 
 // Prefix is empty for Rust, the first language: its symbols, and so its
 // shapes and fingerprints, predate other languages.
@@ -43,13 +58,13 @@ func (grammar) Statements(kind string) bool { return kind == "block" }
 
 // Visit records calls, matches on strings and early returns (a return or
 // a let-else outside closures).
-func (grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
+func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 	if form := errorForm(n, s.Src); form.Form != "" {
 		s.Forms = append(s.Forms, form)
 	}
 	switch n.Kind() {
 	case "call_expression":
-		recordCall(s, n)
+		g.recordCall(s, n)
 	case "match_expression":
 		recordMatch(s, n)
 	case "return_expression":
@@ -60,16 +75,434 @@ func (grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 		if s.Closures == 0 && n.ChildByFieldName("alternative") != nil {
 			s.Exits++ // let-else
 		}
+		// The binding takes effect after its value: let x = x.parse()
+		// calls parse on the old x.
+		return func() { g.let(n, s.Src) }
 	case "closure_expression":
 		s.Closures++
-		return func() { s.Closures-- }
+		restore := g.scope()
+		if params := n.ChildByFieldName("parameters"); params != nil {
+			g.forget(params, s.Src)
+		}
+		return func() { s.Closures--; restore() }
+	case "match_arm":
+		restore := g.scope()
+		if pattern := n.ChildByFieldName("pattern"); pattern != nil {
+			var value *sitter.Node
+			if block := n.Parent(); block != nil && block.Parent() != nil {
+				value = block.Parent().ChildByFieldName("value") // match value { arm }
+			}
+			g.bind(pattern, value, s.Src)
+		}
+		return restore
+	case "block":
+		// A for's pattern is in scope in its body alone, after the
+		// iterator. A block's use declarations hold throughout it.
+		restore := g.scope()
+		if p := n.Parent(); p != nil && p.Kind() == "for_expression" && sameNode(p.ChildByFieldName("body"), n) {
+			if pattern := p.ChildByFieldName("pattern"); pattern != nil {
+				g.forget(pattern, s.Src)
+			}
+		}
+		local := usesIn(n, s.Src)
+		if len(local) == 0 {
+			return restore
+		}
+		outer := maps.Clone(g.imports)
+		maps.Copy(g.imports, local)
+		return func() {
+			restore()
+			clear(g.imports)
+			maps.Copy(g.imports, outer)
+		}
+	case "if_expression", "while_expression":
+		// An if let's or while let's bindings hold from right after their
+		// value, through the chain's later operands and the body, until
+		// the if or while ends; an else starts from the variables as the
+		// if found them.
+		(*g.entries)[span(n)] = maps.Clone(g.vars)
+		restore := g.scope()
+		return func() { delete(*g.entries, span(n)); restore() }
+	case "let_condition":
+		return func() {
+			if pattern := n.ChildByFieldName("pattern"); pattern != nil {
+				g.bind(pattern, n.ChildByFieldName("value"), s.Src)
+			}
+		}
+	case "else_clause":
+		if entry, ok := (*g.entries)[span(n.Parent())]; ok && n.Parent() != nil {
+			clear(g.vars)
+			maps.Copy(g.vars, entry)
+		}
 	}
 	return nil
 }
 
+// span identifies a syntax node by its byte range.
+func span(n *sitter.Node) [2]uint {
+	if n == nil {
+		return [2]uint{}
+	}
+	return [2]uint{n.StartByte(), n.EndByte()}
+}
+
+// sameNode reports whether a and b are the same syntax node.
+func sameNode(a, b *sitter.Node) bool {
+	return a != nil && b != nil && span(a) == span(b)
+}
+
+// scope opens a lexical scope: the bindings made in it are undone by the
+// function it returns. Rust assignments keep a variable's type, so the
+// variables as they were are exactly what holds after it.
+func (g grammar) scope() func() {
+	outer := maps.Clone(g.vars)
+	return func() {
+		clear(g.vars)
+		maps.Copy(g.vars, outer)
+	}
+}
+
+// produced is a call's result: the call's syntax node and the result's
+// position (see unit.Unit.Results).
+type produced struct {
+	call   [2]uint
+	result int
+}
+
+// let records the variable a let declares: its type when stated (let c:
+// Cache) or built by a struct literal (Ledger { .. }), or the call whose
+// result it holds (let s = Store::new()). Any other binding shadows the
+// name with a value of unknown type.
+func (g grammar) let(n *sitter.Node, src []byte) {
+	pattern := n.ChildByFieldName("pattern")
+	if pattern == nil {
+		return
+	}
+	if pattern.Kind() != "identifier" {
+		g.bind(pattern, n.ChildByFieldName("value"), src) // let Some(x) = find() else { .. }
+		return
+	}
+	var op syntax.Operand
+	if t := n.ChildByFieldName("type"); t != nil {
+		op.Type = g.typeOf(t.Utf8Text(src))
+	} else if v := n.ChildByFieldName("value"); v != nil {
+		op = g.valueOf(v, src)
+	}
+	g.set(pattern.Utf8Text(src), op)
+}
+
+// valueOf returns what a value states: a struct literal's type, or the
+// call it is, looking through .await and ? (which takes result 1).
+func (g grammar) valueOf(v *sitter.Node, src []byte) syntax.Operand {
+	if v.Kind() == "struct_expression" {
+		if name := v.ChildByFieldName("name"); name != nil {
+			return syntax.Operand{Type: g.typeOf(name.Utf8Text(src))}
+		}
+		return syntax.Operand{}
+	}
+	if p, ok := callResult(v); ok {
+		if k, ok := g.calls[p.call]; ok {
+			return syntax.Operand{From: k + 1, Result: p.result}
+		}
+	}
+	return syntax.Operand{}
+}
+
+// callResult returns the call a value is, through .await and ?, and the
+// result position (see unit.Unit.Results): 1 more after ?, which takes
+// the value out of a Result or Option, and 2 more after .await. A result
+// adapter (map_err, unwrap) is a call like any other here, marked as one
+// (unit.Call.Adapts) for the call graph to look through.
+func callResult(v *sitter.Node) (produced, bool) {
+	result := 0
+	for v != nil {
+		switch v.Kind() {
+		case "try_expression":
+			result |= 1
+			v = v.NamedChild(0)
+		case "await_expression":
+			result |= 2
+			v = v.NamedChild(0)
+		case "parenthesized_expression":
+			v = v.NamedChild(0)
+		case "call_expression":
+			return produced{call: span(v), result: result}, true
+		default:
+			return produced{}, false
+		}
+	}
+	return produced{}, false
+}
+
+// bind records the variables a pattern binds from a value: Some(x) or
+// Ok(x) binds what a ? leaves of a call's result, or of a variable
+// holding one (if let Some(x) = find()); any other binding is unknown.
+// A value unwrapped already (find()?) has no position for unwrapping it
+// again.
+func (g grammar) bind(pattern, value *sitter.Node, src []byte) {
+	// The value is read where the pattern is not yet bound:
+	// if let Some(value) = value.
+	var op syntax.Operand
+	if value != nil {
+		op = g.valueOf(value, src)
+		if value.Kind() == "identifier" {
+			op = g.vars[value.Utf8Text(src)]
+		}
+	}
+	g.forget(pattern, src)
+	if pattern.Kind() == "match_pattern" && pattern.NamedChildCount() > 0 {
+		pattern = pattern.NamedChild(0) // an arm's, before any guard
+	}
+	if pattern.Kind() != "tuple_struct_pattern" || pattern.NamedChildCount() != 2 || value == nil {
+		return
+	}
+	variant, inner := pattern.ChildByFieldName("type"), pattern.NamedChild(1)
+	// An imported variant of the name (use crate::MyValue::Some) is
+	// another enum's.
+	if variant == nil || inner.Kind() != "identifier" || !unwrapsTo[variant.Utf8Text(src)] || g.imports[variant.Utf8Text(src)] != "" {
+		return
+	}
+	if op.From > 0 && op.Result&1 == 0 {
+		g.set(inner.Utf8Text(src), syntax.Operand{From: op.From, Result: op.Result | 1})
+	}
+}
+
+// unwrapsTo are the variants a ? takes the value out of.
+var unwrapsTo = map[string]bool{"Some": true, "Ok": true}
+
+// set records what a variable holds, or forgets it when unknown.
+func (g grammar) set(name string, op syntax.Operand) {
+	if op == (syntax.Operand{}) {
+		delete(g.vars, name)
+		return
+	}
+	g.vars[name] = op
+}
+
+// forget drops the variables a pattern binds: lower-case names, which
+// are bindings rather than variants or constants (Some(x), Point { y }).
+func (g grammar) forget(pattern *sitter.Node, src []byte) {
+	switch pattern.Kind() {
+	case "identifier", "shorthand_field_identifier":
+		if name := pattern.Utf8Text(src); !isUpper(name) {
+			delete(g.vars, name)
+		}
+		return
+	case "scoped_identifier", "scoped_type_identifier":
+		return // a path, such as Kind::Small, binds nothing
+	}
+	for i := uint(0); i < pattern.NamedChildCount(); i++ {
+		g.forget(pattern.NamedChild(i), src)
+	}
+}
+
+// results returns a function's result types (see unit.Unit.Results): the
+// type as returned, and the type a ? leaves of it, inside a Result or an
+// Option (the returned type itself otherwise). An async fn returns a
+// future, of no type here, and declares the types its .await and .await?
+// give, at positions 2 and 3. No return type gives none.
+func (g grammar) results(fn *sitter.Node, src []byte) []string {
+	ret := fn.ChildByFieldName("return_type")
+	if ret == nil {
+		return nil
+	}
+	if isAsync(fn, src) {
+		return append([]string{"", ""}, g.returned(ret, src)...)
+	}
+	return g.returned(ret, src)
+}
+
+// isAsync reports whether a function is an async fn.
+func isAsync(fn *sitter.Node, src []byte) bool {
+	for i := uint(0); i < fn.NamedChildCount(); i++ {
+		if c := fn.NamedChild(i); c.Kind() == "function_modifiers" && strings.Contains(c.Utf8Text(src), "async") {
+			return true
+		}
+	}
+	return false
+}
+
+// returned returns a return type and what a ? leaves of it.
+func (g grammar) returned(ret *sitter.Node, src []byte) []string {
+	written := strings.TrimSpace(ret.Utf8Text(src))
+	return []string{g.typeOf(written), unwrapped(written, g.typeOf)}
+}
+
+// unwrapped returns the type ? or unwrap() leaves of a value of the
+// written type, as typeOf writes it: the type inside a Result or an
+// Option, the type itself otherwise.
+func unwrapped(written string, typeOf func(string) string) string {
+	written = strings.TrimSpace(written)
+	switch unit.SimpleName(written) {
+	case "Result", "Option":
+		if open := strings.Index(written, "<"); open >= 0 && strings.HasSuffix(written, ">") {
+			return typeOf(firstTypeArgument(written[open+1 : len(written)-1]))
+		}
+		return ""
+	}
+	return typeOf(written)
+}
+
+// typeOf returns the type a method call on a value of the written type
+// reaches, as a simple name (see rustType).
+func (g grammar) typeOf(written string) string {
+	return rustType(written, g.self, g.generic, g.imports)
+}
+
+// wrappers are the smart pointers a method call sees through: x.m() on
+// an Arc<T> calls T's m.
+var wrappers = map[string]bool{"Box": true, "Arc": true, "Rc": true}
+
+// lifetime matches a lifetime at the start of a reference's type.
+var lifetime = regexp.MustCompile(`^'\w+\s*`)
+
+// rustType returns the path of the type whose methods a value of the
+// written type has, without type arguments, or "": references and mut
+// are stripped, Box, Arc and Rc looked through, Self is the impl's type
+// (self), a name the file imports is its import path (Client from use
+// reqwest::Client is reqwest::Client), a trait object (dyn, impl) or type
+// parameter (generic) is its trait's path, when one trait gives its
+// methods (see traitOf), and tuples, slices, function pointers and
+// lower-case (primitive) types give "".
+func rustType(written, self string, generic map[string]string, imports map[string]string) string {
+	t := strings.TrimSpace(written)
+	for {
+		switch {
+		case strings.HasPrefix(t, "&"):
+			t = strings.TrimSpace(t[1:])
+		case strings.HasPrefix(t, "'"):
+			t = lifetime.ReplaceAllString(t, "")
+		case strings.HasPrefix(t, "mut "):
+			t = strings.TrimSpace(t[4:])
+		default:
+			name := unit.SimpleName(t)
+			open := strings.Index(t, "<")
+			if !wrappers[name] || open < 0 || !strings.HasSuffix(t, ">") {
+				return typePath(t, self, generic, imports)
+			}
+			t = strings.TrimSpace(firstTypeArgument(t[open+1 : len(t)-1]))
+		}
+	}
+}
+
+// typePath returns a type's path as rustType writes it.
+func typePath(t, self string, generic map[string]string, imports map[string]string) string {
+	for _, trait := range []string{"dyn ", "impl "} {
+		if rest, ok := strings.CutPrefix(t, trait); ok {
+			return traitPath(traitOf(rest), self, imports)
+		}
+	}
+	for _, other := range []string{"(", "[", "fn", "*"} {
+		if strings.HasPrefix(t, other) {
+			return ""
+		}
+	}
+	if i := strings.Index(t, "<"); i >= 0 {
+		t = t[:i]
+	}
+	if strings.Contains(t, "(") {
+		return "" // Fn(u8) -> u8
+	}
+	path := strings.ReplaceAll(t, " ", "")
+	if bound, ok := generic[path]; ok {
+		return traitPath(bound, self, imports)
+	}
+	switch name := unit.SimpleName(path); {
+	case path == "Self":
+		return self
+	case name == "" || !isUpper(name):
+		return ""
+	case !strings.Contains(path, "::") && imports[path] != "":
+		return imports[path]
+	}
+	// An imported module at the root: m::Client after use crate::model as m.
+	if root, rest, ok := strings.Cut(path, "::"); ok && imports[root] != "" {
+		return imports[root] + "::" + rest
+	}
+	return path
+}
+
+// traitPath returns a trait's path as rustType writes a trait type:
+// marked "dyn " to tell it from a concrete type of the name.
+func traitPath(trait, self string, imports map[string]string) string {
+	if path := typePath(trait, self, nil, imports); path != "" {
+		return "dyn " + path
+	}
+	return ""
+}
+
+// markers are the standard traits a bound adds without giving the value
+// methods code calls on it.
+var markers = map[string]bool{"Send": true, "Sync": true, "Sized": true, "Unpin": true, "Copy": true, "Clone": true,
+	"Debug": true, "Default": true, "Display": true, "Eq": true, "PartialEq": true, "Hash": true, "Ord": true, "PartialOrd": true}
+
+// traitOf returns the trait among bounds (Store + Send + 'static) whose
+// methods a value of them has: the only one that is no marker, lifetime
+// or ?Sized, or "" when none is or several are.
+func traitOf(bounds string) string {
+	trait := ""
+	for _, b := range splitTopLevel(bounds, '+') {
+		b = strings.TrimSpace(b)
+		name := b
+		if i := strings.Index(name, "<"); i >= 0 {
+			name = name[:i]
+		}
+		if b == "" || strings.HasPrefix(b, "'") || strings.HasPrefix(b, "?") || markers[unit.SimpleName(name)] {
+			continue
+		}
+		if trait != "" {
+			return ""
+		}
+		trait = b
+	}
+	return trait
+}
+
+// splitTopLevel splits a list at each sep outside brackets.
+func splitTopLevel(list string, sep rune) []string {
+	var out []string
+	depth, start := 0, 0
+	for i, r := range list {
+		switch r {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 && (r != '>' || i == 0 || list[i-1] != '-') { // not the -> of Fn() -> T
+				depth--
+			}
+		case sep:
+			if depth == 0 {
+				out = append(out, list[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, list[start:])
+}
+
+// firstTypeArgument returns the first of comma-separated type arguments,
+// leaving commas inside nested brackets alone.
+func firstTypeArgument(args string) string {
+	depth := 0
+	for i, r := range args {
+		switch r {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				return args[:i]
+			}
+		}
+	}
+	return args
+}
+
 // IdiomaticForms names the idiomatic form of each concern the adapter
 // knows, which the map suggests where a codebase has no convention. Error
-// wrapping has none: map_err to a typed error and anyhow's context are
+// wrapping and error values have none: map_err to a typed error and
+// anyhow's context, and errors made from variants and with anyhow, are
 // both idiomatic, for libraries and applications.
 var IdiomaticForms = map[string]string{unit.ErrorChecks: "variant"}
 
@@ -89,9 +522,16 @@ func errorForm(n *sitter.Node, src []byte) unit.Form {
 			form.Concern, form.Form = unit.ErrorChecks, "variant"
 		}
 	case "macro_invocation":
-		// A macro's arguments are an opaque token tree: read matches!'s
-		// pattern, after the value, from its tokens.
-		if m := n.ChildByFieldName("macro"); m != nil && lastSegment(m.Utf8Text(src)) == "matches" {
+		m := n.ChildByFieldName("macro")
+		if m == nil {
+			break
+		}
+		switch lastSegment(m.Utf8Text(src)) {
+		case "bail", "anyhow":
+			form.Concern, form.Form = unit.ErrorValues, "anyhow"
+		case "matches":
+			// A macro's arguments are an opaque token tree: read matches!'s
+			// pattern, after the value, from its tokens.
 			pattern, guard := matchesPattern(n, src)
 			if p := errPattern.FindStringSubmatch(pattern); p != nil && isVariantPath(strings.ReplaceAll(p[1], " ", "")) {
 				form.Concern, form.Form = unit.ErrorChecks, "variant"
@@ -108,6 +548,14 @@ func errorForm(n *sitter.Node, src []byte) unit.Form {
 		}
 	case "call_expression":
 		callee := calleeOf(n)
+		if callee != nil && (callee.Kind() == "identifier" || callee.Kind() == "scoped_identifier") && lastSegment(callee.Utf8Text(src)) == "Err" {
+			if args := n.ChildByFieldName("arguments"); args != nil && args.NamedChildCount() == 1 {
+				if f := errorValue(args.NamedChild(0), src); f != "" {
+					form.Concern, form.Form = unit.ErrorValues, f
+				}
+			}
+			break
+		}
 		if callee == nil || callee.Kind() != "field_expression" {
 			break
 		}
@@ -129,6 +577,44 @@ func errorForm(n *sitter.Node, src []byte) unit.Form {
 		}
 	}
 	return form
+}
+
+// errorValue returns the form of the error an Err(..) holds: a variant
+// (Fault::Busy, Fault::Write(e), Fault::Long { .. }), or a string
+// (format!, a literal, .to_string(), .into() or .to_owned() on one, or
+// String::from). Anything else, such as an error passed on or made by a
+// constructor, is no form; anyhow! is recorded as the macro itself.
+func errorValue(n *sitter.Node, src []byte) string {
+	switch n.Kind() {
+	case "string_literal", "raw_string_literal":
+		return "string"
+	case "macro_invocation":
+		if m := n.ChildByFieldName("macro"); m != nil && lastSegment(m.Utf8Text(src)) == "format" {
+			return "string"
+		}
+	case "call_expression":
+		callee := calleeOf(n)
+		switch {
+		case callee == nil:
+		case callee.Kind() == "field_expression":
+			field, value := callee.ChildByFieldName("field"), callee.ChildByFieldName("value")
+			if field != nil && value != nil && (value.Kind() == "string_literal" || value.Kind() == "raw_string_literal") {
+				switch field.Utf8Text(src) {
+				case "to_string", "into", "to_owned":
+					return "string"
+				}
+			}
+		case callee.Utf8Text(src) == "String::from" || strings.HasSuffix(callee.Utf8Text(src), "::String::from"):
+			return "string"
+		case isVariantPath(callee.Utf8Text(src)):
+			return "variant"
+		}
+	case "scoped_identifier", "struct_expression":
+		if isVariantPath(n.Utf8Text(src)) {
+			return "variant"
+		}
+	}
+	return ""
 }
 
 // errPattern finds an Err(Path ..) pattern in a macro's text.
@@ -268,12 +754,28 @@ func Parse(path string, src []byte) ([]unit.Unit, unit.Decls, error) {
 	var decls unit.Decls
 	var marked error
 	err := syntax.Parse(language, src, func(root *sitter.Node) {
-		e := extractor{path: path, src: src}
+		e := extractor{path: path, src: src, uses: map[[2]uint]map[string]string{}}
 		e.walk(root, scope{}, IsTestPath(path), nil)
 		units, decls = e.units, e.decls
 		marked = syntax.MarkIgnored(root, src, units, &decls)
 	})
+	if isBinaryPath(path) {
+		for i := range units {
+			units[i].Forms = slices.DeleteFunc(units[i].Forms, func(f unit.Form) bool { return f.Concern == unit.ErrorValues })
+		}
+	}
 	return units, decls, errors.Join(err, marked)
+}
+
+// isBinaryPath reports whether a file belongs to a binary by Cargo's
+// layout: src/main.rs, or under src/bin/. A binary's errors are printed
+// rather than matched by callers, so how it makes them is no error-values
+// form: measured, the CLIs of lns-inference-router return usage messages
+// as strings in a workspace that otherwise makes errors from variants.
+func isBinaryPath(path string) bool {
+	path = filepath.ToSlash(path)
+	return path == "src/main.rs" || strings.HasSuffix(path, "/src/main.rs") ||
+		strings.HasPrefix(path, "src/bin/") || strings.Contains(path, "/src/bin/")
 }
 
 // Traits returns the names of the traits a file declares, in source order.
@@ -290,35 +792,40 @@ func Traits(src []byte) []string {
 // refers to: "use a::b::{c, d as e}" gives c -> a::b::c and e -> a::b::d.
 // Wildcard imports and imports inside #[cfg(test)] modules are skipped.
 func Imports(src []byte) map[string]string {
+	var out map[string]string
+	_ = syntax.Parse(language, src, func(root *sitter.Node) { out = importsOf(root, src) })
+	return out
+}
+
+// importsOf is Imports for a parsed file's root.
+func importsOf(root *sitter.Node, src []byte) map[string]string {
 	out := map[string]string{}
-	_ = syntax.Parse(language, src, func(root *sitter.Node) {
-		var walk func(n *sitter.Node)
-		walk = func(n *sitter.Node) {
-			if n.Kind() == "use_declaration" {
-				if arg := n.ChildByFieldName("argument"); arg != nil {
-					collectUse(arg, "", src, out)
-				}
-				return
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n.Kind() == "use_declaration" {
+			if arg := n.ChildByFieldName("argument"); arg != nil {
+				collectUse(arg, "", src, out)
 			}
-			var attrs []string
-			for i := uint(0); i < n.ChildCount(); i++ {
-				child := n.Child(i)
-				switch {
-				case child.Kind() == "attribute_item":
-					attrs = append(attrs, child.Utf8Text(src))
-					continue
-				case child.IsExtra():
-					continue
-				case child.Kind() == "mod_item" && slices.ContainsFunc(attrs, isCfgTest):
-					// test modules' imports are not dependencies of the code
-				default:
-					walk(child)
-				}
-				attrs = nil
-			}
+			return
 		}
-		walk(root)
-	})
+		var attrs []string
+		for i := uint(0); i < n.ChildCount(); i++ {
+			child := n.Child(i)
+			switch {
+			case child.Kind() == "attribute_item":
+				attrs = append(attrs, child.Utf8Text(src))
+				continue
+			case child.IsExtra():
+				continue
+			case child.Kind() == "mod_item" && slices.ContainsFunc(attrs, isCfgTest):
+				// test modules' imports are not dependencies of the code
+			default:
+				walk(child)
+			}
+			attrs = nil
+		}
+	}
+	walk(root)
 	return out
 }
 
@@ -372,6 +879,49 @@ type extractor struct {
 	src   []byte
 	units []unit.Unit
 	decls unit.Decls
+	// uses caches each module's use imports (see visibleImports), by the
+	// span of the module's item list.
+	uses map[[2]uint]map[string]string
+}
+
+// visibleImports returns the use imports an item sees: those of the
+// module it is declared in, the file's top level or an inline mod's
+// body. A module does not see its parent's imports.
+func (e *extractor) visibleImports(item *sitter.Node) map[string]string {
+	module := item.Parent()
+	for module != nil && module.Kind() != "source_file" && module.Kind() != "declaration_list" {
+		module = module.Parent()
+	}
+	// An impl's or trait's item list is not a module: keep climbing to
+	// the mod or file holding it.
+	for module != nil && module.Kind() == "declaration_list" && module.Parent() != nil && module.Parent().Kind() != "mod_item" {
+		module = module.Parent().Parent()
+		for module != nil && module.Kind() != "source_file" && module.Kind() != "declaration_list" {
+			module = module.Parent()
+		}
+	}
+	if module == nil {
+		return nil
+	}
+	key := span(module)
+	if _, ok := e.uses[key]; !ok {
+		e.uses[key] = usesIn(module, e.src)
+	}
+	return e.uses[key]
+}
+
+// usesIn returns the imports of the use declarations directly in a
+// module's item list or a block, as Imports gives them.
+func usesIn(container *sitter.Node, src []byte) map[string]string {
+	out := map[string]string{}
+	for i := uint(0); i < container.NamedChildCount(); i++ {
+		if n := container.NamedChild(i); n.Kind() == "use_declaration" {
+			if arg := n.ChildByFieldName("argument"); arg != nil {
+				collectUse(arg, "", src, out)
+			}
+		}
+	}
+	return out
 }
 
 // walk finds function items, tracking the enclosing impl or trait name and
@@ -381,6 +931,8 @@ type extractor struct {
 // inside a trait impl, the trait implemented.
 type scope struct {
 	owner, trait string
+	// module is the inline module path within the file (outer::inner).
+	module string
 }
 
 func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
@@ -390,7 +942,7 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 		return
 	case "struct_item":
 		e.addTypeName(n)
-		e.addStruct(n, test, own)
+		e.addStruct(n, sc, test, own)
 		return
 	case "enum_item":
 		e.addTypeName(n)
@@ -422,6 +974,14 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 			})
 		}
 		sc.trait = ""
+	case "mod_item":
+		// mod x { .. } opens an inline module; mod x; names a file.
+		if name := n.ChildByFieldName("name"); name != nil && n.ChildByFieldName("body") != nil {
+			if sc.module != "" {
+				sc.module += "::"
+			}
+			sc.module += name.Utf8Text(e.src)
+		}
 	}
 	var attrs []string
 	for i := uint(0); i < n.ChildCount(); i++ {
@@ -436,8 +996,8 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 		childTest := test
 		switch child.Kind() {
 		case "function_item":
-			childTest = test || slices.ContainsFunc(attrs, isTestAttr)
-		case "mod_item":
+			childTest = test || slices.ContainsFunc(attrs, isTestAttr) || slices.ContainsFunc(attrs, isCfgTest)
+		case "mod_item", "impl_item":
 			childTest = test || slices.ContainsFunc(attrs, isCfgTest)
 		}
 		e.walk(child, sc, childTest, attrs)
@@ -446,16 +1006,25 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 }
 
 // isTestAttr reports whether an attribute marks a test function, such as
-// #[test], #[tokio::test(...)], #[rstest] or #[test_case(...)].
+// #[test], #[tokio::test(...)], #[rstest], #[test_case(...)], #[bench], or
+// a runner's own named after test (#[wasm_bindgen_test]).
 func isTestAttr(attr string) bool {
 	name := attrName(attr)
-	return name == "test" || name == "rstest" || name == "test_case"
+	return name == "test" || strings.HasSuffix(name, "_test") || name == "rstest" || name == "test_case" || name == "bench"
 }
 
 // isCfgTest reports whether an attribute limits an item to test builds.
 func isCfgTest(attr string) bool {
 	compact := strings.Join(strings.Fields(attr), "")
 	return compact == "#[cfg(test)]" || strings.HasPrefix(compact, "#[cfg(all(test,")
+}
+
+// inBenches reports whether a file is in a benches/ directory, whose
+// functions a benchmark harness registers (Criterion's criterion_group!):
+// all of them are test cases.
+func inBenches(path string) bool {
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	return slices.Contains(parts[:len(parts)-1], "benches")
 }
 
 // IsTestPath reports whether a file holds tests by Cargo and Rust
@@ -482,7 +1051,36 @@ func (e *extractor) addFunction(n *sitter.Node, sc scope, test bool, attrs []str
 	if owner != "" {
 		name = owner + "::" + name
 	}
-	s := syntax.Flatten(n, e.src, rustGrammar)
+	// The signature sees its module's imports; each block of the body also
+	// those its own use declarations add (see Visit).
+	g := grammar{self: unit.SimpleName(owner), generic: typeParameters(n, e.src), imports: maps.Clone(e.visibleImports(n)),
+		vars: map[string]syntax.Operand{}, entries: &map[[2]uint]map[string]syntax.Operand{},
+		calls: map[[2]uint]int{}, chains: map[int]produced{}}
+	if impl := enclosingImpl(n); impl != nil {
+		maps.Copy(g.generic, typeParameters(impl, e.src))
+	}
+	if params := n.ChildByFieldName("parameters"); params != nil {
+		for i := uint(0); i < params.NamedChildCount(); i++ {
+			p := params.NamedChild(i)
+			pattern, typ := p.ChildByFieldName("pattern"), p.ChildByFieldName("type")
+			if pattern != nil && pattern.Kind() == "mut_pattern" && pattern.NamedChildCount() > 0 {
+				pattern = pattern.NamedChild(pattern.NamedChildCount() - 1)
+			}
+			if p.Kind() == "parameter" && pattern != nil && typ != nil && pattern.Kind() == "identifier" {
+				g.set(pattern.Utf8Text(e.src), syntax.Operand{Type: g.typeOf(typ.Utf8Text(e.src))})
+			}
+		}
+	}
+	if g.imports == nil {
+		g.imports = map[string]string{}
+	}
+	results := g.results(n, e.src)
+	s := syntax.Flatten(n, e.src, g)
+	for k, p := range g.chains {
+		if j, ok := g.calls[p.call]; ok {
+			s.Calls[k].From, s.Calls[k].Result = j+1, p.result
+		}
+	}
 	e.units = append(e.units, unit.Unit{
 		File:      e.path,
 		Name:      name,
@@ -491,12 +1089,15 @@ func (e *extractor) addFunction(n *sitter.Node, sc scope, test bool, attrs []str
 		Shape:     similarity.HashSymbols(s.Seq),
 		Nodes:     s.Nodes,
 		Test:      test,
+		Module:    sc.module,
+		TestCase:  slices.ContainsFunc(attrs, isTestAttr) || inBenches(e.path),
 		Leaves:    s.Leaves,
 		Seq:       s.Seq,
 		SeqLines:  s.Lines,
 		Blocks:    s.Blocks,
 		Trait:     sc.trait,
 		Calls:     s.Calls,
+		Results:   results,
 		Public:    isPublic(n, e.src),
 		External:  (owner == "" && name == "main") || slices.ContainsFunc(attrs, isExternalAttr),
 		Forwards:  forwards(n, e.src),
@@ -609,6 +1210,10 @@ var resultAdapters = map[string]bool{
 	"map_err": true, "context": true, "with_context": true, "unwrap": true, "expect": true,
 }
 
+// unwrapping are the resultAdapters that take the value out of a Result
+// or Option, as ? does.
+var unwrapping = map[string]bool{"unwrap": true, "expect": true}
+
 // producer returns the call that produced a bound value, looking through
 // ?, .await and resultAdapters (db.transaction().await.map_err(retry)? is
 // produced by transaction).
@@ -679,6 +1284,7 @@ func closing(stmt *sitter.Node, name string, src []byte) string {
 // borrowed: fn f(a, b) { g(a, &b) }. Constructors (Self(x), Some(x)) and
 // calls on fields (self.inner.get(x)) do not count, and nor do functions
 // without parameters besides self.
+// ddslop:ignore the Go adapter's algorithm over Rust's node kinds; one table-driven home on a third language
 func forwards(fn *sitter.Node, src []byte) string {
 	params, body := fn.ChildByFieldName("parameters"), fn.ChildByFieldName("body")
 	if params == nil || body == nil || body.NamedChildCount() != 1 {
@@ -782,6 +1388,7 @@ func (e *extractor) addTypeName(n *sitter.Node) {
 }
 
 // addEnum records an enum and its variants.
+// ddslop:ignore fills unit.Enum as addStruct fills unit.Struct; only a data model change could merge them
 func (e *extractor) addEnum(n *sitter.Node, test bool) {
 	name, body := n.ChildByFieldName("name"), n.ChildByFieldName("body")
 	if name == nil || body == nil || n.HasError() {
@@ -832,15 +1439,25 @@ func (e *extractor) addImpl(n *sitter.Node, sc scope, test bool) {
 		}
 	}
 	e.decls.Impls = append(e.decls.Impls, unit.Impl{
-		File: e.path, Trait: sc.trait, Type: ty,
+		File: e.path, Trait: sc.trait, TraitPath: traitPathOf(n.ChildByFieldName("trait"), e.src), Type: ty,
 		StartLine: syntax.Line(n.StartPosition()), EndLine: syntax.Line(n.EndPosition()),
 		Blanket: blanket, Test: test,
 	})
 }
 
+// traitPathOf returns a trait's path as written, without type arguments.
+func traitPathOf(trait *sitter.Node, src []byte) string {
+	if trait == nil {
+		return ""
+	}
+	path, _, _ := strings.Cut(syntax.Compact(trait.Utf8Text(src)), "<")
+	return path
+}
+
 // addStruct records a struct with named fields; unit and tuple structs are
 // left out.
-func (e *extractor) addStruct(n *sitter.Node, test bool, attrs []string) {
+func (e *extractor) addStruct(n *sitter.Node, sc scope, test bool, attrs []string) {
+	test = test || slices.ContainsFunc(attrs, isCfgTest) // #[cfg(test)] struct
 	name, body := n.ChildByFieldName("name"), n.ChildByFieldName("body")
 	if name == nil || body == nil || body.Kind() != "field_declaration_list" || n.HasError() {
 		return
@@ -854,6 +1471,7 @@ func (e *extractor) addStruct(n *sitter.Node, test bool, attrs []string) {
 		Test:      test,
 		Converts:  serdeConversions(attrs),
 	}
+	generic := typeParameters(n, e.src)
 	eachMember(body, "field_declaration", func(f, fname *sitter.Node) {
 		if ftype := f.ChildByFieldName("type"); ftype != nil {
 			ty.Fields = append(ty.Fields, unit.Field{
@@ -861,9 +1479,76 @@ func (e *extractor) addStruct(n *sitter.Node, test bool, attrs []string) {
 				Type: syntax.Compact(ftype.Utf8Text(e.src)),
 				Line: syntax.Line(f.StartPosition()),
 			})
+			// A field of no type is recorded too, as unknown (""), so that a
+			// struct of the same name in another module cannot type it.
+			typeOf := func(written string) string { return rustType(written, ty.Name, generic, e.visibleImports(n)) }
+			e.decls.FieldTypes = append(e.decls.FieldTypes, unit.FieldType{Struct: ty.Name, Field: fname.Utf8Text(e.src),
+				Type: typeOf(ftype.Utf8Text(e.src)), Unwrapped: unwrapped(ftype.Utf8Text(e.src), typeOf),
+				File: e.path, Module: sc.module, Test: test})
 		}
 	})
 	e.decls.Structs = append(e.decls.Structs, ty)
+}
+
+// typeParameters returns the type parameters a function, impl or struct
+// declares (<T: Saver, U>), leaving out lifetimes, each with the trait
+// its bounds there and in the where clause give it (see traitOf), or "".
+func typeParameters(n *sitter.Node, src []byte) map[string]string {
+	bounds := map[string][]string{}
+	add := func(name, bound *sitter.Node) {
+		if name == nil {
+			return
+		}
+		b := bounds[name.Utf8Text(src)]
+		if bound != nil {
+			b = append(b, strings.TrimPrefix(strings.TrimSpace(bound.Utf8Text(src)), ":")) // : Send + Store
+		}
+		bounds[name.Utf8Text(src)] = b
+	}
+	list := n.ChildByFieldName("type_parameters")
+	for i := uint(0); list != nil && i < list.NamedChildCount(); i++ {
+		p := list.NamedChild(i)
+		switch {
+		case p.Kind() == "type_identifier":
+			add(p, nil)
+		case p.ChildByFieldName("name") != nil:
+			add(p.ChildByFieldName("name"), p.ChildByFieldName("bounds"))
+		case p.ChildByFieldName("left") != nil:
+			add(p.ChildByFieldName("left"), p.ChildByFieldName("bounds"))
+		}
+	}
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		if w := n.NamedChild(i); w.Kind() == "where_clause" {
+			for j := uint(0); j < w.NamedChildCount(); j++ {
+				left := w.NamedChild(j).ChildByFieldName("left")
+				if left == nil {
+					continue
+				}
+				if _, declared := bounds[left.Utf8Text(src)]; declared {
+					add(left, w.NamedChild(j).ChildByFieldName("bounds"))
+				}
+			}
+		}
+	}
+	out := map[string]string{}
+	for name, b := range bounds {
+		out[name] = traitOf(strings.Join(b, "+"))
+	}
+	return out
+}
+
+// enclosingImpl returns the impl block a function item is declared in,
+// or nil.
+func enclosingImpl(fn *sitter.Node) *sitter.Node {
+	for p := fn.Parent(); p != nil; p = p.Parent() {
+		switch p.Kind() {
+		case "impl_item":
+			return p
+		case "function_item", "source_file", "mod_item":
+			return nil
+		}
+	}
+	return nil
 }
 
 // addConst records a constant or static item.
@@ -908,7 +1593,7 @@ func serdeConversions(attrs []string) []string {
 }
 
 // recordCall notes a call expression by the shape of its function.
-func recordCall(s *syntax.Shaper, n *sitter.Node) {
+func (g grammar) recordCall(s *syntax.Shaper, n *sitter.Node) {
 	fn := n.ChildByFieldName("function")
 	for fn != nil && fn.Kind() == "generic_function" {
 		fn = fn.ChildByFieldName("function") // turbofish: f::<T>(...)
@@ -927,19 +1612,87 @@ func recordCall(s *syntax.Shaper, n *sitter.Node) {
 		}
 		if path := fn.ChildByFieldName("path"); path != nil {
 			c.Qualifier = path.Utf8Text(s.Src)
+			// An imported root is written as its import's path, by the
+			// imports visible here: helpers::log after use crate::util as
+			// helpers is crate::util::log.
+			if root, rest, found := strings.Cut(c.Qualifier, "::"); g.imports[root] != "" {
+				c.Qualifier = g.imports[root]
+				if found {
+					c.Qualifier += "::" + rest
+				}
+			}
 		}
 	case "field_expression":
 		c.Kind = unit.MethodCall
 		if field := fn.ChildByFieldName("field"); field != nil {
 			c.Name = field.Utf8Text(s.Src)
 		}
-		if value := fn.ChildByFieldName("value"); value != nil && value.Kind() == "self" {
+		switch value := fn.ChildByFieldName("value"); {
+		case value == nil:
+		case value.Kind() == "self":
 			c.Qualifier = "self"
+		case value.Kind() == "identifier":
+			op := g.vars[value.Utf8Text(s.Src)]
+			c.Type, c.From, c.Result = op.Type, op.From, op.Result
+		case value.Kind() == "field_expression" || triedField(value):
+			// self.ctx.db.query(), req.store.get(), make().inner.run(): the
+			// fields followed from where the chain starts, one a ? unwraps
+			// marked "?" (make().inner?.run()).
+			var fields []string
+			base, unwrap := value, ""
+			for base != nil && (base.Kind() == "field_expression" || triedField(base)) {
+				if triedField(base) {
+					base, unwrap = base.NamedChild(0), "?"
+					continue
+				}
+				f := base.ChildByFieldName("field")
+				if f == nil {
+					break
+				}
+				fields = append([]string{f.Utf8Text(s.Src) + unwrap}, fields...)
+				base, unwrap = base.ChildByFieldName("value"), ""
+			}
+			switch {
+			case base == nil || base.Kind() == "field_expression":
+				fields = nil
+			case base.Kind() == "self":
+			case base.Kind() == "identifier":
+				op := g.vars[base.Utf8Text(s.Src)]
+				if op == (syntax.Operand{}) {
+					fields = nil // an untyped start types nothing
+				}
+				c.Type, c.From, c.Result = op.Type, op.From, op.Result
+			default:
+				if p, ok := callResult(base); ok {
+					g.chains[len(s.Calls)] = p // recorded after this call
+				} else {
+					fields = nil
+				}
+			}
+			c.Field = strings.Join(fields, ".")
 		}
 	default:
 		return // closures and other callees are not resolved by name
 	}
+	if c.Kind == unit.MethodCall {
+		switch {
+		case unwrapping[c.Name]:
+			c.Adapts = 2
+		case resultAdapters[c.Name]:
+			c.Adapts = 1
+		}
+		if p, ok := callResult(fn.ChildByFieldName("value")); ok {
+			g.chains[len(s.Calls)] = p // recorded after this call
+		}
+	}
+	g.calls[span(n)] = len(s.Calls)
 	s.Calls = append(s.Calls, c)
+}
+
+// triedField reports whether a node is a field a ? unwraps: inner? in
+// make().inner?.run().
+func triedField(n *sitter.Node) bool {
+	return n.Kind() == "try_expression" && n.NamedChildCount() > 0 && n.NamedChild(0).Kind() == "field_expression"
 }
 
 // recordMatch notes a match whose arm patterns hold at least

@@ -127,6 +127,7 @@ type Occurrence struct {
 }
 
 // Difference is one set of values that differ between the copies.
+// ddslop:ignore JSON output: mirrors clone.Difference on purpose, with string kinds for the wire
 type Difference struct {
 	Kind   string   `json:"kind"`
 	Values []string `json:"values"`
@@ -180,6 +181,7 @@ const (
 	reuseExisting    = "reuse-existing"
 	extractCommon    = "extract-common"
 	followConvention = "follow-convention"
+	breakCycle       = "break-cycle"
 	kindIdentifier   = "identifier"
 	kindType         = "type"
 	kindLiteral      = "literal"
@@ -188,6 +190,10 @@ const (
 // ConventionDrift is the kind of a candidate breaking a convention its
 // peers follow; baselines know it by its fingerprint.
 const ConventionDrift = "convention-drift"
+
+// DependencyCycle is the kind of a candidate for modules of a crate calling
+// each other in a loop; baselines know it by its fingerprint.
+const DependencyCycle = "dependency-cycle"
 
 // PipelinePattern is the way forward for a parallel-flow family: extract
 // the pipeline its features copy (the map names it too).
@@ -216,6 +222,23 @@ type Findings struct {
 	Kinds      []pattern.StringKind
 	Params     []pattern.ParamGroup
 	Drifts     []Drift
+	Cycles     []Cycle
+}
+
+// Cycle is modules of a crate calling each other in a loop: the calls
+// closing it (a pair calling each other, or each step of a shortest loop),
+// each as "from -> to" in Steps with its call site. Key names the crate
+// and the modules, so the cycle keeps its fingerprint as code moves.
+type Cycle struct {
+	Key   string
+	Steps []string
+	Sites []CycleSite
+}
+
+// CycleSite is a call closing a cycle: the calling unit and the line.
+type CycleSite struct {
+	Unit unit.Unit
+	Line int
 }
 
 // Drift is another form for a concern where the code has a convention, in
@@ -257,6 +280,7 @@ func Build(languageOf func(file string) string, f Findings, summary Summary) Rep
 	for _, g := range f.Groups {
 		candidates = append(candidates, groupCandidate(languageOf(g.Units[0].File), g))
 	}
+
 	for _, nm := range f.NearMisses {
 		candidates = append(candidates, nearMissCandidate(languageOf(nm.Units[0].File), nm))
 	}
@@ -301,6 +325,9 @@ func Build(languageOf func(file string) string, f Findings, summary Summary) Rep
 	}
 	for _, d := range f.Drifts {
 		candidates = append(candidates, driftCandidate(languageOf(d.Unit.File), d))
+	}
+	for _, c := range f.Cycles {
+		candidates = append(candidates, cycleCandidate(languageOf(c.Sites[0].Unit.File), c))
 	}
 	candidates = slices.DeleteFunc(candidates, mostlyParameters)
 	slices.SortStableFunc(candidates, func(a, b Candidate) int {
@@ -442,10 +469,20 @@ func mostlyParameters(c Candidate) bool {
 	return clone.MostlyParameters(c.Score.Nodes, c.Suggestion.Parameters)
 }
 
+// groupFingerprint identifies a group by its shape. A group of test
+// helpers gets its own: the same shape may be copied in production too,
+// and each candidate stays addressable (ddslop explain).
+func groupFingerprint(language string, g clone.Group) string {
+	if g.TestHelpers {
+		return fmt.Sprintf("%s:test-helper:%016x", language, g.Units[0].Shape)
+	}
+	return fmt.Sprintf("%s:%016x", language, g.Units[0].Shape)
+}
+
 func groupCandidate(language string, g clone.Group) Candidate {
 	first := g.Units[0]
 	c := Candidate{
-		Fingerprint: fmt.Sprintf("%s:%016x", language, first.Shape),
+		Fingerprint: groupFingerprint(language, g),
 		Language:    language,
 		Kind:        exactClone,
 		Similarity:  1,
@@ -713,6 +750,22 @@ func driftCandidate(language string, d Drift) Candidate {
 	return c
 }
 
+// cycleCandidate proposes breaking a loop of calls between modules. Which
+// call is the wrong way is not for ddslop to say, so it lists them all,
+// one occurrence per call line: diff mode then reports the cycle when a
+// change touched one of its calls. It copies nothing.
+func cycleCandidate(language string, c Cycle) Candidate {
+	cand := newCandidate(language, DependencyCycle, DependencyCycle, c.Key,
+		Suggestion{Action: breakCycle},
+		Score{Nodes: len(c.Sites), Lines: len(c.Sites), Occurrences: len(c.Sites)}, nil)
+	for _, s := range c.Sites {
+		cand.Occurrences = append(cand.Occurrences, Occurrence{File: s.Unit.File, Name: s.Unit.Name, StartLine: s.Line, EndLine: s.Line})
+	}
+	cand.Values = c.Steps
+	cand.Concern = "layers"
+	return cand
+}
+
 // newCandidate builds a candidate without differences. Its fingerprint is
 // language:tag:hash(key), where key identifies what the occurrences share.
 func newCandidate(language, kind, tag, key string, s Suggestion, score Score, occs []Occurrence) Candidate {
@@ -790,7 +843,7 @@ func Headline(c Candidate) string {
 		fmt.Fprintf(&b, " (%.0f%% similar)", 100*c.Similarity)
 	}
 	fmt.Fprintf(&b, ": %s", size(c))
-	if c.Kind != ConventionDrift { // a drift copies no code
+	if c.Kind != ConventionDrift && c.Kind != DependencyCycle { // they copy no code
 		fmt.Fprintf(&b, " (%d nodes)", c.Score.Nodes)
 	}
 	fmt.Fprintf(&b, ", %s", c.Suggestion.Action)
@@ -809,8 +862,11 @@ func Headline(c Candidate) string {
 // size describes a candidate's extent: its lines, and the number of copies
 // when there are several.
 func size(c Candidate) string {
-	if c.Kind == ConventionDrift { // places breaking a convention, not copies
+	switch c.Kind {
+	case ConventionDrift: // places breaking a convention, not copies
 		return fmt.Sprintf("%d place(s) using %s", c.Score.Occurrences, strings.Join(c.Values, ", "))
+	case DependencyCycle:
+		return fmt.Sprintf("modules calling each other in a loop, %s", strings.Join(c.Values, ", "))
 	}
 	if c.Score.Occurrences == 1 {
 		return fmt.Sprintf("%d lines", c.Score.Lines)

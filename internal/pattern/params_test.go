@@ -35,7 +35,7 @@ func TestParameterGroupsFindsTheLargestSetPassedTogether(t *testing.T) {
 		withParams("other", "build:i64", "environment:&str", "transaction:&Transaction"),
 	}
 	var got []string
-	for _, g := range ParameterGroups(units) {
+	for _, g := range ParameterGroups(units, nil) {
 		var params, names []string
 		for _, p := range g.Params {
 			params = append(params, p.Name)
@@ -64,7 +64,7 @@ func TestParameterGroupsKeepUnrelatedGroupsApart(t *testing.T) {
 			withParams(fmt.Sprintf("worker%d", i), "gate:Gate", "hot:Conn", "stopping:Stopping", "build:i32"))
 	}
 	// The groups share one parameter only (build): two concepts.
-	if got := len(ParameterGroups(units)); got != 2 {
+	if got := len(ParameterGroups(units, nil)); got != 2 {
 		t.Errorf("got %d groups, want 2", got)
 	}
 }
@@ -85,7 +85,7 @@ func TestParameterGroupsAreDeterministic(t *testing.T) {
 	units = append(units, withParams("handle", "db:&Db", "fleet:Uuid", "token:&str"))
 	describe := func() string {
 		var out []string
-		for _, g := range ParameterGroups(units) {
+		for _, g := range ParameterGroups(units, nil) {
 			var ps []string
 			for _, p := range g.Params {
 				ps = append(ps, p.Name)
@@ -111,7 +111,42 @@ func TestParameterGroupsLeaveOutMethodsCalledViaInterfaces(t *testing.T) {
 		u.Dispatched = true
 		units = append(units, u)
 	}
-	if got := ParameterGroups(units); len(got) != 0 {
+	if got := ParameterGroups(units, nil); len(got) != 0 {
 		t.Errorf("got %d groups of interface methods, want none", len(got))
+	}
+}
+
+// Functions with the parameters of a function type declared in their own
+// Go package have their signature dictated: they are values of that type,
+// such as the commands of a command table. A type elsewhere, or in test
+// code, dictates nothing about them.
+func TestParameterGroupsLeaveOutFunctionsOfDeclaredFunctionTypes(t *testing.T) {
+	commands := func(file string) []unit.Unit {
+		var units []unit.Unit
+		for i := range 4 {
+			u := withParams(fmt.Sprintf("run%d", i), "args:[]string", "stdout:io.Writer", "stderr:io.Writer")
+			u.File = file
+			u.Types = "([]string, io.Writer, io.Writer) (int)"
+			units = append(units, u)
+		}
+		return units
+	}
+	sig := "([]string, io.Writer, io.Writer) (int)"
+	for _, tc := range []struct {
+		name     string
+		units    []unit.Unit
+		funcType unit.FuncType
+		want     int
+	}{
+		{"same package", commands("internal/cli/map.go"), unit.FuncType{File: "internal/cli/cli.go", Types: sig}, 0},
+		{"other package", commands("internal/cli/map.go"), unit.FuncType{File: "internal/report/report.go", Types: sig}, 1},
+		{"test code", commands("internal/cli/map.go"), unit.FuncType{File: "internal/cli/cli_test.go", Types: sig, Test: true}, 1},
+		{"not Go", commands("internal/cli/map.rs"), unit.FuncType{File: "internal/cli/cli.go", Types: sig}, 1},
+		{"other results", commands("internal/cli/map.go"), unit.FuncType{File: "internal/cli/cli.go", Types: "([]string, io.Writer, io.Writer) (bool)"}, 1},
+		{"with a Context", commands("internal/cli/map.go"), unit.FuncType{File: "internal/cli/cli.go", Types: "(context.Context, []string, io.Writer, io.Writer) (int)"}, 1},
+	} {
+		if got := len(ParameterGroups(tc.units, []unit.FuncType{tc.funcType})); got != tc.want {
+			t.Errorf("%s: got %d groups, want %d", tc.name, got, tc.want)
+		}
 	}
 }

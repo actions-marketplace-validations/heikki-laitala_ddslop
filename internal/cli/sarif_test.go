@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,11 +46,7 @@ type sarifLocation struct {
 
 func decodeSARIF(t *testing.T, out string) sarifLog {
 	t.Helper()
-	var l sarifLog
-	if err := json.Unmarshal([]byte(out), &l); err != nil {
-		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
-	}
-	return l
+	return decodeJSON[sarifLog](t, out)
 }
 
 func TestCheckSARIF(t *testing.T) {
@@ -70,7 +65,7 @@ func TestCheckSARIF(t *testing.T) {
 	for _, r := range l.Runs[0].Tool.Driver.Rules {
 		rules = append(rules, r.ID)
 	}
-	if strings.Join(rules, " ") != "exact-clone renamed-clone near-miss block-clone parallel-flow duplicate-type duplicate-constant inlined-constant dead-code pass-through single-impl-trait shared-preamble setup-teardown string-kinds parameter-group convention-drift" {
+	if strings.Join(rules, " ") != "exact-clone renamed-clone near-miss block-clone parallel-flow duplicate-type duplicate-constant inlined-constant dead-code pass-through single-impl-trait shared-preamble setup-teardown string-kinds parameter-group convention-drift dependency-cycle" {
 		t.Errorf("rules = %v, want every candidate kind", rules)
 	}
 	if len(l.Runs[0].Results) != 1 {

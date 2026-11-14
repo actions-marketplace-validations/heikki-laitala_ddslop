@@ -74,10 +74,10 @@ These are requirements, not suggestions.
   code: extract on the third occurrence, and only when the copies change for
   the same reason; a wrong abstraction is worse than two copies. As a
   duplication linter, ddslop must stay clean under its own analysis: CI
-  runs it on its own code against `.ddslop-baseline.json`. Fix new
-  candidates; record one in the baseline (`ddslop baseline`) only when the
-  copies share a shape rather than logic, and say why in the commit.
-  `dupl` in `make lint` stays as a second check.
+  runs it on its own code with no baseline and fails on any candidate. Fix
+  each one; when the copies share a shape rather than logic, mark one with
+  `// ddslop:ignore <reason>` saying why instead. `dupl` in `make lint`
+  stays as a second check.
 
 ## TDD (mandatory for features and behaviour fixes)
 
@@ -103,3 +103,13 @@ boundaries we own, never the behaviour under test. Exploratory spikes inform
 the design but are rebuilt test-first. Coverage stays at or above 80%,
 without excluding files or weakening assertions to reach it; check with
 `make cover`.
+
+## ddslop
+
+Before starting a feature, run `ddslop map --format json .` to see the
+codebase's layers and the helpers it already shares, and follow them.
+Before finishing a code change, run `ddslop check --format json --diff HEAD .`
+(or `--diff` against the base branch) and refactor the duplication it
+reports: occurrences marked `"changed": true` are copies your change added
+or edited. Prefer reusing existing code over adding another copy. See the
+ddslop skill for how to read candidates and act on them.

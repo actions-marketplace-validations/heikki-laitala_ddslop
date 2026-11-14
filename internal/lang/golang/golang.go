@@ -3,9 +3,12 @@ package golang
 
 import (
 	"errors"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	gogrammar "github.com/tree-sitter/tree-sitter-go/bindings/go"
@@ -43,6 +46,19 @@ var leafKinds = map[string]unit.LeafKind{
 type grammar struct {
 	receiver string
 	packages map[string]string // imported name -> import path
+	// vars maps the function's variables whose type the code states, or
+	// that hold a call's result, to that operand, as declarations are
+	// visited.
+	vars map[string]syntax.Operand
+	// calls maps a call's syntax node (its byte range) to its index among
+	// the unit's calls, and chains a method call's index to the call its
+	// operand is (s.Store().Save()), which is recorded after it.
+	calls  map[[2]uint]int
+	chains map[int][2]uint
+	// scopes are the open lexical scopes, innermost last.
+	scopes *[]*varScope
+	// generic names the type parameters of the function and its receiver.
+	generic map[string]bool
 }
 
 // Prefix keeps Go's symbols apart from other languages' alike-named kinds.
@@ -81,6 +97,12 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 	switch n.Kind() {
 	case "call_expression":
 		if c, ok := g.call(n, s.Src); ok {
+			g.calls[span(n)] = len(s.Calls)
+			if fn := n.ChildByFieldName("function"); c.Kind == unit.MethodCall && fn != nil {
+				if operand := fn.ChildByFieldName("operand"); operand != nil && operand.Kind() == "call_expression" {
+					g.chains[len(s.Calls)] = span(operand)
+				}
+			}
 			s.Calls = append(s.Calls, c)
 			if form := errorCallForm(c, g.packages[c.Qualifier], n, s.Src); form.Form != "" {
 				s.Forms = append(s.Forms, form)
@@ -90,6 +112,22 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 		if form := errorComparison(n, s.Src); form.Form != "" {
 			s.Forms = append(s.Forms, form)
 		}
+	// Declarations take effect after their values, whose calls still see
+	// the names as they were: x = x.Reset() calls Reset on the old x.
+	case "var_spec":
+		return func() {
+			t, values := n.ChildByFieldName("type"), n.ChildByFieldName("value")
+			names := fieldNodes(n, "name")
+			for i, name := range names {
+				op := g.valueOf(values, uint(i), uint(len(names)), s.Src) // var x = T{}, var x = f()
+				if t != nil {
+					op = syntax.Operand{Type: g.typeOf(syntax.Compact(t.Utf8Text(s.Src)))}
+				}
+				g.declare(name.Utf8Text(s.Src), op, true)
+			}
+		}
+	case "short_var_declaration", "assignment_statement", "range_clause", "receive_statement":
+		return func() { g.assign(n, s.Src) }
 	case "expression_switch_statement":
 		var values []string
 		for i := uint(0); i < n.NamedChildCount(); i++ {
@@ -104,15 +142,98 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 			}
 		}
 		s.RecordStringMatch(n, values)
+		return g.scope(false)
 	case "return_statement":
 		if s.Closures == 0 {
 			s.Exits++
 		}
 	case "func_literal":
 		s.Closures++
-		return func() { s.Closures-- }
+		restore := g.scope(false)
+		eachOwn(n, s.Src, func(name, typ string) { g.declare(name, syntax.Operand{Type: g.typeOf(typ)}, true) })
+		return func() { s.Closures--; restore() }
+	case "block":
+		// An if's body or else is a branch; other blocks run in sequence.
+		parent := n.Parent()
+		return g.scope(parent != nil && parent.Kind() == "if_statement")
+	case "if_statement", "for_statement", "select_statement":
+		return g.scope(false)
+	case "type_switch_statement":
+		// switch v := x.(type): v is declared for every case.
+		restore := g.scope(false)
+		if alias := n.ChildByFieldName("alias"); alias != nil {
+			for i := uint(0); i < alias.NamedChildCount(); i++ {
+				g.declare(alias.NamedChild(i).Utf8Text(s.Src), syntax.Operand{}, true)
+			}
+		}
+		return restore
+	case "expression_case", "type_case", "communication_case", "default_case":
+		return g.scope(true)
 	}
 	return nil
+}
+
+// isReceiver reports whether name is the method's receiver here, not a
+// variable shadowing it.
+func (g grammar) isReceiver(name string) bool {
+	return g.receiver != "" && name == g.receiver && !g.isVariable(name)
+}
+
+// isVariable reports whether an open scope, the function's parameters
+// and results included, declares a variable of that name, which shadows
+// an imported package or the receiver.
+func (g grammar) isVariable(name string) bool {
+	for _, s := range *g.scopes {
+		if s.declared[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// varScope is a lexical scope: the variables declared in it and the
+// outer ones assigned in it or in the scopes it holds.
+type varScope struct {
+	declared, assigned map[string]bool
+}
+
+// scope opens a lexical scope, closed by the function it returns. The
+// variables declared in it are then forgotten and the ones they shadow
+// restored. An outer variable assigned in it becomes unknown, as the
+// scope may not have run (an if's body, a loop), except when the scope
+// is a branch: the next branch (else, the next case) starts from the
+// types before it, and the variable becomes unknown when the if or
+// switch holding the branches ends.
+func (g grammar) scope(branch bool) func() {
+	outer := maps.Clone(g.vars)
+	s := &varScope{declared: map[string]bool{}, assigned: map[string]bool{}}
+	*g.scopes = append(*g.scopes, s)
+	return func() {
+		*g.scopes = (*g.scopes)[:len(*g.scopes)-1]
+		restore := func(name string) {
+			if typ, ok := outer[name]; ok {
+				g.vars[name] = typ
+			} else {
+				delete(g.vars, name)
+			}
+		}
+		for name := range s.declared {
+			restore(name)
+		}
+		for name := range s.assigned {
+			if s.declared[name] {
+				continue
+			}
+			if n := len(*g.scopes); n > 0 {
+				(*g.scopes)[n-1].assigned[name] = true
+			}
+			if branch {
+				restore(name)
+			} else {
+				delete(g.vars, name)
+			}
+		}
+	}
 }
 
 // call classifies a call by its callee: f(x) is a free call, a selector
@@ -132,12 +253,22 @@ func (g grammar) call(n *sitter.Node, src []byte) (unit.Call, bool) {
 			return c, false
 		}
 		c.Kind, c.Name = unit.MethodCall, field.Utf8Text(src)
-		if operand.Kind() == "identifier" {
+		switch operand.Kind() {
+		case "identifier":
 			switch name := operand.Utf8Text(src); {
-			case name == g.receiver:
+			case g.isReceiver(name):
 				c.Qualifier = "self"
-			case g.packages[name] != "":
+			case g.packages[name] != "" && !g.isVariable(name):
 				c.Kind, c.Qualifier = unit.PathCall, name
+			default:
+				op := g.vars[name]
+				c.Type, c.From, c.Result = op.Type, op.From, op.Result
+			}
+		case "selector_expression":
+			// s.store.Save(): a method of the receiver's field.
+			if v, f := operand.ChildByFieldName("operand"), operand.ChildByFieldName("field"); v != nil && f != nil &&
+				v.Kind() == "identifier" && g.isReceiver(v.Utf8Text(src)) {
+				c.Field = f.Utf8Text(src)
 			}
 		}
 	default:
@@ -183,6 +314,159 @@ func errorCallForm(c unit.Call, pkg string, n *sitter.Node, src []byte) unit.For
 		}
 	}
 	return form
+}
+
+// declare records what a variable holds, in the current scope: declared
+// there (var, :=), or assigned there (=).
+func (g grammar) declare(name string, op syntax.Operand, declared bool) {
+	if n := len(*g.scopes); n > 0 {
+		in := (*g.scopes)[n-1].assigned
+		if declared {
+			in = (*g.scopes)[n-1].declared
+		}
+		in[name] = true
+	}
+	if op == (syntax.Operand{}) {
+		delete(g.vars, name)
+		return
+	}
+	g.vars[name] = op
+}
+
+// assign updates the variables an assignment, short declaration, range
+// clause or receive sets: one set from a composite literal (T{}, &T{})
+// takes its type, one set from a call holds its result (see valueOf), and
+// any other is forgotten.
+func (g grammar) assign(n *sitter.Node, src []byte) {
+	left, right := n.ChildByFieldName("left"), n.ChildByFieldName("right")
+	if left == nil {
+		return
+	}
+	// := declares; = assigns, also in a range clause.
+	declares := n.Kind() == "short_var_declaration"
+	for i := uint(0); i < n.ChildCount(); i++ {
+		declares = declares || n.Child(i).Kind() == ":="
+	}
+	for i := uint(0); i < left.NamedChildCount(); i++ {
+		name := left.NamedChild(i)
+		if name.Kind() != "identifier" {
+			continue
+		}
+		var op syntax.Operand
+		if n.Kind() != "range_clause" {
+			op = g.valueOf(right, i, left.NamedChildCount(), src)
+		}
+		g.declare(name.Utf8Text(src), op, declares)
+	}
+}
+
+// valueOf returns what the i-th of names variables set from values
+// holds: a composite literal's type, or a call's result, the i-th when
+// one call gives them all (db, err := open()).
+func (g grammar) valueOf(values *sitter.Node, i, names uint, src []byte) syntax.Operand {
+	if values == nil {
+		return syntax.Operand{}
+	}
+	value, result := values, 0
+	switch {
+	case values.NamedChildCount() == names:
+		value = values.NamedChild(i)
+	case values.NamedChildCount() == 1:
+		value, result = values.NamedChild(0), int(i) //nolint:gosec // a result's position, a handful at most
+	default:
+		return syntax.Operand{}
+	}
+	if k, ok := g.calls[span(value)]; ok && value.Kind() == "call_expression" {
+		return syntax.Operand{From: k + 1, Result: result}
+	}
+	if result > 0 {
+		return syntax.Operand{}
+	}
+	return syntax.Operand{Type: g.literalType(value, src)}
+}
+
+// span identifies a syntax node by its byte range.
+func span(n *sitter.Node) [2]uint { return [2]uint{n.StartByte(), n.EndByte()} }
+
+// literalType returns the type of a composite literal value (T{}, &T{})
+// as typeOf writes it, or "" for any other value.
+func (g grammar) literalType(value *sitter.Node, src []byte) string {
+	if value.Kind() == "unary_expression" && value.NamedChildCount() == 1 {
+		value = value.NamedChild(0) // &T{}
+	}
+	if t := value.ChildByFieldName("type"); value.Kind() == "composite_literal" && t != nil {
+		return g.typeOf(syntax.Compact(t.Utf8Text(src)))
+	}
+	return ""
+}
+
+// typeOf returns a type as typeOf writes it, with the function's type
+// parameters in scope.
+func (g grammar) typeOf(typ string) string {
+	return typeOf(typ, g.packages, g.generic)
+}
+
+// typeOf returns a named type as Call.Type writes it, qualified by the
+// file's imports, without pointer or type arguments: *st.DB gives
+// "example.com/app/store.DB", Cache[T] gives "Cache". Predeclared types,
+// type parameters (generic), types of unknown packages and other types
+// (slices, maps, functions) give "".
+func typeOf(typ string, packages map[string]string, generic map[string]bool) string {
+	typ = strings.TrimPrefix(typ, "*")
+	for _, other := range []string{"[", "map[", "chan", "func(", "interface{", "struct{"} {
+		if strings.HasPrefix(typ, other) {
+			return ""
+		}
+	}
+	if i := strings.IndexByte(typ, '['); i >= 0 {
+		typ = typ[:i]
+	}
+	if pkg, name, ok := strings.Cut(typ, "."); ok {
+		if packages[pkg] == "" {
+			return ""
+		}
+		return packages[pkg] + "." + name
+	}
+	if predeclared[typ] || generic[typ] {
+		return ""
+	}
+	return typ
+}
+
+// typeParams returns the names of the type parameters a function, a
+// method's receiver (Set[E]) or a type declaration (type_spec)
+// introduces.
+func typeParams(n *sitter.Node, src []byte) map[string]bool {
+	out := map[string]bool{}
+	if list := n.ChildByFieldName("type_parameters"); list != nil {
+		for i := uint(0); i < list.NamedChildCount(); i++ {
+			for _, name := range fieldNodes(list.NamedChild(i), "name") {
+				out[name.Utf8Text(src)] = true
+			}
+		}
+	}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n.Kind() == "type_elem" {
+			out[n.Utf8Text(src)] = true
+			return
+		}
+		for i := uint(0); i < n.NamedChildCount(); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	if recv := n.ChildByFieldName("receiver"); recv != nil {
+		walk(recv)
+	}
+	return out
+}
+
+// predeclared are Go's predeclared types.
+var predeclared = map[string]bool{
+	"any": true, "bool": true, "byte": true, "comparable": true, "complex64": true, "complex128": true,
+	"error": true, "float32": true, "float64": true, "int": true, "int8": true, "int16": true, "int32": true,
+	"int64": true, "rune": true, "string": true, "uint": true, "uint8": true, "uint16": true, "uint32": true,
+	"uint64": true, "uintptr": true,
 }
 
 // formatVerbs returns the verbs of a format string's directives, in
@@ -274,7 +558,26 @@ func Parse(path string, src []byte) ([]unit.Unit, unit.Decls, error) {
 			case "const_declaration":
 				decls.Consts = append(decls.Consts, constants(n, path, src, test)...)
 			case "type_declaration":
-				decls.Structs = append(decls.Structs, structs(n, path, src, test)...)
+				generic := map[string]map[string]bool{} // type name -> its type parameters
+				for i := uint(0); i < n.NamedChildCount(); i++ {
+					if spec := n.NamedChild(i); spec.Kind() == "type_spec" {
+						if name := spec.ChildByFieldName("name"); name != nil {
+							generic[name.Utf8Text(src)] = typeParams(spec, src)
+						}
+					}
+				}
+				for _, st := range structs(n, path, src, test) {
+					decls.Structs = append(decls.Structs, st)
+					for _, f := range st.Fields {
+						if typ := typeOf(f.Type, packages, generic[st.Name]); typ != "" {
+							decls.FieldTypes = append(decls.FieldTypes, unit.FieldType{Struct: st.Name, Field: f.Name, Type: typ, File: path, Test: test})
+						}
+					}
+				}
+				for _, ft := range funcTypes(n, src) {
+					ft.File, ft.Test = path, test
+					decls.FuncTypes = append(decls.FuncTypes, ft)
+				}
 			}
 		}
 		marked = syntax.MarkIgnored(root, src, units, &decls)
@@ -294,7 +597,23 @@ func function(n *sitter.Node, path string, src []byte, test bool, packages map[s
 	if owner != "" {
 		full = owner + "." + short
 	}
-	s := syntax.Flatten(n, src, grammar{receiver: receiverName(n, src), packages: packages})
+	// The parameters and named results are the function's own scope.
+	vars, own, generic := map[string]syntax.Operand{}, map[string]bool{}, typeParams(n, src)
+	eachOwn(n, src, func(name, typ string) {
+		own[name] = true
+		if t := typeOf(typ, packages, generic); t != "" {
+			vars[name] = syntax.Operand{Type: t}
+		}
+	})
+	g := grammar{receiver: receiverName(n, src), packages: packages, vars: vars,
+		scopes: &[]*varScope{{declared: own, assigned: map[string]bool{}}}, generic: generic,
+		calls: map[[2]uint]int{}, chains: map[int][2]uint{}}
+	s := syntax.Flatten(n, src, g)
+	for k, inner := range g.chains {
+		if j, ok := g.calls[inner]; ok {
+			s.Calls[k].From, s.Calls[k].Result = j+1, 0
+		}
+	}
 	return unit.Unit{
 		File:      path,
 		Name:      full,
@@ -303,6 +622,7 @@ func function(n *sitter.Node, path string, src []byte, test bool, packages map[s
 		Shape:     similarity.HashSymbols(s.Seq),
 		Nodes:     s.Nodes,
 		Test:      test,
+		TestCase:  test && owner == "" && isTestCase(short),
 		Leaves:    s.Leaves,
 		Seq:       s.Seq,
 		SeqLines:  s.Lines,
@@ -310,6 +630,8 @@ func function(n *sitter.Node, path string, src []byte, test bool, packages map[s
 		Calls:     s.Calls,
 		Forwards:  forwards(n, src),
 		Params:    params(n, src),
+		Types:     types(n, src),
+		Results:   results(n, src, packages, generic),
 		Forms:     s.Forms,
 
 		StringMatches: s.Matches,
@@ -527,22 +849,102 @@ func addressOf(n *sitter.Node, src []byte) *sitter.Node {
 }
 
 // params returns a function's parameters that could be grouped, the
-// receiver aside: a, b int gives two. A context.Context is left out, since
-// Go passes it explicitly and never stores it in a struct.
+// receiver aside: a, b int gives two.
 func params(fn *sitter.Node, src []byte) []unit.Param {
-	list := fn.ChildByFieldName("parameters")
 	var out []unit.Param
-	for i := uint(0); list != nil && i < list.NamedChildCount(); i++ {
-		p := list.NamedChild(i)
-		typ := p.ChildByFieldName("type")
-		if typ == nil || typ.Utf8Text(src) == "context.Context" {
-			continue
+	eachParam(fn.ChildByFieldName("parameters"), src, func(name, typ string) {
+		if name != "" && typ != contextType {
+			out = append(out, unit.Param{Name: name, Type: typ})
 		}
-		for _, name := range fieldNodes(p, "name") {
-			out = append(out, unit.Param{Name: name.Utf8Text(src), Type: syntax.Compact(typ.Utf8Text(src))})
+	})
+	return out
+}
+
+// contextType is never grouped with other parameters: Go passes it
+// explicitly and never stores it in a struct.
+const contextType = "context.Context"
+
+// types returns the parameter and result types of a function or function
+// type, named or not: (ctx context.Context, a, b string) (n int, err
+// error) gives "(context.Context, string, string) (int, error)".
+func types(fn *sitter.Node, src []byte) string {
+	var params, results []string
+	eachParam(fn.ChildByFieldName("parameters"), src, func(_, t string) { params = append(params, t) })
+	switch r := fn.ChildByFieldName("result"); {
+	case r == nil:
+	case r.Kind() == "parameter_list":
+		eachParam(r, src, func(_, t string) { results = append(results, t) })
+	default:
+		results = []string{syntax.Compact(r.Utf8Text(src))}
+	}
+	return "(" + strings.Join(params, ", ") + ") (" + strings.Join(results, ", ") + ")"
+}
+
+// funcTypes returns a type declaration's function types, declared or
+// aliased (type visit = func(path string)), without file.
+func funcTypes(n *sitter.Node, src []byte) []unit.FuncType {
+	var out []unit.FuncType
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		spec := n.NamedChild(i)
+		typ := spec.ChildByFieldName("type")
+		if (spec.Kind() == "type_spec" || spec.Kind() == "type_alias") && typ != nil && typ.Kind() == "function_type" {
+			out = append(out, unit.FuncType{Types: types(typ, src)})
 		}
 	}
 	return out
+}
+
+// results returns a function's result types as typeOf writes them.
+func results(fn *sitter.Node, src []byte, packages map[string]string, generic map[string]bool) []string {
+	r := fn.ChildByFieldName("result")
+	if r == nil {
+		return nil
+	}
+	if r.Kind() != "parameter_list" {
+		return []string{typeOf(syntax.Compact(r.Utf8Text(src)), packages, generic)}
+	}
+	var out []string
+	eachParam(r, src, func(_, typ string) { out = append(out, typeOf(typ, packages, generic)) })
+	return out
+}
+
+// eachOwn calls each with the named parameters and named results of a
+// function or function literal, with their types as written.
+func eachOwn(fn *sitter.Node, src []byte, each func(name, typ string)) {
+	for _, list := range []*sitter.Node{fn.ChildByFieldName("parameters"), fn.ChildByFieldName("result")} {
+		if list == nil || list.Kind() != "parameter_list" {
+			continue
+		}
+		eachParam(list, src, func(name, typ string) {
+			if name != "" {
+				each(name, typ)
+			}
+		})
+	}
+}
+
+// eachParam calls each with the name ("" when unnamed) and type of every
+// entry of a parameter or result list, a, b int giving two; a variadic
+// type is ...T, as written.
+func eachParam(list *sitter.Node, src []byte, each func(name, typ string)) {
+	for i := uint(0); list != nil && i < list.NamedChildCount(); i++ {
+		p := list.NamedChild(i)
+		typ := p.ChildByFieldName("type")
+		if typ == nil {
+			continue
+		}
+		t := syntax.Compact(typ.Utf8Text(src))
+		if p.Kind() == "variadic_parameter_declaration" {
+			t = "..." + t
+		}
+		names := fieldNodes(p, "name")
+		if len(names) == 0 {
+			each("", t)
+		}
+		for _, name := range names {
+			each(name.Utf8Text(src), t)
+		}
+	}
 }
 
 // receiverType returns a method's receiver type name, without pointer or
@@ -608,4 +1010,28 @@ func InterfaceMethods(src []byte) []string {
 		walk(root)
 	})
 	return names
+}
+
+// ModulePath returns the module path a go.mod declares, or "".
+func ModulePath(gomod []byte) string {
+	for line := range strings.Lines(string(gomod)) {
+		line, _, _ = strings.Cut(line, "//")
+		if path, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			return strings.Trim(strings.TrimSpace(path), "\"`")
+		}
+	}
+	return ""
+}
+
+// isTestCase reports whether a test file's function is one go test runs:
+// Test, Benchmark, Fuzz or Example, alone or followed by a name not
+// starting with a lower-case letter (TestSave, not Testify).
+func isTestCase(name string) bool {
+	for _, prefix := range []string{"Test", "Benchmark", "Fuzz", "Example"} {
+		if rest, ok := strings.CutPrefix(name, prefix); ok {
+			first, _ := utf8.DecodeRuneInString(rest)
+			return rest == "" || !unicode.IsLower(first)
+		}
+	}
+	return false
 }

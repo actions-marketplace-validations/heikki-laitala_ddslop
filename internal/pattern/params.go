@@ -2,6 +2,7 @@ package pattern
 
 import (
 	"cmp"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -31,14 +32,16 @@ const (
 // the group is everything those functions share, so a group is never
 // reported again inside a larger one taken by the same functions. Methods
 // called via a trait or interface are left out, since it dictates their
-// parameters, and so is test code. Groups are ordered by size, the parameters a struct would
+// parameters, and so are Go functions whose parameter and result types
+// are those of a function type their package declares (the commands of a command
+// table, values of its function type), and test code. Groups are ordered by size, the parameters a struct would
 // save: parameters times extra functions.
-func ParameterGroups(units []unit.Unit) []ParamGroup {
+func ParameterGroups(units []unit.Unit, funcTypes []unit.FuncType) []ParamGroup {
 	var eligible []unit.Unit
 	var keys [][]string
 	bySubset := map[string][]int{}
 	for _, u := range units {
-		if u.Test || u.ViaInterface() || len(u.Params) < minGroupParams || len(u.Params) > maxGroupedParams {
+		if u.Test || u.ViaInterface() || len(u.Params) < minGroupParams || len(u.Params) > maxGroupedParams || ofFuncType(u, funcTypes) {
 			continue
 		}
 		k := paramKeys(u)
@@ -112,6 +115,19 @@ func ParameterGroups(units []unit.Unit) []ParamGroup {
 		}
 	}
 	return kept
+}
+
+// ofFuncType reports whether a unit is a Go function with the parameter
+// and result types, in order, of one of funcTypes declared in its own
+// package, outside test code. A type elsewhere may only share the
+// spelling of its types.
+func ofFuncType(u unit.Unit, funcTypes []unit.FuncType) bool {
+	if !strings.HasSuffix(u.File, ".go") {
+		return false
+	}
+	return slices.ContainsFunc(funcTypes, func(ft unit.FuncType) bool {
+		return !ft.Test && ft.Types == u.Types && filepath.Dir(ft.File) == filepath.Dir(u.File)
+	})
 }
 
 // familyParams is how many parameters two groups share to be one concept.

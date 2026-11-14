@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,7 +33,7 @@ for each concern, such as checking and wrapping errors. Each language
 gets a map of its own. A module is a Go package, or a Rust module directly under
 its crate. A Rust workspace is described as crates, each with how many
 modules and layers it holds; --crate describes one crate's modules, as a
-single crate is by default. Calls are resolved by name, as in flows; only
+single crate is by default, and --lang describes one language. Calls are resolved by name, as in flows; only
 calls that name their target count, and test code is left out.
 
 Flags:
@@ -61,6 +62,40 @@ type mapJSON struct {
 	Helpers      []helperJSON  `json:"helpers"`
 	Features     []featureJSON `json:"features"`
 	Idioms       []idiomJSON   `json:"idioms"`
+	// Cycles are the groups of modules calling each other in a loop.
+	Cycles []cycleJSON `json:"cycles"`
+}
+
+// cycleJSON is a group of modules calling each other in a loop: the pairs
+// that call each other directly, those with the fewest calls one way
+// first, or, when no pair does, a shortest loop through the group.
+type cycleJSON struct {
+	Modules     []string   `json:"modules"`
+	ModulesMore int        `json:"modules_more"`
+	Links       []linkJSON `json:"links"`
+	LinksMore   int        `json:"links_more"`
+	Loop        []hopJSON  `json:"loop,omitempty"`
+	LoopMore    int        `json:"loop_more,omitempty"`
+}
+
+// linkJSON is two modules of a cycle calling each other: the calls each
+// way and a call site each way ("file:line caller -> callee").
+//
+// ddslop:ignore wire format of codemap.Link, call sites as text rather than unit indexes
+type linkJSON struct {
+	A       string `json:"a"`
+	B       string `json:"b"`
+	CallsAB int    `json:"calls_ab"`
+	CallsBA int    `json:"calls_ba"`
+	AB      string `json:"ab"`
+	BA      string `json:"ba"`
+}
+
+// hopJSON is one step of a cycle's loop and its call site.
+type hopJSON struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Call string `json:"call"`
 }
 
 // idiomJSON is how the code does one concern: the convention (the form
@@ -107,11 +142,14 @@ type featureStepJSON struct {
 }
 
 // crateJSON summarises a crate in a workspace map: how many modules it
-// holds and how many layers they form (see --crate).
+// holds, how many layers they form, and how many call each other in loops
+// (see --crate).
 type crateJSON struct {
 	Name    string `json:"name"`
 	Modules int    `json:"modules"`
 	Layers  int    `json:"layers"`
+	// CycleModules counts the modules in its cycles (see --crate).
+	CycleModules int `json:"cycle_modules"`
 }
 
 type layerJSON struct {
@@ -145,6 +183,7 @@ func runMap(args []string, stdout, stderr io.Writer) int {
 	format := fs.String("format", "", `output format, "text" or "json" (default: text on a terminal, json otherwise)`)
 	limit := fs.Int("limit", 10, "list at most this many modules per layer, breaks, functions per break, helpers, features, steps and other members per feature, and forms per idiom")
 	crate := fs.String("crate", "", "describe the modules of this Rust crate (default: a workspace's crates)")
+	only := fs.String("lang", "", `describe only this language, "go" or "rust" (default: each language found)`)
 	root, code, ok := parseRoot(fs, args, stderr)
 	if !ok {
 		return code
@@ -155,6 +194,17 @@ func runMap(args []string, stdout, stderr io.Writer) int {
 	}
 	if *limit < 1 {
 		return fail(stderr, fmt.Errorf("--limit must be at least 1, got %d", *limit))
+	}
+	langs := []string{"go", "rust"}
+	switch *only {
+	case "":
+	case "go", "rust":
+		langs = []string{*only}
+	default:
+		return fail(stderr, fmt.Errorf(`--lang must be "go" or "rust", got %q`, *only))
+	}
+	if *crate != "" && *only == "go" {
+		return fail(stderr, fmt.Errorf("--crate describes a Rust crate, not Go code"))
 	}
 
 	cfg, err := config.Load(root)
@@ -172,7 +222,7 @@ func runMap(args []string, stdout, stderr io.Writer) int {
 	defer func() { _ = db.Close() }()
 
 	r := mapReport{Maps: []mapJSON{}}
-	for _, lang := range []string{"go", "rust"} {
+	for _, lang := range langs {
 		if *crate != "" && lang != "rust" {
 			continue
 		}
@@ -200,7 +250,7 @@ func runMap(args []string, stdout, stderr io.Writer) int {
 		enc.SetIndent("", "  ")
 		err = enc.Encode(r)
 	} else {
-		err = writeMapText(stdout, r)
+		err = writeMapText(stdout, r, langs)
 	}
 	if err != nil {
 		return fail(stderr, err)
@@ -225,7 +275,7 @@ func buildMap(root, lang string, files []index.File, opts mapOptions) (mapJSON, 
 	crates := packages(root, files)
 	m := mapJSON{Lang: lang, Scope: "packages", Calls: g.Calls, ResolvedCalls: g.Resolved,
 		Layers: []layerJSON{}, Breaks: []breakJSON{}, Unplaced: []string{}, Helpers: []helperJSON{},
-		Features: []featureJSON{}, Idioms: []idiomJSON{}}
+		Features: []featureJSON{}, Idioms: []idiomJSON{}, Cycles: []cycleJSON{}}
 	layerGroup, helperGroup := codemap.ByModule(crates), codemap.ByModule(crates)
 	if lang == "rust" {
 		names := crateNames(files, crates)
@@ -273,6 +323,7 @@ func buildMap(root, lang string, files []index.File, opts mapOptions) (mapJSON, 
 		}
 		m.Breaks = append(m.Breaks, bj)
 	}
+	m.Cycles = cyclesJSON(g, codemap.Cycles(g, layerGroup), limit)
 	helpers := codemap.Helpers(g, helperGroup, g.Entries(traits))
 	for _, h := range helpers[:min(limit, len(helpers))] {
 		u := g.Units[h.Unit]
@@ -311,6 +362,34 @@ func buildMap(root, lang string, files []index.File, opts mapOptions) (mapJSON, 
 		m.Idioms = append(m.Idioms, ij)
 	}
 	return m, nil
+}
+
+// cyclesJSON describes cycles, each list capped at limit.
+func cyclesJSON(g *flow.Graph, cycles []codemap.Cycle, limit int) []cycleJSON {
+	site := func(s codemap.Site) string {
+		if s.Caller < 0 {
+			return ""
+		}
+		return located(g.Units[s.Caller]) + " -> " + g.Units[s.Callee].Name
+	}
+	out := []cycleJSON{}
+	for _, c := range cycles[:min(limit, len(cycles))] {
+		links := slices.Clone(c.Links)
+		slices.SortStableFunc(links, func(x, y codemap.Link) int {
+			return cmp.Compare(min(x.CallsAB, x.CallsBA), min(y.CallsAB, y.CallsBA))
+		})
+		cj := cycleJSON{Modules: c.Modules[:min(limit, len(c.Modules))], ModulesMore: max(0, len(c.Modules)-limit),
+			Links: []linkJSON{}, LinksMore: max(0, len(links)-limit)}
+		for _, l := range links[:min(limit, len(links))] {
+			cj.Links = append(cj.Links, linkJSON{A: l.A, B: l.B, CallsAB: l.CallsAB, CallsBA: l.CallsBA, AB: site(l.AB), BA: site(l.BA)})
+		}
+		for _, h := range c.Loop[:min(limit, len(c.Loop))] {
+			cj.Loop = append(cj.Loop, hopJSON{From: h.From, To: h.To, Call: site(h.Site)})
+		}
+		cj.LoopMore = max(0, len(c.Loop)-limit)
+		out = append(out, cj)
+	}
+	return out
 }
 
 // located names a function as "file:line name".
@@ -364,7 +443,11 @@ func crateSummary(g *flow.Graph, crates map[string]string, name string) crateJSO
 		}
 	}
 	slices.Sort(modules)
-	return crateJSON{Name: name, Modules: len(slices.Compact(modules)), Layers: len(codemap.Layers(g, in).Layers)}
+	cycled := 0
+	for _, c := range codemap.Cycles(g, in) {
+		cycled += len(c.Modules)
+	}
+	return crateJSON{Name: name, Modules: len(slices.Compact(modules)), Layers: len(codemap.Layers(g, in).Layers), CycleModules: cycled}
 }
 
 // shortName drops a method's owner: helpers are listed by the name code
@@ -393,7 +476,35 @@ func sourceLine(root, file string, line int) string {
 	return ""
 }
 
-func writeMapText(w io.Writer, r mapReport) error {
+// writeCyclesText prints the cycles section.
+func writeCyclesText(b *strings.Builder, cycles []cycleJSON) {
+	if len(cycles) == 0 {
+		return
+	}
+	b.WriteString("\nCycles (modules calling each other in a loop):\n")
+	for _, c := range cycles {
+		more := ""
+		if c.ModulesMore > 0 {
+			more = fmt.Sprintf(" and %d more", c.ModulesMore)
+		}
+		fmt.Fprintf(b, "  %d module(s): %s%s\n", len(c.Modules)+c.ModulesMore, strings.Join(c.Modules, ", "), more)
+		for _, l := range c.Links {
+			fmt.Fprintf(b, "    %s <-> %s: %d call(s) / %d call(s)\n      %s\n      %s\n", l.A, l.B, l.CallsAB, l.CallsBA, l.AB, l.BA)
+		}
+		if c.LinksMore > 0 {
+			fmt.Fprintf(b, "    and %d more pair(s)\n", c.LinksMore)
+		}
+		for _, h := range c.Loop {
+			fmt.Fprintf(b, "    %s -> %s\n      %s\n", h.From, h.To, h.Call)
+		}
+		if c.LoopMore > 0 {
+			fmt.Fprintf(b, "    and %d more step(s) back\n", c.LoopMore)
+		}
+	}
+}
+
+// writeMapText prints the maps of langs, the languages described.
+func writeMapText(w io.Writer, r mapReport, langs []string) error {
 	var b strings.Builder
 	for i, m := range r.Maps {
 		if i > 0 {
@@ -407,7 +518,11 @@ func writeMapText(w io.Writer, r mapReport) error {
 		if len(m.Crates) > 0 {
 			b.WriteString("\nCrates (--crate NAME for one crate's modules):\n")
 			for _, c := range m.Crates {
-				fmt.Fprintf(&b, "  %s  %d module(s), %d layer(s)\n", c.Name, c.Modules, c.Layers)
+				fmt.Fprintf(&b, "  %s  %d module(s), %d layer(s)", c.Name, c.Modules, c.Layers)
+				if c.CycleModules > 0 {
+					fmt.Fprintf(&b, ", %d in cycles", c.CycleModules)
+				}
+				b.WriteString("\n")
 			}
 		}
 		b.WriteString("\nLayers, top first:\n")
@@ -444,11 +559,17 @@ func writeMapText(w io.Writer, r mapReport) error {
 				fmt.Fprintf(&b, "  %s (%s:%d), used by %s\n      %s\n", h.Name, h.File, h.Line, strings.Join(h.Modules, ", "), h.Signature)
 			}
 		}
+		writeCyclesText(&b, m.Cycles)
 		writeFeaturesText(&b, m.Features)
 		writeIdiomsText(&b, m.Idioms)
 	}
 	if len(r.Maps) == 0 {
-		b.WriteString("no Go or Rust code found\n")
+		names := map[string]string{"go": "Go", "rust": "Rust"}
+		var missing []string
+		for _, l := range langs {
+			missing = append(missing, names[l])
+		}
+		fmt.Fprintf(&b, "no %s code found\n", strings.Join(missing, " or "))
 	}
 	_, err := io.WriteString(w, b.String())
 	return err

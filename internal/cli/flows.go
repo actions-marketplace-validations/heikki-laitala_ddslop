@@ -10,6 +10,7 @@ import (
 
 	"github.com/heikki-laitala/ddslop/internal/flow"
 	"github.com/heikki-laitala/ddslop/internal/index"
+	"github.com/heikki-laitala/ddslop/internal/lang/golang"
 	"github.com/heikki-laitala/ddslop/internal/lang/rust"
 )
 
@@ -130,6 +131,29 @@ func manifest(root, dir string) []byte {
 	return toml
 }
 
+// moduleAbove returns the import path of the directory root, from the
+// go.mod of a module root lies inside ("example.com/app/internal" for
+// root internal under example.com/app), or "".
+func moduleAbove(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return ""
+	}
+	for dir := filepath.Dir(abs); ; dir = filepath.Dir(dir) {
+		gomod, err := os.ReadFile(filepath.Join(dir, "go.mod")) //nolint:gosec // a go.mod above the analysed root
+		if path := golang.ModulePath(gomod); err == nil && path != "" {
+			rel, err := filepath.Rel(dir, abs)
+			if err != nil {
+				return ""
+			}
+			return path + "/" + filepath.ToSlash(rel)
+		}
+		if dir == filepath.Dir(dir) {
+			return ""
+		}
+	}
+}
+
 // treeOrder orders a breadth-first slice depth first, each function right
 // after the function that called it, so indentation by depth reads as a
 // call tree. Callees keep their call order.
@@ -150,15 +174,70 @@ func treeOrder(steps []flow.Step) []flow.Step {
 	return out
 }
 
-// graphInputs collects what call resolution needs: each file's imports and
-// each crate's name from its Cargo.toml under root.
-func graphInputs(root string, files []index.File) flow.Inputs {
-	in := flow.Inputs{Imports: map[string]map[string]string{}, Crates: map[string]string{}}
+// graphInputs collects what call resolution needs: each file's imports,
+// each crate's name from its Cargo.toml under root, the types of Go
+// struct fields, the module path of each go.mod above a Go file, and the
+// Rust files, whose paths name their crates' modules, and the Rust trait
+// implementations, of the test code too when the graph includes it.
+func graphInputs(root string, tests bool, files []index.File) flow.Inputs {
+	in := flow.Inputs{Imports: map[string]map[string]string{}, Crates: map[string]string{},
+		Fields: map[string]map[string]flow.FieldType{}, Modules: map[string]string{}}
+	seen := map[string]bool{}
 	for _, f := range files {
+		if strings.HasSuffix(f.Path, ".go") {
+			for dir := filepath.Dir(f.Path); !seen[dir]; dir = filepath.Dir(dir) {
+				seen[dir] = true
+				gomod, err := os.ReadFile(filepath.Join(root, dir, "go.mod")) //nolint:gosec // a go.mod under the analysed root
+				if path := golang.ModulePath(gomod); err == nil && path != "" {
+					in.Modules[filepath.ToSlash(dir)] = path
+				}
+				if dir == "." || dir == string(filepath.Separator) {
+					break
+				}
+			}
+		}
+	}
+	if _, ok := in.Modules["."]; len(seen) > 0 && !ok {
+		if path := moduleAbove(root); path != "" {
+			in.Modules["."] = path
+		}
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f.Path, ".rs") {
+			in.RustFiles = append(in.RustFiles, f.Path)
+		}
 		if len(f.Imports) > 0 {
 			in.Imports[f.Path] = f.Imports
 		}
+		for _, im := range f.Decls.Impls {
+			if tests || !im.Test {
+				in.Impls = append(in.Impls, im)
+			}
+		}
 		dir := flow.CrateOf(f.Path)
+		for _, ft := range f.Decls.FieldTypes {
+			if ft.Test {
+				continue // the graph is of the non-test code
+			}
+			if in.Fields[dir] == nil {
+				in.Fields[dir] = map[string]flow.FieldType{}
+			}
+			// Structs of one name in two Rust modules of a crate that type
+			// a field differently leave it unknown.
+			key := ft.Struct + "." + ft.Field
+			// A relative Rust type (Db, db::Db) means each module's own:
+			// declared in two places, it is unknown unless spelled from
+			// crate::. A Go package is one scope, its files often build
+			// variants of one struct.
+			known, seen := in.Fields[dir][key]
+			elsewhere := strings.HasSuffix(ft.File, ".rs") && (known.File != ft.File || known.Module != ft.Module)
+			relative := func(t string) bool { return t != "" && !strings.HasPrefix(t, "crate::") }
+			if seen && (known.Type != ft.Type || known.Unwrapped != ft.Unwrapped || elsewhere && (relative(ft.Type) || relative(ft.Unwrapped))) {
+				in.Fields[dir][key] = flow.FieldType{}
+			} else if !seen {
+				in.Fields[dir][key] = flow.FieldType{Type: ft.Type, Unwrapped: ft.Unwrapped, File: ft.File, Module: ft.Module}
+			}
+		}
 		if _, done := in.Crates[dir]; done {
 			continue
 		}

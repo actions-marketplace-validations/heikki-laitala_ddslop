@@ -18,6 +18,13 @@ type Unit struct {
 	// Test is true for test code: test functions, functions in test
 	// modules and functions in test files.
 	Test bool
+	// Module is the inline module the unit is declared in within its file
+	// (outer::inner for mod outer { mod inner { .. } }), "" for none. Rust
+	// only.
+	Module string
+	// TestCase is true for a test the test runner calls (#[test], TestXxx);
+	// other test code is helpers, fakes and fixtures.
+	TestCase bool
 	// Ignored is true when a ddslop:ignore comment marks the unit: it is
 	// left out of the analysis.
 	Ignored bool
@@ -67,6 +74,14 @@ type Unit struct {
 	// Params are the unit's named parameters in order, without self and
 	// without patterns that bind several names.
 	Params []Param
+	// Types are the unit's parameter and result types, named or not,
+	// such as "(context.Context, string) (int, error)" (Go).
+	Types string
+	// Results are the unit's result types, written as Call.Type writes an
+	// operand's type ("" where that has none, such as error). In Go, one
+	// per result. In Rust, the type as returned and what a ? leaves of it,
+	// then, for an async fn, what .await and .await? give.
+	Results []string
 	// Forms are the forms the unit uses for concerns its language's
 	// adapter knows, such as how it checks errors, in source order.
 	Forms []Form
@@ -76,6 +91,7 @@ type Unit struct {
 const (
 	ErrorChecks   = "error-checks"   // how code tells one error from another
 	ErrorWrapping = "error-wrapping" // how code adds context to an error it passes on
+	ErrorValues   = "error-values"   // how code makes a new error
 )
 
 // Form is one occurrence of a form for a concern: "error-checks" done
@@ -133,6 +149,29 @@ type Call struct {
 	Qualifier string
 	Name      string
 	Line      int
+	// Type is the type of a method call's operand where the code states
+	// it (a parameter, var x T, x := T{}), as a Go package's import path
+	// and the type name ("example.com/app/store.DB"), or the name alone
+	// for the caller's own package. Go only.
+	Type string
+	// Field is the field a method is called on, followed from the
+	// operand: the receiver's (store in s.store.Save(), Go's and Rust's
+	// self.store.get()) or, in Rust, a dotted path from the receiver, a
+	// typed variable (Type) or a call's result (From): ctx.db in
+	// self.ctx.db.query(), store in req.store.get().
+	Field string
+	// From is 1 + the index, among its unit's calls, of the call whose
+	// result the operand is (db.Save() after db, err := open(), or
+	// s.Store().Save()), and Result that result's position; From is 0
+	// when the operand is no call's result. Go only.
+	From, Result int
+	// Adapts marks a Rust method named like a result adapter (map_err,
+	// context, unwrap, ...): 1 when it keeps its operand's value, 2 when
+	// it takes it out as ? does. A library's is looked through to the
+	// call it adapts; one the repository defines is a call like any other.
+	Adapts int
+	// Ignored is true when a ddslop:ignore comment marks the call's line.
+	Ignored bool
 }
 
 // Statement is one statement of a block, as positions in its unit.
@@ -204,6 +243,34 @@ type Decls struct {
 	// TypeNames are the names of every type the file declares: structs of
 	// any kind, enums, unions and type aliases.
 	TypeNames []string
+	// FuncTypes are the function types the file declares; Go only.
+	FuncTypes []FuncType
+	// FieldTypes are the types of the file's struct fields, written as
+	// Call.Type; fields of other types (slices, maps) are left out. Go
+	// only.
+	FieldTypes []FieldType
+}
+
+// FieldType is the type of one struct field: Server.store is a
+// "example.com/app/store.Store".
+type FieldType struct {
+	Struct, Field, Type string
+	// Unwrapped is what ? or unwrap() leaves of a Rust field's value:
+	// the type inside an Option or Result, the type itself otherwise.
+	Unwrapped string
+	// File and Module are where the struct is declared: its file and, in
+	// Rust, the inline module within it, where a relative type is read.
+	File, Module string
+	Test         bool
+}
+
+// FuncType is a function type declaration: type command func(args
+// []string, out io.Writer) int.
+type FuncType struct {
+	File string
+	// Types are written as a unit's (see Unit.Types).
+	Types string
+	Test  bool
 }
 
 // Trait is a trait declaration.
@@ -220,8 +287,10 @@ type Trait struct {
 // Impl is an implementation of a trait for a type, both as simple names
 // (see SimpleName).
 type Impl struct {
-	File               string
-	Trait, Type        string
+	File        string
+	Trait, Type string
+	// TraitPath is the trait as written (api::Store).
+	TraitPath          string
 	StartLine, EndLine int
 	// Blanket is true when the type is one of the impl's own type
 	// parameters: impl<T: Read> Io for T.
