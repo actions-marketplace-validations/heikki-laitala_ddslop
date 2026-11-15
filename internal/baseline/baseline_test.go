@@ -147,3 +147,176 @@ func TestACycleIsKnownByItsFingerprintAlone(t *testing.T) {
 		t.Errorf("kept = %s, want %s", got, want)
 	}
 }
+
+// Code moved to another file keeps its duplication known: an occurrence
+// is matched by its function's name when its file changed, as long as the
+// candidate has no more copies of a name than the entry recorded. Each
+// entry is matched so at most once, by the candidate that kept the most of
+// its files, so a second family of the same functions is still new. A
+// candidate none of whose occurrences stayed in place must be the same
+// code, by its fingerprint.
+func TestMovedDuplicationStaysKnownAndNewCopiesDoNot(t *testing.T) {
+	base := FromReport(rep(
+		cand("rust:pair", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+		cand("rust:fam", "near-miss", occ("x.rs", "load", 1), occ("y.rs", "store", 1)),
+	))
+
+	now := rep(
+		// Another pair of f, in files the baseline never saw: new.
+		cand("rust:elsewhere", "exact-clone", occ("d.rs", "f", 1), occ("e.rs", "f", 1)),
+		// One copy moved from a.rs to c.rs: known.
+		cand("rust:one-moved", "exact-clone", occ("c.rs", "f", 4), occ("b.rs", "f", 1)),
+		// Both copies moved, the same code (its fingerprint): known.
+		cand("rust:fam", "near-miss", occ("z.rs", "load", 1), occ("w.rs", "store", 1)),
+		// The same names under another kind: new.
+		cand("rust:other-kind", "renamed-clone", occ("q.rs", "load", 1), occ("r.rs", "store", 1)),
+	)
+
+	got := Filter(now, base)
+
+	if want := "[c1:rust:elsewhere c2:rust:other-kind]"; ids(got) != want {
+		t.Errorf("kept = %s, want %s", ids(got), want)
+	}
+	if got.Summary.Baselined != 2 {
+		t.Errorf("baselined = %d, want 2", got.Summary.Baselined)
+	}
+}
+
+// A further copy of a known pair is new even when no other candidate
+// claims the pair's entry: the candidate has more copies of f than the
+// entry recorded.
+func TestAFurtherCopyOfAMovedPairIsNew(t *testing.T) {
+	base := FromReport(rep(cand("rust:pair", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1))))
+	now := rep(cand("rust:three", "exact-clone", occ("c.rs", "f", 1), occ("b.rs", "f", 1), occ("g.rs", "f", 1)))
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:three]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// Unrelated clones that only share a known pair's function names, in files
+// the baseline never saw, are new: nothing stayed in place and the code is
+// not the same, though the pair they share names with is gone.
+func TestClonesSharingOnlyNamesWithAGonePairAreNew(t *testing.T) {
+	base := FromReport(rep(cand("rust:old", "exact-clone", occ("old/a.rs", "load", 1), occ("old/b.rs", "load", 1))))
+	now := rep(cand("rust:unrelated", "exact-clone", occ("new/c.rs", "load", 1), occ("new/d.rs", "load", 1)))
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:unrelated]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// A baseline keeps one key per function, so two blocks copied inside one
+// function are one key: a pure move of that function stays known.
+func TestAMovedFunctionWithTwoCopiedBlocksStaysKnown(t *testing.T) {
+	base := FromReport(rep(cand("rust:block", "block-clone", occ("a.rs", "run", 1), occ("a.rs", "run", 30))))
+	now := rep(cand("rust:block", "block-clone", occ("b.rs", "run", 1), occ("b.rs", "run", 30)))
+
+	if got := ids(Filter(now, base)); got != "[]" {
+		t.Errorf("kept = %s, want none", got)
+	}
+}
+
+// Moved candidates are matched to entries as a whole, not first come first
+// served: a candidate that fits two entries does not take the only entry
+// another one fits, and the same code (its fingerprint) is preferred.
+func TestMovedCandidatesAreMatchedWithoutStrandingAnother(t *testing.T) {
+	base := FromReport(rep(
+		cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("c.rs", "f", 1)),
+		cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+	))
+	now := rep(
+		// Kept a.rs in place, so it fits both entries.
+		cand("rust:n", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
+		// Both copies moved, the code of rust:a: fits that entry only.
+		cand("rust:a", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
+	)
+
+	if got := ids(Filter(now, base)); got != "[]" {
+		t.Errorf("kept = %s, want none: each fits an entry of its own", got)
+	}
+}
+
+// The same, with no fingerprint to go by: each candidate kept a copy in
+// place, one of them in a file only one entry has.
+func TestKeptCopiesAloneAreMatchedWithoutStrandingAnother(t *testing.T) {
+	base := FromReport(rep(
+		cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("c.rs", "f", 1)),
+		cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+	))
+	now := rep(
+		cand("rust:n", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
+		cand("rust:m", "exact-clone", occ("c.rs", "f", 1), occ("m.rs", "f", 1)),
+	)
+
+	if got := ids(Filter(now, base)); got != "[]" {
+		t.Errorf("kept = %s, want none: each fits an entry of its own", got)
+	}
+}
+
+// Two candidates fitting one entry: the same code (its fingerprint) is the
+// moved one, and the other is new.
+func TestTheSameCodeIsPreferredForAMovedEntry(t *testing.T) {
+	base := FromReport(rep(cand("rust:pair", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1))))
+	now := rep(
+		cand("rust:new", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
+		cand("rust:pair", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
+	)
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:new]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// Some kinds' fingerprints hash their files (a flow's entry points, a
+// single function or trait), so a move changes them: moved whole, the same
+// functions by name are the evidence instead. A different function is new.
+func TestMovedFindingsKeyedByTheirFilesStayKnown(t *testing.T) {
+	base := FromReport(rep(
+		cand("rust:dead-code:1", "dead-code", occ("a.rs", "unused", 1)),
+		cand("rust:flow:1", "parallel-flow", occ("a.rs", "create", 1), occ("b.rs", "update", 1)),
+	))
+	now := rep(
+		cand("rust:dead-code:2", "dead-code", occ("moved.rs", "unused", 1)),
+		cand("rust:flow:2", "parallel-flow", occ("c.rs", "create", 1), occ("d.rs", "update", 1)),
+		cand("rust:dead-code:3", "dead-code", occ("moved.rs", "other", 1)),
+	)
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:dead-code:3]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// A candidate known directly by two entries takes the one no moved
+// candidate needs.
+func TestADirectMatchLeavesAMovedCandidateItsOnlyEntry(t *testing.T) {
+	base := FromReport(rep(
+		cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+		cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1), occ("c.rs", "f", 1)),
+	))
+	now := rep(
+		// Known directly by both entries.
+		cand("rust:direct", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+		// The code of rust:a moved whole: fits that entry only.
+		cand("rust:a", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
+	)
+
+	if got := ids(Filter(now, base)); got != "[]" {
+		t.Errorf("kept = %s, want none", got)
+	}
+}
+
+// A near-miss family's fingerprint is its anchor's shape, and a move can
+// change which member is the anchor: moved whole, exactly the entry's
+// functions are the evidence, as for findings keyed by their files.
+func TestAMovedNearMissFamilyWithANewAnchorStaysKnown(t *testing.T) {
+	base := FromReport(rep(cand("rust:anchor-a~2", "near-miss", occ("a.rs", "load", 1), occ("b.rs", "store", 1))))
+	now := rep(
+		cand("rust:anchor-b~2", "near-miss", occ("y.rs", "load", 1), occ("x.rs", "store", 1)),
+		cand("rust:other~2", "near-miss", occ("p.rs", "load", 1), occ("q.rs", "save", 1)),
+	)
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:other~2]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}

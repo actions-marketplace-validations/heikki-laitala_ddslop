@@ -766,6 +766,14 @@ func cycleCandidate(language string, c Cycle) Candidate {
 	return cand
 }
 
+// MovesFingerprint reports whether moving a kind's code to other files
+// can change its fingerprint: it hashes the occurrences' files (a flow's
+// entry points, a single function or trait), or a near-miss family's
+// anchor, which is chosen in the members' file order.
+func MovesFingerprint(kind string) bool {
+	return kind == parallelFlow || kind == deadCode || kind == passThrough || kind == singleImpl || kind == nearMiss
+}
+
 // newCandidate builds a candidate without differences. Its fingerprint is
 // language:tag:hash(key), where key identifies what the occurrences share.
 func newCandidate(language, kind, tag, key string, s Suggestion, score Score, occs []Occurrence) Candidate {
