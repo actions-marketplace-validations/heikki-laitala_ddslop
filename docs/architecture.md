@@ -1588,6 +1588,14 @@ the map lists the pairs that call each other directly, with the calls
 each way and a call site each way, those with the fewest calls one way
 first, or, when no pair does, a shortest loop through the group; a
 workspace map counts each crate's modules in cycles (`cycle_modules`).
+A call through a value of a trait type (`dyn Store`, `S: Store`) is no
+module dependency, for the layers or the cycles: the call graph follows
+it to the trait's only implementation, but the caller depends on the
+trait, and the implementation's module, which imports the trait, would
+otherwise close a loop that the code does not have (`Graph.Dispatched`,
+per call). A function that also calls the implementation directly
+depends on it, and that call is the cycle's site. On a Rust workspace
+this removed two cycles, both of that shape, and changed no other.
 Only Rust modules within a crate can form one: Go's compiler forbids
 import cycles between packages, and Cargo cycles between crates.
 
@@ -1615,9 +1623,10 @@ the map exists to point at. Go codebases have none.
 `break-cycle`, concern `layers`): a pair calling each other, with its
 two calls as occurrences, or a group with no such pair, with each step
 of its shortest loop. Each occurrence is the call's line, so diff mode
-reports a cycle when a change touched one of its calls, the change that
-closed the loop, and CI fails on it; a cycle the code already had goes
-into the baseline, which knows it by its fingerprint (the crate and the
+reports a cycle when a change touched one of its calls: that may be the
+change that closed the loop, or only an edit on a line of a loop already
+there, which is not the edit to undo. CI fails on it; a cycle the code already
+had goes into the baseline, which knows it by its fingerprint (the crate and the
 modules) whichever calls close it later. Like the map, it does not say
 which call is the wrong way. Generated files are left out, and a
 `ddslop:ignore` on one of the calls marks a deliberate pair. Measured:

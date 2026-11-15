@@ -73,7 +73,7 @@ func TestCheckIgnoresACycleMarkedAtACallSite(t *testing.T) {
 }
 
 // In diff mode a cycle is reported when the change touched one of its
-// call sites: the change that closed the loop.
+// call sites, as the change closing it here does.
 func TestDiffReportsTheChangeClosingACycle(t *testing.T) {
 	files := maps.Clone(cyclicCrate)
 	files["src/store.rs"] = "pub fn open() {}\npub fn endpoint() {}\n" // no call back yet
@@ -183,5 +183,56 @@ func TestCheckReportsCyclesThroughTheRootModule(t *testing.T) {
 	}
 	if got := strings.Join(r.Candidates[0].Values, ", "); !strings.Contains(got, "foo") {
 		t.Errorf("values = %s, want a cycle through foo and the root module", got)
+	}
+}
+
+// A call through a trait (a dyn field, a generic bound) depends on the
+// trait, not on the implementation that happens to be its only one: the
+// implementation's module, which imports the trait, closes no loop.
+func TestCheckCallsThroughATraitCloseNoCycle(t *testing.T) {
+	trait := "pub trait Provide {\n    fn provide(&self) -> u32;\n}\n"
+	for name, caller := range map[string]string{
+		"dyn field": "pub struct Chain {\n    provider: Box<dyn Provide>,\n}\n" +
+			"impl Chain {\n    pub fn get(&self) -> u32 {\n        self.provider.provide()\n    }\n}\n",
+		"generic bound": "pub fn run<A: Provide>(a: &A) -> u32 {\n    a.provide()\n}\n",
+		// A guess by name is no dependency either, beside a trait call.
+		"trait call and a guess": "pub fn run(a: &dyn Provide) -> u32 {\n    let p = other::make();\n    a.provide() + p.provide()\n}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			files := map[string]string{
+				"Cargo.toml":    "[package]\nname = \"app\"\n",
+				"src/lib.rs":    "pub mod source;\npub mod pod;\n",
+				"src/source.rs": trait + caller,
+				"src/pod.rs": "use crate::source::Provide;\npub struct Pod;\n" +
+					"impl Provide for Pod {\n    fn provide(&self) -> u32 {\n        7\n    }\n}\n",
+			}
+			_, stdout, stderr := run("check", "--format", "json", repo(t, files))
+			if r := cycles(t, stdout); len(r.Candidates) != 0 {
+				t.Errorf("candidates = %+v, want none: source calls pod only through the trait; stderr = %s", r.Candidates, stderr)
+			}
+		})
+	}
+}
+
+// A function calling an implementation both through its trait and
+// directly depends on it by the direct call, and that call is the site.
+func TestACycleThroughATraitAndADirectCallIsTheDirectCall(t *testing.T) {
+	files := map[string]string{
+		"Cargo.toml": "[package]\nname = \"app\"\n",
+		"src/lib.rs": "pub mod source;\npub mod pod;\n",
+		"src/source.rs": "pub trait Provide {\n    fn provide(&self) -> u32;\n}\n" +
+			"pub fn both(a: &dyn Provide, b: &crate::pod::Pod) -> u32 {\n    let x = a.provide();\n    x + b.provide()\n}\n",
+		"src/pod.rs": "use crate::source::Provide;\npub struct Pod;\n" +
+			"impl Provide for Pod {\n    fn provide(&self) -> u32 {\n        7\n    }\n}\n",
+	}
+	_, stdout, _ := run("check", "--format", "json", repo(t, files))
+	r := cycles(t, stdout)
+	if len(r.Candidates) != 1 {
+		t.Fatalf("candidates = %+v, want source and pod depending on each other", r.Candidates)
+	}
+	for _, o := range r.Candidates[0].Occurrences {
+		if filepath.ToSlash(o.File) == "src/source.rs" && o.StartLine != 6 {
+			t.Errorf("source's site = line %d, want 6, the direct call", o.StartLine)
+		}
 	}
 }

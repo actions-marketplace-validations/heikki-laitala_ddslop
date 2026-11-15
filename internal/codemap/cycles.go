@@ -65,10 +65,10 @@ func Cycles(g *flow.Graph, group Grouping, deps []Dependency) []Cycle {
 	site := func(a, b int) Site {
 		for _, caller := range all[a][b].callers {
 			for k, callee := range g.Callees[caller] {
-				if group(g.Units[callee]) == names[b] && named(g, caller, k) {
+				if group(g.Units[callee]) == names[b] && dependsOn(g, caller, k) {
 					call := -1
-					if caller < len(g.Targets) {
-						call = slices.Index(g.Targets[caller], callee)
+					if caller < len(g.Dispatched) {
+						call = directCall(g, caller, callee)
 					}
 					return Site{Caller: caller, Callee: callee, Call: call}
 				}

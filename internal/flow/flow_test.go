@@ -1099,6 +1099,11 @@ func TestRustCallsThroughTraitsReachTheirOnlyImplementation(t *testing.T) {
 	if got, want := fmt.Sprint(g.ByName[0]), "[false false]"; got != want {
 		t.Errorf("ByName = %s, want %s", got, want)
 	}
+	// Only the call reaching the implementation is dispatched: the
+	// trait's own default is in the trait's module, a dependency.
+	if got, want := fmt.Sprint(g.Dispatched[0]), "[true false false false]"; got != want {
+		t.Errorf("Dispatched = %s, want %s: only get reached an implementation", got, want)
+	}
 }
 
 // A concrete type named like a trait is no trait: its own methods. A
