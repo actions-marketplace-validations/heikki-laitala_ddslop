@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,15 +25,9 @@ func TestSimilarFindsExistingFunctionsLikeTheOneAtALine(t *testing.T) {
 	root := repo(t, map[string]string{"src/users.rs": users, "src/orders.rs": orders, "src/math.rs": unrelated})
 
 	// A line inside load_user, not only its first line.
-	code, stdout, stderr := run("similar", "--format", "json", filepath.Join(root, "src", "users.rs")+":3", root)
-
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 0, "similar", "--format", "json", filepath.Join(root, "src", "users.rs")+":3", root)
 	var r similarReport
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not valid JSON: %v\n%s", err, stdout)
-	}
+	decodeInto(t, stdout, &r)
 	if r.Target.Name != "load_user" || filepath.ToSlash(r.Target.File) != "src/users.rs" {
 		t.Errorf("target = %+v, want src/users.rs load_user", r.Target)
 	}
@@ -56,9 +49,7 @@ func TestSimilarErrors(t *testing.T) {
 		"line outside a function": {"similar", filepath.Join(root, "src", "users.rs") + ":40", root},
 		"file outside the root":   {"similar", "/elsewhere/x.rs:1", root},
 	}
-	for name, args := range cases {
-		if code, _, stderr := run(args...); code != 2 || stderr == "" {
-			t.Errorf("%s: exit code %d, stderr %q; want 2 and a message", name, code, stderr)
-		}
+	for _, args := range cases {
+		wantError(t, "", args...)
 	}
 }

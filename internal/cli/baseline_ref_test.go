@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/heikki-laitala/ddslop/internal/testutil"
 )
 
 // A gate against a ref reports only what the change added: known
@@ -18,23 +20,10 @@ func TestBaselineRefReportsOnlyWhatTheChangeAdded(t *testing.T) {
 	gitIn(t, root, "mv", "svc/a.rs", "svc/moved.rs")
 	gitIn(t, root, "commit", "-q", "-m", "move")
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD~1", svc)
-	if code != 0 {
-		t.Fatalf("a move alone: exit code = %d, want 0; stdout: %s stderr: %s", code, stdout, stderr)
-	}
+	runCode(t, 0, "check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD~1", svc)
 
-	people := strings.ReplaceAll(syncUsers, "sync_users", "sync_people")
-	if err := os.WriteFile(filepath.Join(svc, "d.rs"), []byte(people), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, stdout, stderr = run("check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD~1", svc)
-	if code != 1 {
-		t.Fatalf("a new copy: exit code = %d, want 1; stderr: %s", code, stderr)
-	}
-	r := decode(t, stdout)
-	if len(r.Candidates) != 1 {
-		t.Fatalf("got %d candidates, want only the new copy: %s", len(r.Candidates), stdout)
-	}
+	testutil.WriteFiles(t, svc, map[string]string{"d.rs": syncPeople})
+	r := oneCandidate[jsonReport](t, "--min-nodes", "20", "--baseline-ref", "HEAD~1", svc)
 	var files []string
 	for _, o := range r.Candidates[0].Occurrences {
 		files = append(files, filepath.ToSlash(o.File))
@@ -58,21 +47,12 @@ func TestBaselineRefReportsOnlyWhatTheChangeAdded(t *testing.T) {
 func TestBaselineRefErrors(t *testing.T) {
 	root := committedRepo(t, map[string]string{"a.rs": users})
 
-	code, _, stderr := run("check", "--baseline-ref", "no-such-ref", root)
-	if code != 2 || !strings.Contains(stderr, "no-such-ref") {
-		t.Errorf("unknown ref: exit %d, stderr %q; want 2 naming the ref", code, stderr)
-	}
+	wantError(t, "no-such-ref", "check", "--baseline-ref", "no-such-ref", root)
 
-	code, _, stderr = run("check", "--baseline-ref", "HEAD", "--baseline", "x.json", root)
-	if code != 2 || !strings.Contains(stderr, "--baseline-ref") {
-		t.Errorf("both baselines: exit %d, stderr %q; want 2 naming the conflict", code, stderr)
-	}
+	wantError(t, "--baseline-ref", "check", "--baseline-ref", "HEAD", "--baseline", "x.json", root)
 
 	plain := repo(t, map[string]string{"a.rs": users})
-	code, _, stderr = run("check", "--baseline-ref", "HEAD", plain)
-	if code != 2 || !strings.Contains(stderr, "Git") {
-		t.Errorf("outside Git: exit %d, stderr %q; want 2 saying a ref needs a Git repository", code, stderr)
-	}
+	wantError(t, "Git", "check", "--baseline-ref", "HEAD", plain)
 }
 
 // A path the ref does not have yet, such as a component the change adds,
@@ -84,15 +64,10 @@ func TestBaselineRefOfAPathTheRefLacksKnowsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, content := range map[string]string{"a.rs": users, "b.rs": orders} {
-		if err := os.WriteFile(filepath.Join(svc, name), []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		testutil.WriteFiles(t, svc, map[string]string{name: content})
 	}
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD", svc)
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 for the new pair; stderr: %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD", svc)
 	if r := decode(t, stdout); len(r.Candidates) != 1 || r.Summary.Baselined != 0 {
 		t.Errorf("got %d candidates, %d baselined; want the new pair and nothing known", len(r.Candidates), r.Summary.Baselined)
 	}
@@ -100,20 +75,16 @@ func TestBaselineRefOfAPathTheRefLacksKnowsNothing(t *testing.T) {
 
 // Both trees are analysed with the change's configuration: duplication a
 // change's narrower exclusions bring into view was there before it.
+// ddslop:ignore a ref's configuration, not config_test's exclusions: one shape, two features
 func TestBaselineRefAnalysesTheRefWithTheChangesConfiguration(t *testing.T) {
 	root := committedRepo(t, map[string]string{
 		".ddslop.yaml": "exclude:\n  - gen/**\n",
 		"gen/a.rs":     users,
 		"gen/b.rs":     orders,
 	})
-	if err := os.WriteFile(filepath.Join(root, ".ddslop.yaml"), []byte("min-nodes: 20\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFiles(t, root, map[string]string{".ddslop.yaml": "min-nodes: 20\n"})
 
-	code, stdout, stderr := run("check", "--format", "json", "--baseline-ref", "HEAD", root)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0: the pair was there before; stdout %s stderr %s", code, stdout, stderr)
-	}
+	stdout, _ := runCode(t, 0, "check", "--format", "json", "--baseline-ref", "HEAD", root)
 	if r := decode(t, stdout); r.Summary.Baselined != 1 {
 		t.Errorf("baselined = %d, want the pair", r.Summary.Baselined)
 	}
@@ -135,9 +106,7 @@ func TestBaselineRefDoesNotWriteThroughASymlinkedConfiguration(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, ".ddslop.yaml")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ".ddslop.yaml"), []byte("min-nodes: 20\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFiles(t, root, map[string]string{".ddslop.yaml": "min-nodes: 20\n"})
 
 	if code, _, stderr := run("check", "--format", "json", "--baseline-ref", "HEAD", root); code == 2 {
 		t.Fatalf("exit code 2: %s", stderr)
@@ -157,20 +126,9 @@ func TestBaselineRefOfAPathThatWasNoDirectoryKnowsNothing(t *testing.T) {
 	gitIn(t, root, "add", "svc")
 	gitIn(t, root, "commit", "-q", "-m", "svc links elsewhere")
 	gitIn(t, root, "rm", "-q", "svc")
-	for name, content := range map[string]string{"svc/a.rs": users, "svc/b.rs": orders} {
-		p := filepath.Join(root, name)
-		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	testutil.WriteFiles(t, root, map[string]string{"svc/a.rs": users, "svc/b.rs": orders})
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD", filepath.Join(root, "svc"))
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 for the pair now in svc; stderr: %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", "--baseline-ref", "HEAD", filepath.Join(root, "svc"))
 	if r := decode(t, stdout); r.Summary.Baselined != 0 {
 		t.Errorf("baselined = %d, want 0: the ref had no directory svc", r.Summary.Baselined)
 	}
@@ -180,11 +138,26 @@ func TestBaselineRefOfAPathThatWasNoDirectoryKnowsNothing(t *testing.T) {
 func TestBaselineRefReplacesAConfigurationDirectory(t *testing.T) {
 	root := committedRepo(t, map[string]string{"a.rs": users, ".ddslop.yaml/old.txt": "x\n"})
 	gitIn(t, root, "rm", "-q", "-r", ".ddslop.yaml")
-	if err := os.WriteFile(filepath.Join(root, ".ddslop.yaml"), []byte("min-nodes: 20\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFiles(t, root, map[string]string{".ddslop.yaml": "min-nodes: 20\n"})
 
 	if code, _, stderr := run("check", "--format", "json", "--baseline-ref", "HEAD", root); code == 2 {
 		t.Fatalf("exit code 2: %s", stderr)
+	}
+}
+
+// A baseline built from a ref knows the ref's functions, so a flow of
+// handlers the ref already had is not new however a change regroups them.
+func TestABaselineFromARefKnowsItsFunctions(t *testing.T) {
+	root := committedRepo(t, map[string]string{"src/a.rs": users, "src/b.rs": orders})
+	opts, err := analysisFlags(newFlags("check", "", nil))(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := baselineAt(root, opts, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.Functions[filepath.Join("src", "a.rs")+"#load_user"] || !b.Functions[filepath.Join("src", "b.rs")+"#load_order"] {
+		t.Errorf("functions = %v, want the ref's two", b.Functions)
 	}
 }

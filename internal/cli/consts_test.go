@@ -20,6 +20,7 @@ type targetReport struct {
 			File      string `json:"file"`
 			Name      string `json:"name"`
 			StartLine int    `json:"start_line"`
+			EndLine   int    `json:"end_line"`
 		} `json:"target"`
 		Suggestion struct {
 			Action string `json:"action"`
@@ -28,6 +29,22 @@ type targetReport struct {
 			DuplicatedNodes int `json:"duplicated_nodes"`
 		} `json:"score"`
 	} `json:"candidates"`
+}
+
+func (r targetReport) count() int { return len(r.Candidates) }
+
+// first describes the report's first candidate as its kind, action,
+// occurrences and any target, each as file:start-end name.
+func (r targetReport) first() string {
+	c := r.Candidates[0]
+	parts := []string{c.Kind, c.Suggestion.Action}
+	for _, o := range c.Occurrences {
+		parts = append(parts, fmt.Sprintf("%s:%d-%d %s", filepath.ToSlash(o.File), o.StartLine, o.EndLine, o.Name))
+	}
+	if g := c.Target; g != nil {
+		parts = append(parts, fmt.Sprintf("target %s:%d-%d %s", filepath.ToSlash(g.File), g.StartLine, g.EndLine, g.Name))
+	}
+	return strings.Join(parts, " ")
 }
 
 func decodeTargets(t *testing.T, stdout string) targetReport {
@@ -41,23 +58,9 @@ func TestCheckReportsConstantsDeclaredTwice(t *testing.T) {
 		"ledger/src/model_grant.rs": "// Limits.\n\npub const MAX_GRANTED_MODELS: usize = 64;\n",
 	})
 
-	code, stdout, stderr := run("check", "--format", "json", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr: %s", code, stderr)
-	}
-	r := decodeTargets(t, stdout)
-	if len(r.Candidates) != 1 {
-		t.Fatalf("got %d candidates, want 1: %s", len(r.Candidates), stdout)
-	}
-	c := r.Candidates[0]
-	var occs []string
-	for _, o := range c.Occurrences {
-		occs = append(occs, fmt.Sprintf("%s:%d-%d %s", filepath.ToSlash(o.File), o.StartLine, o.EndLine, o.Name))
-	}
-	want := "ledger/src/model_grant.rs:3-3 MAX_GRANTED_MODELS router/src/model_grant.rs:1-1 MAX_GRANTED_MODELS"
-	if c.Kind != "duplicate-constant" || c.Suggestion.Action != "reuse-existing" || strings.Join(occs, " ") != want {
-		t.Errorf("candidate = %s %s %s, want duplicate-constant reuse-existing %s", c.Kind, c.Suggestion.Action, strings.Join(occs, " "), want)
+	got := oneCandidate[targetReport](t, root).first()
+	if want := "duplicate-constant reuse-existing ledger/src/model_grant.rs:3-3 MAX_GRANTED_MODELS router/src/model_grant.rs:1-1 MAX_GRANTED_MODELS"; got != want {
+		t.Errorf("candidate = %s, want %s", got, want)
 	}
 }
 
@@ -70,32 +73,14 @@ func TestCheckReportsConstantValuesWrittenInline(t *testing.T) {
 `,
 	})
 
-	code, stdout, stderr := run("check", "--format", "json", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr: %s", code, stderr)
+	r := oneCandidate[targetReport](t, root)
+	// The constant, then its inline use; the constant is the target.
+	if got, want := r.first(), "inlined-constant reuse-existing src/gate.rs:1-1 LEDGER_UNAVAILABLE src/api.rs:2-2 refuse target src/gate.rs:1-1 LEDGER_UNAVAILABLE"; got != want {
+		t.Errorf("candidate = %s, want %s", got, want)
 	}
-	r := decodeTargets(t, stdout)
-	if len(r.Candidates) != 1 {
-		t.Fatalf("got %d candidates, want 1: %s", len(r.Candidates), stdout)
+	if n := r.Candidates[0].Score.DuplicatedNodes; n != 1 {
+		t.Errorf("duplicated nodes = %d, want 1 per inline use", n)
 	}
-	c := r.Candidates[0]
-	var occs []string
-	for _, o := range c.Occurrences {
-		occs = append(occs, fmt.Sprintf("%s:%d %s", filepath.ToSlash(o.File), o.StartLine, o.Name))
-	}
-	if c.Kind != "inlined-constant" || c.Suggestion.Action != "reuse-existing" || strings.Join(occs, " ") != "src/gate.rs:1 LEDGER_UNAVAILABLE src/api.rs:2 refuse" {
-		t.Errorf("candidate = %s %s %v, want inlined-constant reuse-existing at the constant then its inline use", c.Kind, c.Suggestion.Action, occs)
-	}
-	if c.Target == nil || filepath.ToSlash(c.Target.File) != "src/gate.rs" || c.Target.Name != "LEDGER_UNAVAILABLE" || c.Target.StartLine != 1 {
-		t.Errorf("target = %+v, want the constant src/gate.rs:1 LEDGER_UNAVAILABLE", c.Target)
-	}
-	if c.Score.DuplicatedNodes != 1 {
-		t.Errorf("duplicated nodes = %d, want 1 per inline use", c.Score.DuplicatedNodes)
-	}
-
 	_, text, _ := run("check", "--format", "text", root)
-	if !strings.Contains(text, "target: src/gate.rs:1-1 LEDGER_UNAVAILABLE") {
-		t.Errorf("text output does not show the target:\n%s", text)
-	}
+	wantContains(t, text, "target: src/gate.rs:1-1 LEDGER_UNAVAILABLE")
 }

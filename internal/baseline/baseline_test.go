@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -220,51 +221,66 @@ func TestAMovedFunctionWithTwoCopiedBlocksStaysKnown(t *testing.T) {
 // Moved candidates are matched to entries as a whole, not first come first
 // served: a candidate that fits two entries does not take the only entry
 // another one fits, and the same code (its fingerprint) is preferred.
-func TestMovedCandidatesAreMatchedWithoutStrandingAnother(t *testing.T) {
-	base := FromReport(rep(
+func TestCandidatesAreMatchedToEntriesWithoutStrandingAnother(t *testing.T) {
+	pairs := []report.Candidate{
 		cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("c.rs", "f", 1)),
 		cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
-	))
-	now := rep(
-		// Kept a.rs in place, so it fits both entries.
-		cand("rust:n", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
-		// Both copies moved, the code of rust:a: fits that entry only.
-		cand("rust:a", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
-	)
-
-	if got := ids(Filter(now, base)); got != "[]" {
-		t.Errorf("kept = %s, want none: each fits an entry of its own", got)
 	}
-}
-
-// The same, with no fingerprint to go by: each candidate kept a copy in
-// place, one of them in a file only one entry has.
-func TestKeptCopiesAloneAreMatchedWithoutStrandingAnother(t *testing.T) {
-	base := FromReport(rep(
-		cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("c.rs", "f", 1)),
-		cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
-	))
-	now := rep(
-		cand("rust:n", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
-		cand("rust:m", "exact-clone", occ("c.rs", "f", 1), occ("m.rs", "f", 1)),
-	)
-
-	if got := ids(Filter(now, base)); got != "[]" {
-		t.Errorf("kept = %s, want none: each fits an entry of its own", got)
-	}
-}
-
-// Two candidates fitting one entry: the same code (its fingerprint) is the
-// moved one, and the other is new.
-func TestTheSameCodeIsPreferredForAMovedEntry(t *testing.T) {
-	base := FromReport(rep(cand("rust:pair", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1))))
-	now := rep(
-		cand("rust:new", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
-		cand("rust:pair", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
-	)
-
-	if got, want := ids(Filter(now, base)), "[c1:rust:new]"; got != want {
-		t.Errorf("kept = %s, want %s", got, want)
+	for name, tc := range map[string]struct {
+		base, now []report.Candidate
+		kept      string
+	}{
+		"moved candidates": {
+			base: pairs,
+			now: []report.Candidate{
+				// Kept a.rs in place, so it fits both entries.
+				cand("rust:n", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
+				// Both copies moved, the code of rust:a: fits that entry only.
+				cand("rust:a", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
+			},
+			kept: "[]",
+		},
+		// With no fingerprint to go by: each candidate kept a copy in
+		// place, one of them in a file only one entry has.
+		"kept copies alone": {
+			base: pairs,
+			now: []report.Candidate{
+				cand("rust:n", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
+				cand("rust:m", "exact-clone", occ("c.rs", "f", 1), occ("m.rs", "f", 1)),
+			},
+			kept: "[]",
+		},
+		// Two candidates fitting one entry: the same code (its
+		// fingerprint) is the moved one, and the other is new.
+		"the same code is preferred for a moved entry": {
+			base: []report.Candidate{cand("rust:pair", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1))},
+			now: []report.Candidate{
+				cand("rust:new", "exact-clone", occ("a.rs", "f", 1), occ("n.rs", "f", 1)),
+				cand("rust:pair", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
+			},
+			kept: "[c1:rust:new]",
+		},
+		// A candidate known directly by two entries takes the one no moved
+		// candidate needs.
+		"a direct match leaves a moved candidate its only entry": {
+			base: []report.Candidate{
+				cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+				cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1), occ("c.rs", "f", 1)),
+			},
+			now: []report.Candidate{
+				// Known directly by both entries.
+				cand("rust:direct", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
+				// The code of rust:a moved whole: fits that entry only.
+				cand("rust:a", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
+			},
+			kept: "[]",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ids(Filter(rep(tc.now...), FromReport(rep(slices.Clone(tc.base)...)))); got != tc.kept {
+				t.Errorf("kept = %s, want %s", got, tc.kept)
+			}
+		})
 	}
 }
 
@@ -282,27 +298,10 @@ func TestMovedFindingsKeyedByTheirFilesStayKnown(t *testing.T) {
 		cand("rust:dead-code:3", "dead-code", occ("moved.rs", "other", 1)),
 	)
 
-	if got, want := ids(Filter(now, base)), "[c1:rust:dead-code:3]"; got != want {
+	// The flow's old entry points are gone from the code: it moved.
+	current := map[string]bool{"moved.rs#unused": true, "c.rs#create": true, "d.rs#update": true, "moved.rs#other": true}
+	if got, want := ids(FilterAgainst(now, base, current)), "[c1:rust:dead-code:3]"; got != want {
 		t.Errorf("kept = %s, want %s", got, want)
-	}
-}
-
-// A candidate known directly by two entries takes the one no moved
-// candidate needs.
-func TestADirectMatchLeavesAMovedCandidateItsOnlyEntry(t *testing.T) {
-	base := FromReport(rep(
-		cand("rust:a", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
-		cand("rust:b", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1), occ("c.rs", "f", 1)),
-	))
-	now := rep(
-		// Known directly by both entries.
-		cand("rust:direct", "exact-clone", occ("a.rs", "f", 1), occ("b.rs", "f", 1)),
-		// The code of rust:a moved whole: fits that entry only.
-		cand("rust:a", "exact-clone", occ("m.rs", "f", 1), occ("k.rs", "f", 1)),
-	)
-
-	if got := ids(Filter(now, base)); got != "[]" {
-		t.Errorf("kept = %s, want none", got)
 	}
 }
 
@@ -318,5 +317,66 @@ func TestAMovedNearMissFamilyWithANewAnchorStaysKnown(t *testing.T) {
 
 	if got, want := ids(Filter(now, base)), "[c1:rust:other~2]"; got != want {
 		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// A parallel flow is a suggestion over entry points the code already has:
+// when a change makes them more alike, ddslop regroups them into other
+// flows. A flow all of whose entry points were in the baseline's flows is
+// that regrouping, known; one with an entry point no flow had is new.
+func TestRegroupedFlowsOfKnownEntryPointsAreKnown(t *testing.T) {
+	base := FromReport(rep(
+		cand("rust:flow:a", "parallel-flow", occ("p.rs", "report", 1), occ("p.rs", "hold", 1), occ("p.rs", "engage", 1)),
+		cand("rust:flow:b", "parallel-flow", occ("m.rs", "request", 1), occ("p.rs", "complete", 1)),
+		cand("rust:flow:c", "parallel-flow", occ("m.rs", "lift_global", 1), occ("m.rs", "update_provider", 1)),
+	))
+	now := rep(
+		// complete joined report's flow: entry points all known.
+		cand("rust:flow:x", "parallel-flow", occ("p.rs", "report", 1), occ("p.rs", "complete", 1), occ("p.rs", "hold", 1), occ("p.rs", "engage", 1)),
+		// a pair across two known flows.
+		cand("rust:flow:y", "parallel-flow", occ("m.rs", "update_provider", 1), occ("m.rs", "request", 1)),
+		// a flow with an entry point no flow had: new.
+		cand("rust:flow:z", "parallel-flow", occ("p.rs", "report", 1), occ("n.rs", "fresh", 1)),
+	)
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:flow:z]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// With the base's functions known (as --baseline-ref knows them), a flow
+// whose entry points all existed there is a regrouping too, even with one
+// no flow had: the change made existing handlers alike. A flow with an
+// entry point the base did not have is new.
+func TestFlowsOfFunctionsTheBaseHadAreKnown(t *testing.T) {
+	base := FromReport(rep(cand("rust:flow:c", "parallel-flow", occ("m.rs", "lift_global", 1), occ("m.rs", "update_provider", 1))))
+	base.Functions = map[string]bool{"m.rs#lift_provider": true, "m.rs#lift_global": true, "m.rs#update_provider": true}
+	now := rep(
+		cand("rust:flow:y", "parallel-flow", occ("m.rs", "lift_provider", 1), occ("m.rs", "update_provider", 1)),
+		cand("rust:flow:z", "parallel-flow", occ("m.rs", "added", 1), occ("m.rs", "update_provider", 1)),
+	)
+
+	if got, want := ids(Filter(now, base)), "[c1:rust:flow:z]"; got != want {
+		t.Errorf("kept = %s, want %s", got, want)
+	}
+}
+
+// A flow entry point is matched by name only where a known one of that
+// name is gone from the code, as a move leaves it: a new function that
+// merely shares an old entry point's name is new.
+func TestAFlowEntryPointSharingOnlyAnOldNameIsNew(t *testing.T) {
+	base := FromReport(rep(cand("rust:flow:a", "parallel-flow", occ("p.rs", "report", 1), occ("p.rs", "hold", 1))))
+	now := rep(cand("rust:flow:x", "parallel-flow", occ("n.rs", "report", 1), occ("p.rs", "hold", 1)))
+
+	stillThere := map[string]bool{"p.rs#report": true, "p.rs#hold": true, "n.rs#report": true}
+	if got, want := ids(FilterAgainst(now, base, stillThere)), "[c1:rust:flow:x]"; got != want {
+		t.Errorf("original still there: kept = %s, want %s", got, want)
+	}
+	moved := map[string]bool{"p.rs#hold": true, "n.rs#report": true}
+	if got := ids(FilterAgainst(now, base, moved)); got != "[]" {
+		t.Errorf("original moved: kept = %s, want none", got)
+	}
+	if got, want := ids(Filter(now, base)), "[c1:rust:flow:x]"; got != want {
+		t.Errorf("current code unknown: kept = %s, want %s (no name evidence)", got, want)
 	}
 }

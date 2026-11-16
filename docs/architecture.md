@@ -2122,7 +2122,13 @@ A linter on a sloppy codebase must not fail every build on day one:
   workspace across a day of refactors that moved code between modules:
   matching on files alone reported 10 known candidates as new, and names
   brought that to the one real new copy. Renaming a function still makes
-  its duplication look new. `check --baseline-ref REF` builds the baseline
+  its duplication look new. A parallel flow is a suggestion over entry
+  points, and a change that makes existing ones more alike regroups them
+  into other flows: a flow is known when its entry points were all entry
+  points of known flows or, with `--baseline-ref`, all functions the ref
+  had (the ref's index lists them; a baseline file does not keep them). On
+  the Rust workspace, a deduplication of API handlers regrouped two flows
+  that a member-list fingerprint read as new. `check --baseline-ref REF` builds the baseline
   from the code at REF instead of a file, analysed with the same options
   in a temporary Git worktree (so its files are listed as a checkout's
   are) that is removed afterwards, with the current tree's configuration
@@ -2365,8 +2371,8 @@ Implemented so far: `main.go`, `internal/cli`, `internal/unit`,
 `internal/lang/rust`, `internal/clone` (which also holds the type and
 constant detectors), `internal/simplify`, `internal/flow`,
 `internal/similarity`, `internal/source`, `internal/index`,
-`internal/baseline`, `internal/integrate` and `internal/report`. The rest
-is planned.
+`internal/baseline`, `internal/integrate`, `internal/report` and
+`internal/testutil`. The rest is planned.
 
 ```text
 main.go              entry point; calls internal/cli (kept at the root so
@@ -2387,6 +2393,7 @@ internal/config/     .ddslop.yaml loading and flag merging
 internal/baseline/   fingerprints, baseline file, suppressions
 internal/source/     file discovery (git ls-files) and diff ranges (git diff)
 internal/index/      SQLite index of extracted units, parallel parsing
+internal/testutil/   assertions and fixtures the packages' tests share
 ```
 
 ```mermaid

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/heikki-laitala/ddslop/internal/testutil"
 )
 
 func gitIn(t *testing.T, dir string, args ...string) {
@@ -32,21 +34,14 @@ func TestCheckDiffReportsOnlyNewDuplication(t *testing.T) {
 	// The base already has a renamed pair (users, orders) and sync_users.
 	root := committedRepo(t, map[string]string{"a.rs": users, "b.rs": orders, "c.rs": syncUsers})
 	// The change adds a renamed copy of sync_users.
-	people := strings.ReplaceAll(syncUsers, "sync_users", "sync_people")
-	if err := os.WriteFile(filepath.Join(root, "d.rs"), []byte(people), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFiles(t, root, map[string]string{"d.rs": syncPeople})
 
 	_, full, _ := run("check", "--format", "json", "--min-nodes", "20", root)
 	if got := len(decode(t, full).Candidates); got != 2 {
 		t.Fatalf("without --diff: %d candidates, want the old pair and the new one", got)
 	}
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", "--diff", "HEAD", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr: %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", "--diff", "HEAD", root)
 	r := decode(t, stdout)
 	if len(r.Candidates) != 1 || r.Summary.Candidates != 1 {
 		t.Fatalf("got %d candidates (summary %d), want only the new duplication", len(r.Candidates), r.Summary.Candidates)
@@ -66,23 +61,15 @@ func TestCheckDiffReportsOnlyNewDuplication(t *testing.T) {
 
 func TestCheckDiffWithoutNewDuplicationExitsZero(t *testing.T) {
 	root := committedRepo(t, map[string]string{"a.rs": users, "b.rs": orders})
-	if err := os.WriteFile(filepath.Join(root, "c.rs"), []byte(unrelated), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFiles(t, root, map[string]string{"c.rs": unrelated})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", "--diff", "HEAD", root)
-
-	if code != 0 || len(decode(t, stdout).Candidates) != 0 {
-		t.Errorf("exit code = %d, want 0: the change adds no duplication", code)
-	}
+	// Exit code 0: no candidate, as the change adds no duplication.
+	runCode(t, 0, "check", "--format", "json", "--min-nodes", "20", "--diff", "HEAD", root)
 }
 
 func TestCheckDiffTextMarksChangedOccurrences(t *testing.T) {
 	root := committedRepo(t, map[string]string{"c.rs": syncUsers})
-	people := strings.ReplaceAll(syncUsers, "sync_users", "sync_people")
-	if err := os.WriteFile(filepath.Join(root, "d.rs"), []byte(people), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	testutil.WriteFiles(t, root, map[string]string{"d.rs": syncPeople})
 
 	_, stdout, _ := run("check", "--format", "text", "--min-nodes", "20", "--diff", "HEAD", root)
 
@@ -93,13 +80,9 @@ func TestCheckDiffTextMarksChangedOccurrences(t *testing.T) {
 
 func TestCheckDiffErrors(t *testing.T) {
 	root := committedRepo(t, map[string]string{"a.rs": users})
-	if code, _, stderr := run("check", "--diff", "no-such-ref", root); code != 2 || stderr == "" {
-		t.Errorf("unknown ref: exit %d, stderr %q; want 2 with an error", code, stderr)
-	}
+	wantError(t, "", "check", "--diff", "no-such-ref", root)
 	plain := repo(t, map[string]string{"a.rs": users})
-	if code, _, stderr := run("check", "--diff", "HEAD", plain); code != 2 || !strings.Contains(stderr, "Git") {
-		t.Errorf("outside Git: exit %d, stderr %q; want 2 explaining Git is needed", code, stderr)
-	}
+	wantError(t, "Git", "check", "--diff", "HEAD", plain)
 }
 
 // A tracked file deleted but not yet committed is gone: Git still lists

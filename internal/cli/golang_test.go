@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/heikki-laitala/ddslop/internal/testutil"
 )
 
 const goUsers = `package store
@@ -37,11 +39,7 @@ func TestCheckReportsCopiesInGoCode(t *testing.T) {
 		"src/orders.rs":       orders,
 	})
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr: %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", root)
 	r := decode(t, stdout)
 	var got []string
 	for _, c := range r.Candidates {
@@ -55,9 +53,7 @@ func TestCheckReportsCopiesInGoCode(t *testing.T) {
 		"go renamed-clone go [store/orders.go LoadOrder, store/users.go LoadUser]",
 		"rust renamed-clone rust [src/orders.rs load_order, src/users.rs load_user]",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("candidates:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "candidates", got, want)
 	if r.Summary.GeneratedFiles != 1 || r.Summary.TestUnits != 1 {
 		t.Errorf("summary = %+v, want 1 generated file and 1 test function", r.Summary)
 	}

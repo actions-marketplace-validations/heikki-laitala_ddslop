@@ -1,13 +1,15 @@
 package clone
 
 import (
-	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/heikki-laitala/ddslop/internal/testutil"
 
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
 
+// ddslop:ignore builds an enum from "Name(Payload)" variants as st builds a struct from "name:type" fields: one shape, two types
 func en(file, name string, variants ...string) unit.Enum {
 	e := unit.Enum{File: file, Name: name, StartLine: 1, EndLine: len(variants) + 2, Nodes: 5 * len(variants)}
 	for _, v := range variants {
@@ -32,22 +34,15 @@ func TestEnumsGroupsEnumsWithTheSameVariants(t *testing.T) {
 		en("ports_a.rs", "PortAccess", "Public", "SignedIn"), // ...unless the name is the same too
 		en("ports_b.rs", "PortAccess", "Public", "SignedIn"),
 	}
-	var got []string
-	for _, g := range Enums(enums) {
-		var members []string
-		for _, e := range g.Enums {
-			members = append(members, fmt.Sprintf("%s %s", e.File, e.Name))
-		}
-		got = append(got, strings.Join(members, " | "))
-	}
+	got := groupLines(Enums(enums), func(g EnumGroup) []unit.Enum { return g.Enums }, func(e unit.Enum) string {
+		return e.File + " " + e.Name
+	})
 	want := []string{
 		"runs.rs RunStatus | sandbox.rs SandboxState",
 		"ports_a.rs PortAccess | ports_b.rs PortAccess", // ties in size: by file
 		"sweep_a.rs NotSwept | sweep_b.rs NotSwept",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("groups:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "groups", got, want)
 }
 
 // Groups of equal size whose first enums share a file are ordered by line,

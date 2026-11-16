@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -21,14 +20,38 @@ type patternCandidate struct {
 	} `json:"suggestion"`
 }
 
+// summary describes the candidate's suggestion and occurrences, the
+// first one in full.
+func (c patternCandidate) summary() string {
+	o := c.Occurrences[0]
+	return fmt.Sprintf("%s %s gof=%q, %d occurrences from %s %d-%d", c.Suggestion.Action, c.Suggestion.Pattern, c.Suggestion.GoF, len(c.Occurrences), o.Name, o.StartLine, o.EndLine)
+}
+
+// numberedCopies checks a crate whose file holds n copies of template,
+// each with the copy's number in both its %d verbs, and stops the test
+// unless check reports one kind candidate, which it returns with the
+// crate's root.
+func numberedCopies(t *testing.T, kind, file, template string, n int) (patternCandidate, string) {
+	t.Helper()
+	var src strings.Builder
+	for i := range n {
+		fmt.Fprintf(&src, template, i, i)
+	}
+	root := repo(t, map[string]string{file: src.String()})
+	_, stdout, stderr := run("check", "--format", "json", root)
+	got := patternCandidates(t, stdout, kind)
+	if len(got) != 1 {
+		t.Fatalf("got %d %s candidates, want 1; stderr: %s\n%s", len(got), kind, stderr, stdout)
+	}
+	return got[0], root
+}
+
 func patternCandidates(t *testing.T, stdout, kind string) []patternCandidate {
 	t.Helper()
 	var r struct {
 		Candidates []patternCandidate `json:"candidates"`
 	}
-	if err := json.Unmarshal([]byte(stdout), &r); err != nil {
-		t.Fatalf("output is not valid JSON: %v\n%s", err, stdout)
-	}
+	decodeInto(t, stdout, &r)
 	var out []patternCandidate
 	for _, c := range r.Candidates {
 		if c.Kind == kind {
@@ -39,31 +62,16 @@ func patternCandidates(t *testing.T, stdout, kind string) []patternCandidate {
 }
 
 func TestCheckProposesAClosureHelperForRepeatedSetupAndTeardown(t *testing.T) {
-	var src strings.Builder
-	for i := range 6 {
-		fmt.Fprintf(&src, `pub async fn write%d(db: &Db, id: u64) -> Result<()> {
+	c, _ := numberedCopies(t, "setup-teardown", "src/writes.rs", `pub async fn write%d(db: &Db, id: u64) -> Result<()> {
     let mut tx = db.transaction().await?;
     step%d(&mut tx, id).await?;
     tx.commit().await?;
     Ok(())
 }
 
-`, i, i)
-	}
-	root := repo(t, map[string]string{"src/writes.rs": src.String()})
-
-	_, stdout, stderr := run("check", "--format", "json", root)
-
-	got := patternCandidates(t, stdout, "setup-teardown")
-	if len(got) != 1 {
-		t.Fatalf("got %d setup-teardown candidates, want 1; stderr: %s\n%s", len(got), stderr, stdout)
-	}
-	c := got[0]
-	s := c.Suggestion
-	if s.Action != "extract-scope" || s.Pattern != "closure-helper" || s.GoF != "Template Method" || len(c.Occurrences) != 6 {
-		t.Errorf("candidate = %+v", c)
-	}
-	if o := c.Occurrences[0]; o.Name != "write0" || o.StartLine != 2 || o.EndLine != 4 {
-		t.Errorf("first occurrence = %+v, want write0 lines 2-4 (begin to commit)", o)
+`, 6)
+	// The first occurrence runs from begin to commit.
+	if got, want := c.summary(), `extract-scope closure-helper gof="Template Method", 6 occurrences from write0 2-4`; got != want {
+		t.Errorf("candidate = %s, want %s", got, want)
 	}
 }

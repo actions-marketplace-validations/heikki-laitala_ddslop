@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/heikki-laitala/ddslop/internal/testutil"
 )
 
 // Two functions with the same structure: names, a literal and a called
@@ -43,15 +45,7 @@ const unrelated = `pub fn add(a: u32, b: u32) -> u32 {
 func repo(t *testing.T, files map[string]string) string {
 	t.Helper()
 	root := t.TempDir()
-	for name, content := range files {
-		p := filepath.Join(root, name)
-		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	testutil.WriteFiles(t, root, files)
 	return root
 }
 
@@ -59,6 +53,37 @@ func run(args ...string) (code int, stdout, stderr string) {
 	var out, errOut bytes.Buffer
 	code = Run(args, &out, &errOut)
 	return code, out.String(), errOut.String()
+}
+
+// wantError runs ddslop with args and fails the test unless it exits 2
+// with an error on stderr that mentions mention.
+func wantError(t *testing.T, mention string, args ...string) {
+	t.Helper()
+	stderr := ""
+	if _, stderr = runCode(t, 2, args...); stderr == "" || !strings.Contains(stderr, mention) {
+		t.Errorf("ddslop %s: stderr %q, want an error mentioning %q", strings.Join(args, " "), stderr, mention)
+	}
+}
+
+// wantContains fails the test for each of wants output lacks.
+func wantContains(t *testing.T, output string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(output, want) {
+			t.Errorf("output lacks %q:\n%s", want, output)
+		}
+	}
+}
+
+// runCode runs ddslop with args and stops the test unless it exits with
+// code.
+func runCode(t *testing.T, code int, args ...string) (stdout, stderr string) {
+	t.Helper()
+	got, stdout, stderr := run(args...)
+	if got != code {
+		t.Fatalf("ddslop %s: exit code %d, want %d; stderr:\n%s", strings.Join(args, " "), got, code, stderr)
+	}
+	return stdout, stderr
 }
 
 type jsonReport struct {
@@ -121,6 +146,23 @@ func decodeJSON[T any](t *testing.T, stdout string) T {
 	return v
 }
 
+func (r jsonReport) count() int { return len(r.Candidates) }
+
+// counted is a report that counts its candidates.
+type counted interface{ count() int }
+
+// oneCandidate runs check --format json with args and stops the test
+// unless it exits 1 reporting exactly one candidate, decoded as an R.
+func oneCandidate[R counted](t *testing.T, args ...string) R {
+	t.Helper()
+	stdout, _ := runCode(t, 1, append([]string{"check", "--format", "json"}, args...)...)
+	r := decodeJSON[R](t, stdout)
+	if r.count() != 1 {
+		t.Fatalf("got %d candidates, want 1:\n%s", r.count(), stdout)
+	}
+	return r
+}
+
 func decode(t *testing.T, stdout string) jsonReport {
 	t.Helper()
 	return decodeJSON[jsonReport](t, stdout)
@@ -133,11 +175,7 @@ func TestCheckReportsRenamedCloneAsJSON(t *testing.T) {
 		"src/math.rs":   unrelated,
 	})
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1 (candidates found); stderr: %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", root)
 	r := decode(t, stdout)
 	if r.Summary.Files != 3 || r.Summary.Units != 3 || r.Summary.Candidates != 1 {
 		t.Errorf("summary = %+v, want 3 files, 3 units, 1 candidate", r.Summary)
@@ -190,11 +228,7 @@ func TestCheckReportsRenamedCloneAsJSON(t *testing.T) {
 func TestCheckSuggestsReuseForExactCopies(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": users})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
-	}
+	stdout, _ := runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", root)
 	c := decode(t, stdout).Candidates[0]
 	if c.Kind != "exact-clone" || c.Suggestion.Action != "reuse-existing" || c.Suggestion.Parameters != 0 {
 		t.Errorf("candidate = %s, %+v; want exact-clone with reuse-existing", c.Kind, c.Suggestion)
@@ -207,11 +241,7 @@ func TestCheckSuggestsReuseForExactCopies(t *testing.T) {
 func TestCheckWithoutDuplicatesExitsZero(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": unrelated})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", root)
-
-	if code != 0 {
-		t.Errorf("exit code = %d, want 0", code)
-	}
+	stdout, _ := runCode(t, 0, "check", "--format", "json", "--min-nodes", "20", root)
 	if r := decode(t, stdout); len(r.Candidates) != 0 || r.Summary.Units != 2 {
 		t.Errorf("report = %+v, want no candidates and 2 units", r)
 	}
@@ -220,32 +250,20 @@ func TestCheckWithoutDuplicatesExitsZero(t *testing.T) {
 func TestCheckRespectsMinNodes(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": orders})
 
-	code, _, _ := run("check", "--format", "json", "--min-nodes", "100000", root)
-
-	if code != 0 {
-		t.Errorf("exit code = %d, want 0 when every unit is below --min-nodes", code)
-	}
+	runCode(t, 0, "check", "--format", "json", "--min-nodes", "100000", root)
 }
 
 func TestCheckTextFormat(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": orders})
 
-	code, stdout, _ := run("check", "--format", "text", "--min-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
-	}
-	for _, want := range []string{
+	stdout, _ := runCode(t, 1, "check", "--format", "text", "--min-nodes", "20", root)
+	wantContains(t, stdout,
 		"c1 renamed-clone",
 		"a.rs:1-9 load_user",
 		"b.rs:1-9 load_order",
 		"extract-common",
 		`"SELECT * FROM users WHERE id = $1" | "SELECT * FROM orders WHERE id = $1"`,
-	} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("text output is missing %q:\n%s", want, stdout)
-		}
-	}
+	)
 }
 
 func TestCheckDefaultsToCurrentDirectoryAndCommand(t *testing.T) {
@@ -268,10 +286,7 @@ func TestCheckErrors(t *testing.T) {
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
-			code, _, stderr := run(args...)
-			if code != 2 {
-				t.Errorf("exit code = %d, want 2", code)
-			}
+			_, stderr := runCode(t, 2, args...)
 			if stderr == "" {
 				t.Error("no error message on stderr")
 			}
@@ -299,11 +314,7 @@ func TestCheckSkipsGeneratedFilesAndCountsThem(t *testing.T) {
 		"src/generated/more.rs":   "// @generated\n" + users,
 	})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", root)
-
-	if code != 0 {
-		t.Errorf("exit code = %d, want 0: duplicates only involve generated files", code)
-	}
+	stdout, _ := runCode(t, 0, "check", "--format", "json", "--min-nodes", "20", root)
 	r := decode(t, stdout)
 	if r.Summary.Files != 1 || r.Summary.GeneratedFiles != 2 || r.Summary.Units != 1 {
 		t.Errorf("summary = %+v, want 1 analysed file, 2 generated files, 1 unit", r.Summary)
@@ -319,19 +330,13 @@ func TestCheckSkipsTestsUnlessAsked(t *testing.T) {
 		"tests/it.rs":  "#[test]\n" + users,
 	})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", root)
-	if code != 0 {
-		t.Errorf("exit code = %d, want 0: the only copies are test cases", code)
-	}
+	stdout, _ := runCode(t, 0, "check", "--format", "json", "--min-nodes", "20", root)
 	r := decode(t, stdout)
 	if r.Summary.Units != 1 || r.Summary.TestUnits != 2 {
 		t.Errorf("summary = %+v, want 1 unit analysed and 2 test units skipped", r.Summary)
 	}
 
-	code, stdout, _ = run("check", "--format", "json", "--min-nodes", "20", "--tests", root)
-	if code != 1 {
-		t.Fatalf("exit code with --tests = %d, want 1", code)
-	}
+	stdout, _ = runCode(t, 1, "check", "--format", "json", "--min-nodes", "20", "--tests", root)
 	r = decode(t, stdout)
 	if r.Summary.Units != 3 || r.Summary.TestUnits != 0 || len(r.Candidates) != 1 || len(r.Candidates[0].Occurrences) != 3 {
 		t.Errorf("with --tests: summary = %+v, candidates = %d; want all 3 units in one candidate", r.Summary, len(r.Candidates))
@@ -398,15 +403,7 @@ const usersLogged = `pub fn load_logged(db: &Db, user_id: u64) -> Result<User, E
 func TestCheckReportsNearMissCopies(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": usersLogged})
 
-	code, stdout, stderr := run("check", "--format", "json", "--min-nodes", "20", "--min-near-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1; stderr: %s", code, stderr)
-	}
-	r := decode(t, stdout)
-	if len(r.Candidates) != 1 {
-		t.Fatalf("got %d candidates, want 1", len(r.Candidates))
-	}
+	r := oneCandidate[jsonReport](t, "--min-nodes", "20", "--min-near-nodes", "20", root)
 	c := r.Candidates[0]
 	if c.Kind != "near-miss" || c.Similarity < 0.8 || c.Similarity >= 1 {
 		t.Errorf("candidate = %s with similarity %v, want a near-miss in [0.8, 1)", c.Kind, c.Similarity)
@@ -464,9 +461,7 @@ func TestCheckMinSimilarity(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"0", "1.5", "-0.2"} {
-		if code, _, stderr := run("check", "--min-similarity", bad, root); code != 2 || stderr == "" {
-			t.Errorf("--min-similarity %s: exit %d, stderr %q; want 2 with an error", bad, code, stderr)
-		}
+		wantError(t, "", "check", "--min-similarity", bad, root)
 	}
 }
 
@@ -475,11 +470,7 @@ func TestCheckTextFormatShowsNearMiss(t *testing.T) {
 
 	_, stdout, _ := run("check", "--format", "text", "--min-nodes", "20", "--min-near-nodes", "20", root)
 
-	for _, want := range []string{"c1 near-miss", "% similar", "b.rs:1-10 load_logged (unmatched: 3)"} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("text output is missing %q:\n%s", want, stdout)
-		}
-	}
+	wantContains(t, stdout, "c1 near-miss", "% similar", "b.rs:1-10 load_logged (unmatched: 3)")
 }
 
 // usersChecked is users with an extra check on line 5.
@@ -498,15 +489,7 @@ const usersChecked = `pub fn load_checked(db: &Db, user_id: u64) -> Result<User,
 func TestCheckReportsNearMissFamilyAsOneCandidate(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": usersLogged, "c.rs": usersChecked})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", "--min-near-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
-	}
-	r := decode(t, stdout)
-	if len(r.Candidates) != 1 {
-		t.Fatalf("got %d candidates, want one family", len(r.Candidates))
-	}
+	r := oneCandidate[jsonReport](t, "--min-nodes", "20", "--min-near-nodes", "20", root)
 	c := r.Candidates[0]
 	var files []string
 	for _, o := range c.Occurrences {
@@ -543,6 +526,9 @@ const syncUsers = `fn sync_users(client: &Client, users: &[User]) -> Result<(), 
 }
 `
 
+// syncPeople is a renamed copy of syncUsers.
+var syncPeople = strings.ReplaceAll(syncUsers, "sync_users", "sync_people")
+
 const syncOrders = `fn sync_orders(client: &Client, orders: &[Order], extra: u32) -> Result<(), Error> {
     if orders.is_empty() {
         return Ok(());
@@ -561,15 +547,7 @@ const syncOrders = `fn sync_orders(client: &Client, orders: &[Order], extra: u32
 func TestCheckReportsCopiedBlocksInsideFunctions(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": syncUsers, "b.rs": syncOrders})
 
-	code, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", "--min-block-nodes", "20", root)
-
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
-	}
-	r := decode(t, stdout)
-	if len(r.Candidates) != 1 {
-		t.Fatalf("got %d candidates, want 1", len(r.Candidates))
-	}
+	r := oneCandidate[jsonReport](t, "--min-nodes", "20", "--min-block-nodes", "20", root)
 	c := r.Candidates[0]
 	if c.Kind != "block-clone" || c.Similarity != 1 {
 		t.Errorf("candidate = %s, similarity %v; want block-clone, 1", c.Kind, c.Similarity)
@@ -594,11 +572,7 @@ func TestCheckTextFormatShowsBlockClone(t *testing.T) {
 
 	_, stdout, _ := run("check", "--format", "text", "--min-nodes", "20", "--min-block-nodes", "20", root)
 
-	for _, want := range []string{"c1 block-clone: 2 copies of 6 lines", "a.rs:6-11 sync_users", "b.rs:5-10 sync_orders"} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("text output is missing %q:\n%s", want, stdout)
-		}
-	}
+	wantContains(t, stdout, "c1 block-clone: 2 copies of 6 lines", "a.rs:6-11 sync_users", "b.rs:5-10 sync_orders")
 }
 
 func TestCheckBlockClonesNeedMoreNodesByDefault(t *testing.T) {
@@ -659,14 +633,8 @@ func TestCheckDropsCandidatesThatAreMostlyParameters(t *testing.T) {
 		"c.rs": users, "d.rs": orders,
 	})
 
-	_, stdout, _ := run("check", "--format", "json", "--min-nodes", "20", root)
-
-	r := decode(t, stdout)
-	if len(r.Candidates) != 1 || r.Candidates[0].Occurrences[0].File != "c.rs" {
-		var found []string
-		for _, c := range r.Candidates {
-			found = append(found, c.Occurrences[0].File)
-		}
-		t.Errorf("candidates start at %v, want only the users/orders pair", found)
+	r := oneCandidate[jsonReport](t, "--min-nodes", "20", root)
+	if f := r.Candidates[0].Occurrences[0].File; f != "c.rs" {
+		t.Errorf("the candidate starts at %s, want the users/orders pair", f)
 	}
 }

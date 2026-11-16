@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/heikki-laitala/ddslop/internal/testutil"
 )
 
 func TestVersionPrintsTheVersion(t *testing.T) {
@@ -19,10 +21,7 @@ func TestVersionPrintsTheVersion(t *testing.T) {
 
 func TestHelpListsCommands(t *testing.T) {
 	for _, arg := range []string{"help", "-h", "--help"} {
-		code, stdout, _ := run(arg)
-		if code != 0 {
-			t.Errorf("%s: exit code %d, want 0", arg, code)
-		}
+		stdout, _ := runCode(t, 0, arg)
 		for _, cmd := range []string{"check", "baseline", "flows", "map", "index", "init", "stats", "status", "uninstall", "version"} {
 			if !strings.Contains(stdout, "\n  "+cmd+" ") {
 				t.Errorf("%s: usage does not list %q:\n%s", arg, cmd, stdout)
@@ -41,10 +40,7 @@ func TestCheckHelpExitsZero(t *testing.T) {
 func TestIndexBuildsAndRefreshesTheIndex(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users, "b.rs": orders, "gen.rs": "// @generated\n" + users})
 
-	code, stdout, stderr := run("index", root)
-	if code != 0 {
-		t.Fatalf("index: exit %d, stderr %s", code, stderr)
-	}
+	stdout, _ := runCode(t, 0, "index", root)
 	if want := "indexed 3 files: 3 parsed, 0 unchanged, 0 deleted"; !strings.Contains(stdout, want) {
 		t.Errorf("first index output %q, want it to contain %q", stdout, want)
 	}
@@ -56,9 +52,7 @@ func TestIndexBuildsAndRefreshesTheIndex(t *testing.T) {
 }
 
 func TestIndexErrors(t *testing.T) {
-	if code, _, stderr := run("index", "/nonexistent/ddslop-test"); code != 2 || stderr == "" {
-		t.Errorf("index on a missing path: exit %d, stderr %q; want 2 with an error", code, stderr)
-	}
+	wantError(t, "", "index", "/nonexistent/ddslop-test")
 	if code, _, _ := run("index", "-h"); code != 0 {
 		t.Errorf("index -h: exit %d, want 0", code)
 	}
@@ -67,16 +61,8 @@ func TestIndexErrors(t *testing.T) {
 func TestInitInstallsForClaudeByDefaultAndIndexes(t *testing.T) {
 	root := repo(t, map[string]string{"a.rs": users})
 
-	code, stdout, stderr := run("init", root)
-
-	if code != 0 {
-		t.Fatalf("init: exit %d, stderr %s", code, stderr)
-	}
-	for _, want := range []string{"claude skill", "CLAUDE.md", ".gitignore", "indexed 1 files"} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("init output is missing %q:\n%s", want, stdout)
-		}
-	}
+	stdout, _ := runCode(t, 0, "init", root)
+	wantContains(t, stdout, "claude skill", "CLAUDE.md", ".gitignore", "indexed 1 files")
 	if _, err := os.Stat(filepath.Join(root, ".codex")); err == nil {
 		t.Error("init without flags installed Codex too")
 	}
@@ -90,17 +76,13 @@ func TestInitSelectedAgentsStatusAndUninstall(t *testing.T) {
 	}
 
 	_, stdout, _ := run("status", root)
-	for _, want := range []string{
+	wantContains(t, stdout,
 		".gitignore: .ddslop/ present",
 		"index: present",
 		"claude: not installed",
 		"codex: skill, instructions",
 		"copilot: skill, instructions",
-	} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("status output is missing %q:\n%s", want, stdout)
-		}
-	}
+	)
 
 	if code, _, stderr := run("uninstall", root); code != 0 {
 		t.Fatalf("uninstall: exit %d, stderr %s", code, stderr)
@@ -125,22 +107,10 @@ func TestStatsDescribesTheIndexWithoutSyncing(t *testing.T) {
 		"tests.rs": orders,
 	})
 
-	if code, _, stderr := run("stats", root); code != 2 || !strings.Contains(stderr, "ddslop index") {
-		t.Errorf("stats before indexing: exit %d, stderr %q; want 2 suggesting ddslop index", code, stderr)
-	}
+	wantError(t, "ddslop index", "stats", root)
 
 	run("index", root)
-	if err := os.WriteFile(filepath.Join(root, "new.rs"), []byte(orders), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, stdout, _ := run("stats", root)
-
-	if code != 0 {
-		t.Fatalf("stats: exit %d", code)
-	}
-	for _, want := range []string{"files: 3 (1 generated)", "functions: 2 (1 test)", ".ddslop/index.db"} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("stats output is missing %q (new.rs must not be indexed by stats):\n%s", want, stdout)
-		}
-	}
+	testutil.WriteFiles(t, root, map[string]string{"new.rs": orders})
+	stdout, _ := runCode(t, 0, "stats", root)
+	wantContains(t, stdout, "files: 3 (1 generated)", "functions: 2 (1 test)", indexPath)
 }

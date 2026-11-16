@@ -5,15 +5,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/heikki-laitala/ddslop/internal/testutil"
+
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
 
 func mustDecls(t *testing.T, src string) unit.Decls {
 	t.Helper()
-	_, decls, err := Parse("lib.rs", []byte(src))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	_, decls := testutil.Parse(t, Parse, "lib.rs", src)
 	return decls
 }
 
@@ -49,18 +48,15 @@ mod tests {
 }
 `
 	decls := mustDecls(t, src)
-	var got []string
-	for _, ty := range decls.Structs {
-		got = append(got, fmt.Sprintf("%s %s:%d-%d %s test=%v", ty.Name, ty.File, ty.StartLine, ty.EndLine, fieldList(ty.Fields), ty.Test))
-	}
+	got := testutil.Format(decls.Structs, func(ty unit.Struct) string {
+		return fmt.Sprintf("%s %s:%d-%d %s test=%v", ty.Name, ty.File, ty.StartLine, ty.EndLine, fieldList(ty.Fields), ty.Test)
+	})
 	want := []string{
 		"Budget lib.rs:1-5 id:String,limit:Option<Vec<u8>>,label:&'static str test=false",
 		"Nested lib.rs:11-11 a:u32 test=false",
 		"Fixture lib.rs:20-20 a:u32 test=true",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("types:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "types", got, want)
 	if decls.Structs[0].Nodes == 0 {
 		t.Error("a type's size in nodes is not recorded")
 	}
@@ -68,10 +64,7 @@ mod tests {
 
 func TestParseReturnsTheSameUnitsAsUnits(t *testing.T) {
 	src := "fn a() {}\nstruct S { x: u32 }\nimpl S { fn b(&self) {} }\n"
-	units, _, err := Parse("lib.rs", []byte(src))
-	if err != nil {
-		t.Fatal(err)
-	}
+	units, _ := testutil.Parse(t, Parse, "lib.rs", src)
 	if got := fmt.Sprint(names(units)); got != "[a S::b]" {
 		t.Errorf("Parse units = %s, want [a S::b]", got)
 	}
@@ -96,10 +89,9 @@ mod inner {
 }
 `
 	decls := mustDecls(t, src)
-	var got []string
-	for _, c := range decls.Consts {
-		got = append(got, fmt.Sprintf("%s=%s %s:%d literal=%v macro=%v", c.Name, c.Value, c.File, c.Line, c.Literal, c.Macro))
-	}
+	got := testutil.Format(decls.Consts, func(c unit.Const) string {
+		return fmt.Sprintf("%s=%s %s:%d literal=%v macro=%v", c.Name, c.Value, c.File, c.Line, c.Literal, c.Macro)
+	})
 	want := []string{
 		"MAX_MODELS=64 lib.rs:1 literal=false macro=false",
 		"TIMEOUT=Duration::from_secs(5) lib.rs:2 literal=false macro=false",
@@ -107,9 +99,7 @@ mod inner {
 		`CONTRACT=include_str!("openapi.json") lib.rs:4 literal=false macro=true`,
 		"NESTED=3 lib.rs:15 literal=false macro=false",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("constants:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "constants", got, want)
 }
 
 func TestUnitsRecordVisibilityAndExternalCallers(t *testing.T) {
@@ -140,10 +130,9 @@ impl S {
 }
 `
 	units := mustUnits(t, src)
-	var got []string
-	for _, u := range units {
-		got = append(got, fmt.Sprintf("%s public=%v external=%v", u.Name, u.Public, u.External))
-	}
+	got := testutil.Format(units, func(u unit.Unit) string {
+		return fmt.Sprintf("%s public=%v external=%v", u.Name, u.Public, u.External)
+	})
 	want := []string{
 		"api public=true external=false",
 		"internal public=false external=false",
@@ -154,9 +143,7 @@ impl S {
 		"health public=true external=true",
 		"S::method public=true external=false",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("units:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "units", got, want)
 }
 
 func TestUnitsRecordWhatAWrapperForwardsTo(t *testing.T) {
@@ -195,20 +182,18 @@ impl Store {
 }
 `
 	units := mustUnits(t, src)
-	var got []string
-	for _, u := range units {
+	got := testutil.Format(units, func(u unit.Unit) string {
 		if u.Forwards != "" {
-			got = append(got, u.Name+" -> "+u.Forwards)
+			return u.Name + " -> " + u.Forwards
 		}
-	}
+		return ""
+	})
 	want := []string{
 		"visible -> in_namespace",
 		"decide -> super::decide",
 		"Store::stored -> self.stored_record",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("wrappers:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "wrappers", got, want)
 }
 
 func TestParseListsTraitsImplsAndTypeNames(t *testing.T) {
@@ -275,13 +260,14 @@ struct Other {
     a: u32,
 }
 `
-	var got []string
-	for _, s := range mustDecls(t, src).Structs {
-		got = append(got, fmt.Sprintf("%s %v", s.Name, s.Converts))
-	}
-	if want := "Port [AuthoredPort Port]\nPlain [Raw]\nOther []"; strings.Join(got, "\n") != want {
-		t.Errorf("conversions:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
+	got := testutil.Format(mustDecls(t, src).Structs, func(s unit.Struct) string {
+		return fmt.Sprintf("%s %v", s.Name, s.Converts)
+	})
+	testutil.Lines(t, "conversions", got, []string{
+		"Port [AuthoredPort Port]",
+		"Plain [Raw]",
+		"Other []",
+	})
 }
 
 func TestStatementsRecordWhetherTheyReturnEarly(t *testing.T) {
@@ -338,17 +324,17 @@ fn closed_in_the_middle(db: &Db) {
     four();
 }
 `
-	var got []string
-	for _, u := range mustUnits(t, src) {
+	got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
 		if s := u.Scope; s != nil {
-			got = append(got, fmt.Sprintf("%s %s..%s %d-%d", u.Name, s.Opens, s.Closes, s.StartLine, s.EndLine))
+			return fmt.Sprintf("%s %s..%s %d-%d", u.Name, s.Opens, s.Closes, s.StartLine, s.EndLine)
 		}
-	}
+		return ""
+	})
 	// finalize consumes a hasher, but it computes, not closes: not a scope.
-	want := "reserve transaction..commit 3-6\ndropped acquire..drop 15-17"
-	if strings.Join(got, "\n") != want {
-		t.Errorf("scopes:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
+	testutil.Lines(t, "scopes", got, []string{
+		"reserve transaction..commit 3-6",
+		"dropped acquire..drop 15-17",
+	})
 }
 
 func TestUnitsRecordMatchesOnStringLiterals(t *testing.T) {
@@ -381,9 +367,7 @@ fn numbers(n: u8) -> &'static str {
 			got = append(got, fmt.Sprintf("%s %v %d-%d", u.Name, m.Values, m.StartLine, m.EndLine))
 		}
 	}
-	if want := `interpret ["committed" "refused" "replayed"] 2-7`; strings.Join(got, "\n") != want {
-		t.Errorf("string matches:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
+	testutil.Lines(t, "string matches", got, []string{`interpret ["committed" "refused" "replayed"] 2-7`})
 }
 
 func TestParseListsEnumsWithTheirVariants(t *testing.T) {
@@ -407,10 +391,10 @@ mod tests {
 		}
 		got = append(got, fmt.Sprintf("%s %d-%d %v test=%v", e.Name, e.StartLine, e.EndLine, vs, e.Test))
 	}
-	want := "NotSwept 1-6 [HistoryUnavailable(String) Store(StoreFault) Gone{at:u64} Empty] test=false\nFixture 10-10 [A B] test=true"
-	if strings.Join(got, "\n") != want {
-		t.Errorf("enums:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
+	testutil.Lines(t, "enums", got, []string{
+		"NotSwept 1-6 [HistoryUnavailable(String) Store(StoreFault) Gone{at:u64} Empty] test=false",
+		"Fixture 10-10 [A B] test=true",
+	})
 }
 
 func TestUnitsRecordTheirParameters(t *testing.T) {
@@ -418,10 +402,9 @@ func TestUnitsRecordTheirParameters(t *testing.T) {
     fn write(&mut self, db: &Db, mut deadline:   Duration, (a, b): (u8, u8)) {}
 }
 `
-	var got []string
-	for _, p := range byName(t, mustUnits(t, src), "Store::write").Params {
-		got = append(got, p.Name+": "+p.Type)
-	}
+	got := testutil.Format(byName(t, mustUnits(t, src), "Store::write").Params, func(p unit.Param) string {
+		return p.Name + ": " + p.Type
+	})
 	// self is no parameter of the group kind, and a tuple pattern has no
 	// single name.
 	if want := "[db: &Db deadline: Duration]"; fmt.Sprint(got) != want {
@@ -429,8 +412,11 @@ func TestUnitsRecordTheirParameters(t *testing.T) {
 	}
 }
 
-func TestAScopeOpensWithTheCallBeforeItsErrorConversion(t *testing.T) {
-	src := `async fn attempt(&mut self) -> Result<(), Attempt> {
+// A scope opens with the call before an error conversion or with type
+// arguments, not with the conversion.
+func TestAScopeOpensWithTheCallBeforeItsConversionOrTypeArguments(t *testing.T) {
+	for name, src := range map[string]string{
+		"error conversion": `async fn attempt(&mut self) -> Result<(), Attempt> {
     let transaction = self.client.transaction().await.map_err(retry)?;
     write(&transaction).await?;
     transaction.commit().await.map_err(retry)
@@ -441,20 +427,8 @@ fn leased(pool: &Pool) -> anyhow::Result<()> {
     lease.release();
     Ok(())
 }
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		if s := u.Scope; s != nil {
-			got = append(got, u.Name+" "+s.Opens+".."+s.Closes)
-		}
-	}
-	if want := "attempt transaction..commit\nleased acquire..release"; strings.Join(got, "\n") != want {
-		t.Errorf("scopes:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-func TestAScopeOpensThroughCallsWithTypeArguments(t *testing.T) {
-	src := `async fn attempt(&mut self) -> Result<(), Attempt> {
+`,
+		"type arguments": `async fn attempt(&mut self) -> Result<(), Attempt> {
     let transaction = self.client.transaction().await.map_err::<Attempt, _>(retry)?;
     write(&transaction).await?;
     transaction.commit().await.map_err(retry)
@@ -464,15 +438,20 @@ fn leased(pool: &Pool) {
     use_it(&lease);
     lease.release();
 }
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		if s := u.Scope; s != nil {
-			got = append(got, u.Name+" "+s.Opens+".."+s.Closes)
-		}
-	}
-	if want := "attempt transaction..commit\nleased acquire..release"; strings.Join(got, "\n") != want {
-		t.Errorf("scopes:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
+				if s := u.Scope; s != nil {
+					return u.Name + " " + s.Opens + ".." + s.Closes
+				}
+				return ""
+			})
+			testutil.Lines(t, "scopes", got, []string{
+				"attempt transaction..commit",
+				"leased acquire..release",
+			})
+		})
 	}
 }
 
@@ -516,9 +495,7 @@ func TestUnitsRecordTheirErrorForms(t *testing.T) {
 		"12 error-values variant",
 		"14 error-wrapping map_err",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("forms:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "forms", got, want)
 }
 
 func TestErrorFormsInMacrosQualifiedPathsAndAnyhowContext(t *testing.T) {
@@ -544,9 +521,7 @@ func TestErrorFormsInMacrosQualifiedPathsAndAnyhowContext(t *testing.T) {
 		"9 error-wrapping context",
 		"10 error-wrapping context",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("forms:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "forms", got, want)
 }
 
 func TestUnitsRecordHowTheyMakeErrors(t *testing.T) {
@@ -607,9 +582,7 @@ func TestUnitsRecordHowTheyMakeErrors(t *testing.T) {
 		"36 error-values string",
 		"39 error-values string",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("forms:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "forms", got, want)
 }
 
 func TestBinariesRecordNoErrorValues(t *testing.T) {
@@ -621,10 +594,7 @@ func TestBinariesRecordNoErrorValues(t *testing.T) {
 }
 `
 	for _, path := range []string{"src/main.rs", "svc/src/bin/tool.rs", "svc/src/bin/tool/args.rs"} {
-		units, _, err := Parse(path, []byte(src))
-		if err != nil {
-			t.Fatal(err)
-		}
+		units, _ := testutil.Parse(t, Parse, path, src)
 		got := forms(byName(t, units, "args"))
 		if want := "5 error-wrapping map_err"; strings.Join(got, "\n") != want {
 			t.Errorf("%s: forms = %v, want %s", path, got, want)
@@ -638,12 +608,12 @@ func TestAMessageCheckInAMatchesGuardIsRecorded(t *testing.T) {
 }
 `
 	got := forms(byName(t, mustUnits(t, src), "busy"))
-	if want := "2 error-checks message"; strings.Join(got, "\n") != want {
-		t.Errorf("forms = %v, want %s", got, want)
-	}
+	testutil.Lines(t, "forms", got, []string{"2 error-checks message"})
 }
 
-func TestLiteralsAndCommentsInMatchesAreNoErrorChecks(t *testing.T) {
+// Only an Err in the pattern of matches! is a variant check, its path
+// maybe qualified: not one in a literal, a comment or the value matched.
+func TestOnlyAnErrInTheMatchesPatternIsAVariantCheck(t *testing.T) {
 	src := `fn quoted(s: &str) -> bool {
     matches!(s, "Err(Fault::Gone)" | "e.to_string() == x") // Err(Fault::Gone)
 }
@@ -653,38 +623,7 @@ fn commented(r: Result<u8, Fault>) -> bool {
 fn real(r: Result<u8, Fault>) -> bool {
     matches!(r, Err(crate::Fault::Gone))
 }
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		for _, f := range u.Forms {
-			got = append(got, u.Name+" "+f.Form)
-		}
-	}
-	if want := "real variant"; strings.Join(got, "\n") != want {
-		t.Errorf("forms = %v, want only %s", got, want)
-	}
-}
-
-func TestQualifiedErrPatternsAreVariantChecks(t *testing.T) {
-	src := `fn gone(r: Result<u8, Fault>) -> bool {
-    match r {
-        Result::Err(Fault::Gone) => true,
-        core::result::Result::Err(Fault::Busy) => true,
-        _ => false,
-    }
-}
-`
-	var got []string
-	for _, f := range byName(t, mustUnits(t, src), "gone").Forms {
-		got = append(got, fmt.Sprintf("%d %s", f.Line, f.Form))
-	}
-	if want := "3 variant\n4 variant"; strings.Join(got, "\n") != want {
-		t.Errorf("forms = %v, want variant checks on lines 3 and 4", got)
-	}
-}
-
-func TestOnlyTheMatchesPatternIsSearchedAndItsPathMayBeQualified(t *testing.T) {
-	src := `fn value_side(r: Option<Result<u8, Fault>>) -> bool {
+fn value_side(r: Option<Result<u8, Fault>>) -> bool {
     matches!(Some(Err(Fault::Gone)), Some(Ok(_)))
 }
 fn qualified(r: Result<u8, Fault>) -> bool {
@@ -697,9 +636,25 @@ fn qualified(r: Result<u8, Fault>) -> bool {
 			got = append(got, u.Name+" "+f.Form)
 		}
 	}
-	if want := "qualified variant"; strings.Join(got, "\n") != want {
-		t.Errorf("forms = %v, want only %s", got, want)
-	}
+	testutil.Lines(t, "forms", got, []string{"real variant", "qualified variant"})
+}
+
+func TestQualifiedErrPatternsAreVariantChecks(t *testing.T) {
+	src := `fn gone(r: Result<u8, Fault>) -> bool {
+    match r {
+        Result::Err(Fault::Gone) => true,
+        core::result::Result::Err(Fault::Busy) => true,
+        _ => false,
+    }
+}
+`
+	got := testutil.Format(byName(t, mustUnits(t, src), "gone").Forms, func(f unit.Form) string {
+		return fmt.Sprintf("%d %s", f.Line, f.Form)
+	})
+	testutil.Lines(t, "forms", got, []string{
+		"3 variant",
+		"4 variant",
+	})
 }
 
 func TestAnErrInAMatchesGuardIsNoVariantCheck(t *testing.T) {
@@ -732,10 +687,9 @@ where
     f.call();
 }
 `
-	var got []string
-	for _, c := range byName(t, mustUnits(t, src), "run").Calls {
-		got = append(got, fmt.Sprintf("%s type=%q", c.Name, c.Type))
-	}
+	got := testutil.Format(byName(t, mustUnits(t, src), "run").Calls, func(c unit.Call) string {
+		return fmt.Sprintf("%s type=%q", c.Name, c.Type)
+	})
 	want := []string{
 		`get type="dyn crate::store::Store"`,
 		`save type="dyn Saver"`,
@@ -744,9 +698,7 @@ where
 		`get type=""`,
 		`call type=""`,
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "calls", got, want)
 }
 
 func TestMethodCallsRecordTheTypeTheCodeStates(t *testing.T) {
@@ -781,12 +733,12 @@ func TestMethodCallsRecordTheTypeTheCodeStates(t *testing.T) {
     }
 }
 `
-	var got []string
-	for _, c := range byName(t, mustUnits(t, src), "Server::run").Calls {
+	got := testutil.Format(byName(t, mustUnits(t, src), "Server::run").Calls, func(c unit.Call) string {
 		if c.Kind == unit.MethodCall {
-			got = append(got, fmt.Sprintf("%d %s type=%q field=%q self=%v", c.Line, c.Name, c.Type, c.Field, c.Qualifier == "self"))
+			return fmt.Sprintf("%d %s type=%q field=%q self=%v", c.Line, c.Name, c.Type, c.Field, c.Qualifier == "self")
 		}
-	}
+		return ""
+	})
 	want := []string{
 		`3 save type="Store" field="" self=false`,
 		`4 fill type="Cache" field="" self=false`,
@@ -805,9 +757,7 @@ func TestMethodCallsRecordTheTypeTheCodeStates(t *testing.T) {
 		`27 save type="" field="" self=false`,
 		`28 save type="Store" field="" self=false`,
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("method calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "method calls", got, want)
 }
 
 func TestStructFieldTypesAreRecordedForRust(t *testing.T) {
@@ -820,18 +770,15 @@ func TestStructFieldTypesAreRecordedForRust(t *testing.T) {
 }
 struct Pair(Left, Right);
 `
-	var got []string
-	for _, f := range mustDecls(t, src).FieldTypes {
-		got = append(got, fmt.Sprintf("%s.%s %s", f.Struct, f.Field, f.Type))
-	}
+	got := testutil.Format(mustDecls(t, src).FieldTypes, func(f unit.FieldType) string {
+		return fmt.Sprintf("%s.%s %s", f.Struct, f.Field, f.Type)
+	})
 	// Vec is recorded too: the graph finds no Vec method in the repository
 	// and falls back to guessing by name, as without a type. A field of no
 	// type (inner: T) is recorded as unknown, so that a struct of the same
 	// name elsewhere cannot type it.
 	want := []string{"Server.db Database", "Server.cache Cache", "Server.names Vec", "Server.inner ", "Server.store crate::store::Store"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("field types:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "field types", got, want)
 }
 
 // A field's unwrapped type is what ? or unwrap() leaves of it: inside an
@@ -843,14 +790,11 @@ func TestStructFieldTypesRecordWhatUnwrappingLeaves(t *testing.T) {
     store: Store,
 }
 `
-	var got []string
-	for _, f := range mustDecls(t, src).FieldTypes {
-		got = append(got, fmt.Sprintf("%s %s %s", f.Field, f.Type, f.Unwrapped))
-	}
+	got := testutil.Format(mustDecls(t, src).FieldTypes, func(f unit.FieldType) string {
+		return fmt.Sprintf("%s %s %s", f.Field, f.Type, f.Unwrapped)
+	})
 	want := []string{"db Option Database", "cache Result Cache", "store Store Store"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("field types:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "field types", got, want)
 }
 
 func TestRustBindingsTakeEffectWhereTheyAreInScope(t *testing.T) {
@@ -870,19 +814,16 @@ func TestRustBindingsTakeEffectWhereTheyAreInScope(t *testing.T) {
     cache.fill();
 }
 `
-	var got []string
-	for _, c := range byName(t, mustUnits(t, src), "run").Calls {
-		got = append(got, fmt.Sprintf("%d %s %q", c.Line, c.Name, c.Type))
-	}
+	got := testutil.Format(byName(t, mustUnits(t, src), "run").Calls, func(c unit.Call) string {
+		return fmt.Sprintf("%d %s %q", c.Line, c.Name, c.Type)
+	})
 	want := []string{
 		`2 items "Store"`, `3 save ""`,
 		`5 load "Store"`, `6 save ""`, `8 save "Store"`,
 		`10 next "Store"`, `11 save ""`,
 		`13 make ""`, `14 fill "Cache"`,
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "calls", got, want)
 }
 
 func TestRustTypesKeepTheirPathQualifiedByImports(t *testing.T) {
@@ -903,14 +844,10 @@ fn run(c: Client, s: Store, k: Kept, local: Ledger, q: crate::queue::Queue) {
     q.push_back();
 }
 `
-	units, decls, err := Parse("a/src/lib.rs", []byte(src))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	for _, c := range byName(t, units, "run").Calls {
-		got = append(got, fmt.Sprintf("%s %s", c.Name, c.Type))
-	}
+	units, decls := testutil.Parse(t, Parse, "a/src/lib.rs", src)
+	got := testutil.Format(byName(t, units, "run").Calls, func(c unit.Call) string {
+		return fmt.Sprintf("%s %s", c.Name, c.Type)
+	})
 	for _, f := range decls.FieldTypes {
 		got = append(got, fmt.Sprintf("field %s %s", f.Field, f.Type))
 	}
@@ -918,9 +855,7 @@ fn run(c: Client, s: Store, k: Kept, local: Ledger, q: crate::queue::Queue) {
 		"send reqwest::Client", "save crate::store::Store", "fill crate::store::Cache", "post Ledger", "push_back crate::queue::Queue",
 		"field http reqwest::Client", "field store crate::store::Store", "field other other_crate::Thing",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("types:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "types", got, want)
 }
 
 func TestLetChainBindingsApplyToLaterConditions(t *testing.T) {
@@ -932,14 +867,11 @@ func TestLetChainBindingsApplyToLaterConditions(t *testing.T) {
     }
 }
 `
-	var got []string
-	for _, c := range byName(t, mustUnits(t, src), "run").Calls {
-		got = append(got, fmt.Sprintf("%d %s %q", c.Line, c.Name, c.Type))
-	}
+	got := testutil.Format(byName(t, mustUnits(t, src), "run").Calls, func(c unit.Call) string {
+		return fmt.Sprintf("%d %s %q", c.Line, c.Name, c.Type)
+	})
 	want := []string{`2 load ""`, `2 ready ""`, `3 save ""`, `5 save "Store"`}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "calls", got, want)
 }
 
 func TestRustImportsQualifyOnlyWhereTheyAreVisible(t *testing.T) {
@@ -978,9 +910,7 @@ mod inner {
 		"other send Client", "other save crate::store::Store",
 		"run fill crate::cache::Cache", "run save Store",
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "calls", got, want)
 }
 
 func TestImportedModulesExpandAtTheRootOfATypePath(t *testing.T) {
@@ -993,14 +923,11 @@ fn run(c: m::Client, s: store::Store, o: other::Thing) {
     o.go();
 }
 `
-	var got []string
-	for _, c := range byName(t, mustUnits(t, src), "run").Calls {
-		got = append(got, fmt.Sprintf("%s %s", c.Name, c.Type))
-	}
+	got := testutil.Format(byName(t, mustUnits(t, src), "run").Calls, func(c unit.Call) string {
+		return fmt.Sprintf("%s %s", c.Name, c.Type)
+	})
 	want := []string{"send crate::model::Client", "save crate::store::Store", "go other::Thing"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "calls", got, want)
 }
 
 func TestUseDeclarationsInNestedBlocksQualifyThere(t *testing.T) {
@@ -1014,15 +941,16 @@ func TestUseDeclarationsInNestedBlocksQualifyThere(t *testing.T) {
     l.send();
 }
 `
-	var got []string
-	for _, c := range byName(t, mustUnits(t, src), "run").Calls {
+	got := testutil.Format(byName(t, mustUnits(t, src), "run").Calls, func(c unit.Call) string {
 		if c.Kind == unit.MethodCall {
-			got = append(got, fmt.Sprintf("%d %s", c.Line, c.Type))
+			return fmt.Sprintf("%d %s", c.Line, c.Type)
 		}
-	}
-	if want := "5 reqwest::Client\n8 Client"; strings.Join(got, "\n") != want {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
+		return ""
+	})
+	testutil.Lines(t, "calls", got, []string{
+		"5 reqwest::Client",
+		"8 Client",
+	})
 }
 
 func TestCfgTestStructsAreTestCode(t *testing.T) {
@@ -1036,17 +964,18 @@ struct Client {
 }
 `
 	d := mustDecls(t, src)
-	var got []string
-	for _, s := range d.Structs {
-		got = append(got, fmt.Sprintf("struct %s test=%v", s.Name, s.Test))
-	}
+	got := testutil.Format(d.Structs, func(s unit.Struct) string {
+		return fmt.Sprintf("struct %s test=%v", s.Name, s.Test)
+	})
 	for _, f := range d.FieldTypes {
 		got = append(got, fmt.Sprintf("field %s.%s test=%v", f.Struct, f.Field, f.Test))
 	}
-	want := "struct Server test=true\nstruct Client test=false\nfield Server.db test=true\nfield Client.http test=false"
-	if strings.Join(got, "\n") != want {
-		t.Errorf("got:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
+	testutil.Lines(t, "got", got, []string{
+		"struct Server test=true",
+		"struct Client test=false",
+		"field Server.db test=true",
+		"field Client.http test=false",
+	})
 }
 
 func TestRustUnitsRecordTheirResultTypes(t *testing.T) {
@@ -1061,10 +990,9 @@ impl Store {
     fn nothing(&self) {}
 }
 `
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		got = append(got, fmt.Sprintf("%s %q", u.Name, u.Results))
-	}
+	got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
+		return fmt.Sprintf("%s %q", u.Name, u.Results)
+	})
 	want := []string{
 		`Store::new ["Store" "Store"]`,
 		`Store::open ["Result" "Store"]`,
@@ -1074,13 +1002,32 @@ impl Store {
 		`Store::count ["" ""]`,
 		`Store::nothing []`,
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("results:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
+	testutil.Lines(t, "results", got, want)
 }
 
-func TestRustMethodCallsRecordTheCallProducingTheirOperand(t *testing.T) {
-	src := `async fn run() -> Result<(), Error> {
+// producedCall describes a call by the call producing its operand, and
+// the operand's type, field path and result adapter where it has them.
+func producedCall(calls []unit.Call, c unit.Call) string {
+	line := fmt.Sprintf("%d %s from=%s", c.Line, c.Name, testutil.Producer(calls, c))
+	if c.Type != "" {
+		line += fmt.Sprintf(" type=%q", c.Type)
+	}
+	if c.Field != "" {
+		line += fmt.Sprintf(" field=%q", c.Field)
+	}
+	if c.Adapts != 0 {
+		line += fmt.Sprintf(" adapts=%d", c.Adapts)
+	}
+	return line
+}
+
+func TestMethodCallsRecordTheCallProducingTheirOperand(t *testing.T) {
+	for name, tc := range map[string]struct {
+		src, unit string
+		want      []string
+	}{
+		"lets, awaits and ?": {
+			src: `async fn run() -> Result<(), Error> {
     let s = Store::new();
     s.save();
     let db = Db::connect().await?;
@@ -1090,59 +1037,41 @@ func TestRustMethodCallsRecordTheCallProducingTheirOperand(t *testing.T) {
     n.add();
     Ok(())
 }
-`
-	calls := byName(t, mustUnits(t, src), "run").Calls
-	var got []string
-	for _, c := range calls {
-		from := "-"
-		if c.From > 0 {
-			from = fmt.Sprintf("%s#%d", calls[c.From-1].Name, c.Result)
-		}
-		got = append(got, fmt.Sprintf("%d %s from=%s", c.Line, c.Name, from))
-	}
-	want := []string{
-		"2 new from=-",
-		"3 save from=new#0",
-		"4 connect from=-",
-		"5 query from=connect#3",
-		"6 get from=open#1",
-		"6 open from=-",
-		"7 count from=new#0",
-		"8 add from=count#0",
-		"9 Ok from=-",
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
-}
-
-// tree-sitter parses let mut x with mut beside the pattern, not as a
-// mut_pattern around it: a mutable binding records its producer too.
-func TestMutableLetsRecordTheCallProducingThem(t *testing.T) {
-	src := `async fn run() -> Result<(), Error> {
+`,
+			unit: "run",
+			want: []string{
+				"2 new from=-",
+				"3 save from=new#0",
+				"4 connect from=-",
+				"5 query from=connect#3",
+				"6 get from=open#1",
+				"6 open from=-",
+				"7 count from=new#0",
+				"8 add from=count#0",
+				"9 Ok from=-",
+			},
+		},
+		// tree-sitter parses let mut x with mut beside the pattern, not as
+		// a mut_pattern around it: a mutable binding records its producer
+		// too.
+		"mutable lets": {
+			src: `async fn run() -> Result<(), Error> {
     let mut db = Db::connect().await?;
     db.query();
     Ok(())
 }
-`
-	calls := byName(t, mustUnits(t, src), "run").Calls
-	var got []string
-	for _, c := range calls {
-		from := "-"
-		if c.From > 0 {
-			from = fmt.Sprintf("%s#%d", calls[c.From-1].Name, c.Result)
-		}
-		got = append(got, fmt.Sprintf("%s from=%s", c.Name, from))
-	}
-	if want := "connect from=-\nquery from=connect#3\nOk from=-"; strings.Join(got, "\n") != want {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// An async fn's call gives a future until awaited: make().map(..) is the
-// future's map, not the output's.
-func TestUnawaitedAsyncCallsAreNotTheirOutput(t *testing.T) {
-	src := `async fn make() -> Widget { Widget }
+`,
+			unit: "run",
+			want: []string{
+				"2 connect from=-",
+				"3 query from=connect#3",
+				"4 Ok from=-",
+			},
+		},
+		// An async fn's call gives a future until awaited: make().map(..)
+		// is the future's map, not the output's.
+		"unawaited async calls are not their output": {
+			src: `async fn make() -> Widget { Widget }
 
 async fn run() {
     make().map(|w| w);
@@ -1150,221 +1079,63 @@ async fn run() {
     f.spin();
     make().await.spin();
 }
-`
-	units := mustUnits(t, src)
-	if got := fmt.Sprintf("%q", byName(t, units, "make").Results); got != `["" "" "Widget" "Widget"]` {
-		t.Errorf("make's results = %s", got)
-	}
-	calls := byName(t, units, "run").Calls
-	var got []string
-	for _, c := range calls {
-		if c.From > 0 {
-			got = append(got, fmt.Sprintf("%s from=%s#%d", c.Name, calls[c.From-1].Name, c.Result))
-		}
-	}
-	if want := "map from=make#0\nspin from=make#0\nspin from=make#2"; strings.Join(got, "\n") != want {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// map_err, context, unwrap and expect are recorded as result adapters
-// (unwrap and expect as unwrapping): whether one is a library's, to look
-// through, or the repository's own method is the call graph's to tell.
-func TestResultAdaptersAreMarked(t *testing.T) {
-	src := `async fn run() -> anyhow::Result<()> {
+`,
+			unit: "run",
+			want: []string{
+				"4 map from=make#0",
+				"4 make from=-",
+				"5 make from=-",
+				"6 spin from=make#0",
+				"7 spin from=make#2",
+				"7 make from=-",
+			},
+		},
+		// map_err, context, unwrap and expect are recorded as result
+		// adapters (unwrap and expect as unwrapping): whether one is a
+		// library's, to look through, or the repository's own method is
+		// the call graph's to tell.
+		"result adapters are marked": {
+			src: `async fn run() -> anyhow::Result<()> {
     let db = Db::connect().await.context("connect")?;
     db.query();
     let s = Store::open().unwrap();
     s.get();
     Ok(())
 }
-`
-	calls := byName(t, mustUnits(t, src), "run").Calls
-	var got []string
-	for _, c := range calls {
-		if c.Kind == unit.MethodCall {
-			got = append(got, fmt.Sprintf("%s from=%s#%d adapts=%d", c.Name, calls[c.From-1].Name, c.Result, c.Adapts))
-		}
-	}
-	want := "context from=connect#2 adapts=1\nquery from=context#1 adapts=0\nunwrap from=open#0 adapts=2\nget from=unwrap#0 adapts=0"
-	if strings.Join(got, "\n") != want {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-func TestParenthesisedValuesKeepTheirProducer(t *testing.T) {
-	src := `async fn run() -> anyhow::Result<()> {
+`,
+			unit: "run",
+			want: []string{
+				"2 context from=connect#2 adapts=1",
+				"2 connect from=-",
+				"3 query from=context#1",
+				"4 unwrap from=open#0 adapts=2",
+				"4 open from=-",
+				"5 get from=unwrap#0",
+				"6 Ok from=-",
+			},
+		},
+		"parenthesised values keep their producer": {
+			src: `async fn run() -> anyhow::Result<()> {
     let db = (Db::connect().await?);
     db.query();
     (Store::open()?).get();
     Ok(())
 }
-`
-	calls := byName(t, mustUnits(t, src), "run").Calls
-	var got []string
-	for _, c := range calls {
-		if c.From > 0 {
-			got = append(got, fmt.Sprintf("%s from=%s#%d", c.Name, calls[c.From-1].Name, c.Result))
-		}
-	}
-	if want := "query from=connect#3\nget from=open#1"; strings.Join(got, "\n") != want {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// A path call's imported root is written as its import's path, by the
-// imports visible at the call: an alias in one function does not reach
-// another.
-func TestPathCallsExpandTheirVisibleImportedRoot(t *testing.T) {
-	src := `use crate::util as tools;
-
-fn a() {
-    use tokio::fs as helpers;
-    helpers::read();
-    tools::log();
-}
-
-fn b() {
-    helpers::log();
-}
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		for _, c := range u.Calls {
-			got = append(got, fmt.Sprintf("%s %s::%s", u.Name, c.Qualifier, c.Name))
-		}
-	}
-	if want := "a tokio::fs::read\na crate::util::log\nb helpers::log"; strings.Join(got, "\n") != want {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// #[cfg(test)] on a function or an impl block limits it to test builds,
-// as on a module: test code.
-func TestCfgTestFunctionsAndImplsAreTestCode(t *testing.T) {
-	src := `pub fn real() {}
-
-#[cfg(test)]
-pub fn fake_store() {}
-
-#[cfg(test)]
-impl Store {
-    pub fn fake() -> Self { Store }
-}
-
-impl Store {
-    pub fn real_one() {}
-}
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		got = append(got, fmt.Sprintf("%s test=%v", u.Name, u.Test))
-	}
-	want := "real test=false\nfake_store test=true\nStore::fake test=true\nStore::real_one test=false"
-	if strings.Join(got, "\n") != want {
-		t.Errorf("units:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// A function in an inline module records that module's path within its
-// file.
-func TestUnitsRecordTheirInlineModule(t *testing.T) {
-	src := `pub fn top() {}
-
-mod outer {
-    pub fn a() {}
-    pub mod inner {
-        pub fn b() {}
-    }
-    impl Thing {
-        pub fn c() {}
-    }
-}
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		got = append(got, fmt.Sprintf("%s module=%q", u.Name, u.Module))
-	}
-	want := "top module=\"\"\na module=\"outer\"\nb module=\"outer::inner\"\nThing::c module=\"outer\""
-	if strings.Join(got, "\n") != want {
-		t.Errorf("units:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// A test case (#[test], #[tokio::test], #[rstest]) is told apart from the
-// helpers and fakes around it in test code.
-func TestTestCasesAreToldFromTestHelpers(t *testing.T) {
-	src := `pub fn real() {}
-
-#[cfg(test)]
-mod tests {
-    fn store() -> Store { Store }
-
-    #[test]
-    fn saves() { store(); }
-
-    #[tokio::test]
-    async fn loads() { store(); }
-}
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		got = append(got, fmt.Sprintf("%s test=%v case=%v", u.Name, u.Test, u.TestCase))
-	}
-	want := "real test=false case=false\nstore test=true case=false\nsaves test=true case=true\nloads test=true case=true"
-	if strings.Join(got, "\n") != want {
-		t.Errorf("units:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// Cargo's benchmark harness runs #[bench] functions: test cases.
-func TestBenchmarksAreTestCases(t *testing.T) {
-	src := "#[cfg(test)]\nmod benches {\n    #[bench]\n    fn saving(b: &mut Bencher) {}\n}\n"
-	if u := byName(t, mustUnits(t, src), "saving"); !u.Test || !u.TestCase {
-		t.Errorf("saving: test=%v case=%v, want a test case", u.Test, u.TestCase)
-	}
-}
-
-// Test runners name their attribute after test: #[wasm_bindgen_test],
-// #[sqlx::test], #[test_log::test]. Each marks a test case.
-func TestRunnerAttributesMarkTestCases(t *testing.T) {
-	src := `#[wasm_bindgen_test]
-fn in_browser() {}
-
-#[sqlx::test]
-async fn with_db() {}
-
-#[test_log::test]
-fn logged() {}
-
-#[serde(rename = "contest")]
-fn not_a_test() {}
-`
-	var got []string
-	for _, u := range mustUnits(t, src) {
-		got = append(got, fmt.Sprintf("%s case=%v", u.Name, u.TestCase))
-	}
-	if want := "in_browser case=true\nwith_db case=true\nlogged case=true\nnot_a_test case=false"; strings.Join(got, "\n") != want {
-		t.Errorf("units:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)
-	}
-}
-
-// Benchmark files register their cases with macros (Criterion's
-// criterion_group!), so every function in benches/ is a test case.
-func TestFunctionsInBenchesAreTestCases(t *testing.T) {
-	units, _, err := Parse("svc/benches/save.rs", []byte("fn bench_save(c: &mut Criterion) {}\ncriterion_group!(benches, bench_save);\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if u := byName(t, units, "bench_save"); !u.Test || !u.TestCase {
-		t.Errorf("bench_save: test=%v case=%v, want a test case", u.Test, u.TestCase)
-	}
-}
-
-// A Some(x) or Ok(x) pattern binds what unwrapping its value leaves: of a
-// call, its result after a ?; anything else it binds is unknown.
-func TestUnwrappingPatternsBindTheCallsUnwrappedResult(t *testing.T) {
-	src := `fn run() {
+`,
+			unit: "run",
+			want: []string{
+				"2 connect from=-",
+				"3 query from=connect#3",
+				"4 get from=open#1",
+				"4 open from=-",
+				"5 Ok from=-",
+			},
+		},
+		// A Some(x) or Ok(x) pattern binds what unwrapping its value
+		// leaves: of a call, its result after a ?; anything else it binds
+		// is unknown.
+		"unwrapping patterns bind the call's unwrapped result": {
+			src: `fn run() {
     if let Some(a) = find() {
         a.save();
     }
@@ -1398,40 +1169,35 @@ func TestUnwrappingPatternsBindTheCallsUnwrappedResult(t *testing.T) {
         value.save();
     }
 }
-`
-	calls := byName(t, mustUnits(t, src), "run").Calls
-	var got []string
-	for _, c := range calls {
-		if c.Name != "save" {
-			continue
-		}
-		from := "-"
-		if c.From > 0 {
-			from = calls[c.From-1].Name
-		}
-		got = append(got, fmt.Sprintf("%d from=%s result=%d", c.Line, from, c.Result))
-	}
-	want := []string{
-		"3 from=find result=1",
-		"6 from=next result=3",
-		"9 from=find result=1",
-		"11 from=load result=1",
-		"12 from=- result=0", // the error: not what ? leaves
-		"16 from=find result=1",
-		"19 from=- result=0",    // unwrapped twice: no position says
-		"22 from=- result=0",    // a tuple inside
-		"27 from=- result=0",    // an imported variant named Some
-		"32 from=find result=1", // the outer value, shadowed only inside
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
-}
-
-// A method called through fields records the field path from where the
-// chain starts: self, a typed variable, or a call's result.
-func TestMethodCallsThroughFieldChainsRecordThePath(t *testing.T) {
-	src := `impl Server {
+`,
+			unit: "run",
+			want: []string{
+				"2 find from=-",
+				"3 save from=find#1",
+				"5 next from=-",
+				"6 save from=next#3",
+				"8 find from=-",
+				"9 save from=find#1",
+				"10 load from=-",
+				"11 save from=load#1",
+				"12 save from=-", // the error: not what ? leaves
+				"14 find from=-",
+				"16 save from=find#1",
+				"18 find from=-",
+				"19 save from=-", // unwrapped twice: no position says
+				"21 find from=-",
+				"22 save from=-", // a tuple inside
+				"26 find from=-",
+				"27 save from=-", // an imported variant named Some
+				"30 find from=-",
+				"32 save from=find#1", // the outer value, shadowed only inside
+			},
+		},
+		// A method called through fields records the field path from
+		// where the chain starts: self, a typed variable, or a call's
+		// result.
+		"field chains record the path": {
+			src: `impl Server {
     fn run(&self, req: &Request) {
         self.ctx.db.query();
         req.store.get();
@@ -1442,30 +1208,186 @@ func TestMethodCallsThroughFieldChainsRecordThePath(t *testing.T) {
         req.store?.get();
     }
 }
+`,
+			unit: "Server::run",
+			want: []string{
+				`3 query from=- field="ctx.db"`,
+				`4 get from=- type="Request" field="store"`,
+				`5 run from=make#0 field="inner"`,
+				"5 make from=-",
+				`6 ping from=- field="db"`,
+				// A ? on a field unwraps it ("?"): what is inside its Option.
+				`7 run from=make#0 field="inner?"`,
+				"7 make from=-",
+				`8 query from=- field="ctx?.db"`,
+				`9 get from=- type="Request" field="store?"`,
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := byName(t, mustUnits(t, tc.src), tc.unit).Calls
+			got := testutil.Format(calls, func(c unit.Call) string { return producedCall(calls, c) })
+			testutil.Lines(t, "calls", got, tc.want)
+		})
+	}
+}
+
+func TestAnAsyncFunctionsResultsStartWithItsFuture(t *testing.T) {
+	src := "async fn make() -> Widget { Widget }\n"
+	if got := fmt.Sprintf("%q", byName(t, mustUnits(t, src), "make").Results); got != `["" "" "Widget" "Widget"]` {
+		t.Errorf("make's results = %s", got)
+	}
+}
+
+// A path call's imported root is written as its import's path, by the
+// imports visible at the call: an alias in one function does not reach
+// another.
+func TestPathCallsExpandTheirVisibleImportedRoot(t *testing.T) {
+	src := `use crate::util as tools;
+
+fn a() {
+    use tokio::fs as helpers;
+    helpers::read();
+    tools::log();
+}
+
+fn b() {
+    helpers::log();
+}
 `
-	calls := byName(t, mustUnits(t, src), "Server::run").Calls
 	var got []string
-	for _, c := range calls {
-		if c.Kind != unit.MethodCall {
-			continue
+	for _, u := range mustUnits(t, src) {
+		for _, c := range u.Calls {
+			got = append(got, fmt.Sprintf("%s %s::%s", u.Name, c.Qualifier, c.Name))
 		}
-		from := "-"
-		if c.From > 0 {
-			from = calls[c.From-1].Name
-		}
-		got = append(got, fmt.Sprintf("%s type=%q from=%s field=%q", c.Name, c.Type, from, c.Field))
 	}
-	want := []string{
-		`query type="" from=- field="ctx.db"`,
-		`get type="Request" from=- field="store"`,
-		`run type="" from=make field="inner"`,
-		`ping type="" from=- field="db"`,
-		// A ? on a field unwraps it ("?"): what is inside its Option.
-		`run type="" from=make field="inner?"`,
-		`query type="" from=- field="ctx?.db"`,
-		`get type="Request" from=- field="store?"`,
+	testutil.Lines(t, "calls", got, []string{
+		"a tokio::fs::read",
+		"a crate::util::log",
+		"b helpers::log",
+	})
+}
+
+// #[cfg(test)] on a function or an impl block limits it to test builds,
+// as on a module: test code.
+func TestCfgTestFunctionsAndImplsAreTestCode(t *testing.T) {
+	src := `pub fn real() {}
+
+#[cfg(test)]
+pub fn fake_store() {}
+
+#[cfg(test)]
+impl Store {
+    pub fn fake() -> Self { Store }
+}
+
+impl Store {
+    pub fn real_one() {}
+}
+`
+	got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
+		return fmt.Sprintf("%s test=%v", u.Name, u.Test)
+	})
+	testutil.Lines(t, "units", got, []string{
+		"real test=false",
+		"fake_store test=true",
+		"Store::fake test=true",
+		"Store::real_one test=false",
+	})
+}
+
+// A function in an inline module records that module's path within its
+// file.
+func TestUnitsRecordTheirInlineModule(t *testing.T) {
+	src := `pub fn top() {}
+
+mod outer {
+    pub fn a() {}
+    pub mod inner {
+        pub fn b() {}
+    }
+    impl Thing {
+        pub fn c() {}
+    }
+}
+`
+	got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
+		return fmt.Sprintf("%s module=%q", u.Name, u.Module)
+	})
+	testutil.Lines(t, "units", got, []string{
+		"top module=\"\"",
+		"a module=\"outer\"",
+		"b module=\"outer::inner\"",
+		"Thing::c module=\"outer\"",
+	})
+}
+
+// A test case (#[test], #[tokio::test], #[rstest]) is told apart from the
+// helpers and fakes around it in test code.
+func TestTestCasesAreToldFromTestHelpers(t *testing.T) {
+	src := `pub fn real() {}
+
+#[cfg(test)]
+mod tests {
+    fn store() -> Store { Store }
+
+    #[test]
+    fn saves() { store(); }
+
+    #[tokio::test]
+    async fn loads() { store(); }
+}
+`
+	got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
+		return fmt.Sprintf("%s test=%v case=%v", u.Name, u.Test, u.TestCase)
+	})
+	testutil.Lines(t, "units", got, []string{
+		"real test=false case=false",
+		"store test=true case=false",
+		"saves test=true case=true",
+		"loads test=true case=true",
+	})
+}
+
+// Cargo's benchmark harness runs #[bench] functions: test cases.
+func TestBenchmarksAreTestCases(t *testing.T) {
+	src := "#[cfg(test)]\nmod benches {\n    #[bench]\n    fn saving(b: &mut Bencher) {}\n}\n"
+	if u := byName(t, mustUnits(t, src), "saving"); !u.Test || !u.TestCase {
+		t.Errorf("saving: test=%v case=%v, want a test case", u.Test, u.TestCase)
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+}
+
+// Test runners name their attribute after test: #[wasm_bindgen_test],
+// #[sqlx::test], #[test_log::test]. Each marks a test case.
+func TestRunnerAttributesMarkTestCases(t *testing.T) {
+	src := `#[wasm_bindgen_test]
+fn in_browser() {}
+
+#[sqlx::test]
+async fn with_db() {}
+
+#[test_log::test]
+fn logged() {}
+
+#[serde(rename = "contest")]
+fn not_a_test() {}
+`
+	got := testutil.Format(mustUnits(t, src), func(u unit.Unit) string {
+		return fmt.Sprintf("%s case=%v", u.Name, u.TestCase)
+	})
+	testutil.Lines(t, "units", got, []string{
+		"in_browser case=true",
+		"with_db case=true",
+		"logged case=true",
+		"not_a_test case=false",
+	})
+}
+
+// Benchmark files register their cases with macros (Criterion's
+// criterion_group!), so every function in benches/ is a test case.
+func TestFunctionsInBenchesAreTestCases(t *testing.T) {
+	units, _ := testutil.Parse(t, Parse, "svc/benches/save.rs", "fn bench_save(c: &mut Criterion) {}\ncriterion_group!(benches, bench_save);\n")
+	if u := byName(t, units, "bench_save"); !u.Test || !u.TestCase {
+		t.Errorf("bench_save: test=%v case=%v, want a test case", u.Test, u.TestCase)
 	}
 }
