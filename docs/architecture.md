@@ -287,11 +287,16 @@ returns), and each adapter describes its grammar to it: which node kinds
 are names, types and literals, which positions declare names, which node
 holds a block's statements, and per-node hooks. Each language prefixes
 its node kinds before they become symbols (Rust with nothing, so its
-fingerprints predate other languages; Go with `go:`), so alike-named kinds
-(identifier, block) never make a Go function a near miss of a Rust one.
-Files are indexed by extension (`.rs`, `.go`), and each candidate's
-`language` is its first file's. The Go adapter (`internal/lang/golang`)
-extracts functions and methods (named `Type.Method`, the receiver
+fingerprints predate other languages; Go with `go:`, TypeScript with
+`ts:`), so alike-named kinds (identifier, block) never make a Go function
+a near miss of a Rust one. Files are indexed by extension (`.rs`, `.go`,
+`.ts`, `.tsx`, `.mts`, `.cts`), and each candidate's
+`language` is its first file's. The detectors grouping declarations or
+functions by a key (types, constants, inlined constants, string kinds,
+parameter groups, scopes) run on each language on its own, so a Go and
+a TypeScript constant of one name and value are no copies. The Go
+adapter (`internal/lang/golang`) extracts functions and methods
+(named `Type.Method`, the receiver
 without pointer or type arguments); function literals stay part of their
 function; `_test.go` files and `testdata/` directories are test code; the
 generated-file header rule (`// Code generated ... DO NOT EDIT.`) is
@@ -310,8 +315,11 @@ package. Pass-through wrappers work the same way as in Rust; Go methods
 are left out, since they may satisfy an interface. The rule "the
 arguments are the parameters, in order, as is or borrowed" lives once in
 `syntax.PassesOn`; the per-grammar rest of wrapper detection and of the
-grammar hooks stays per adapter until a third language (extract on the
-third occurrence), marked `ddslop:ignore` in ddslop's own code. Go functions also
+grammar hooks (call classification) stays per adapter, marked
+`ddslop:ignore` in ddslop's own code: with TypeScript as the third
+language, what the three share is their shape, as each changes with its
+own grammar (borrows and `Self(x)` in Rust, `&x` and variadics in Go,
+arrow and rest parameters in TypeScript). Go functions also
 record their parameters (a `context.Context` left out: Go passes it
 explicitly and never stores it in a struct, so it is never part of a
 parameter object) and their switches on strings (`case "a", "b":`), so
@@ -397,6 +405,92 @@ On a 100-file Go service: 43 candidates and 12.2% duplication, led by an
 authentication check in 14 handlers; with declarations, a client package
 re-declaring the server's response types (`MemoryItem`, `SearchResponse`,
 ...) was the main new finding.
+
+The TypeScript adapter (`internal/lang/typescript`) parses `.tsx` files
+with the TSX grammar and the others with the TypeScript one, under one
+prefix, so a component and a plain function can be copies. Its units are
+top-level functions, a class's methods and fields holding a function
+(named `Class.member`), and constants holding an arrow function or
+function expression (`const load = async () => {}`, named after the
+constant, also behind `as`, `satisfies` or parentheses); `export`,
+before the declaration or in an export clause (`export { load }`,
+`export default save`), makes them public, unless a member is private,
+protected or `#named`. A member with a computed name
+(`[Symbol.iterator]`) is no unit: code never calls it by name. Nested
+functions stay part of their function, and a return in one leaves only
+it. `.test` and `.spec` files and `__tests__` directories are test code;
+test runners take their cases as callbacks (`it("...", () => {})`), so
+no TypeScript unit is a test case. Declaration files (`.d.ts`) are not
+indexed: they hold no code. Module-level declarations feed the type and
+constant detectors: an interface or object type
+(`type Budget = { ... }`) is a struct of its properties, methods left
+out, an interface's bases a field named `extends`
+(`extends:Base,Other<T>`), an optional one typed `T|undefined`, so
+copies differing in it are shown with that difference, as Rust's
+`Option<T>` is; an enum is an enum, an initialiser its variant's payload
+(`High = 10`); a union of string literals (`"queued" | "running"`) is an
+enum of them, the idiomatic TypeScript enum. A `const` is a constant
+only when its value is made of literals and operators (`5 * 60 * 1000`,
+`{ retries: 3 } as const`), and not an empty object or array, which is
+state to fill (`const cache = {}`, `{} as Cache`): TypeScript binds any
+value with `const`, and on Hono and tRPC counting every one reported 140
+groups of call results (`const root = createRoot(el)`, one router per
+example) where 17 copied values remained. Next.js route options
+(`export const dynamic = ...` in page, layout and route files) are left
+out: the framework asks every route for them.
+
+TypeScript calls are recorded from the file's imports: an imported
+function (`import { verify as check } from "../auth/verify.js"`) is a
+path call qualified by its module as written, under its exported name,
+and so is one through a namespace import (`db.query`); another plain
+name is a free call, a call on `this` a self call, one on a field of
+`this` a method call on that field. They resolve without types: a free
+call to the caller's file's function (a name a file does not import is
+its own, or a global, unless the caller declares the name, as a
+parameter does), a relative import to the exported function of that
+name in the file it names, extension or not, or in its `index` file (a
+default import is taken under its local name, which a private function
+of the module may share), and a self call to the class's method. A package's import (`node:fs`, `@acme/db`)
+resolves to nothing, even a workspace package's, and nor does any other
+method call: JavaScript's own method names (`map`, `get`, `then`) are
+too many to tell from the code's. Wrappers work as in Go, but a
+function giving a parameter a default value (`opts = {}`) or taking an
+optional one (`id?: string`) is no wrapper: inlined, its callers that
+leave the argument out would change;
+nor is an async function or a generator, whose callers get a promise or
+an iterator, not the call's value; class members are left out,
+as they may implement an interface, which TypeScript checks by shape.
+All TypeScript extensions share one call index, so a `.tsx` component
+calls a `.ts` helper. What the call graph needs to know of TypeScript
+files by name (which are source, which file a relative import names)
+lives in `internal/lang/tsfile`, which holds no parser, so `flow` links
+no grammar. Calls through packages are not followed, so no
+TypeScript code counts as internal to the analysed code and none is
+reported unused; and as module cycles are found among a Rust crate's
+modules, TypeScript files in a crate's directory (a Tauri app's
+frontend) are none of its modules. On Hono, Excalidraw and tRPC, 6
+wrappers, all passing their parameters on unchanged; most narrow the
+types (`createHTTPHandler` calling `createHandler`).
+
+TypeScript functions record their parameters named by one name, each
+with its type as written (`""` when it has none), and their switches on
+strings (`case "a":`, quote style normalised as for unions), so
+parameter groups and string kinds work for TypeScript. A `this`
+parameter only types `this`; destructured and rest parameters (a React
+component's props) bind no one name and are left out; class members
+are left out of parameter groups, as for Go methods. On Excalidraw: 18
+parameter groups, the state a canvas renderer passes along (`appState`,
+`element`, `elementsMap`; `context`, `width`, `height`), and the element
+types switched on in eight functions; on tRPC, query states
+(`"pending"`, `"success"`, `"error"`) switched on in three example
+pages. Signatures a framework dictates are not told apart yet: an
+Express app writing its handlers inline passes them as callbacks, which
+are no units, but named handlers (`export const getUser = (req:
+Request, res: Response, next: NextFunction) => ...`) would group, as
+Go's HTTP handlers did, once measured. On three open-source
+TypeScript codebases (Hono, Excalidraw, tRPC; 95k to 230k lines, 2 to 4
+seconds each), the copies found were real: adapters vendored twice, undo
+and redo actions, per-shape geometry.
 
 All three languages are parsed with tree-sitter
 (`github.com/tree-sitter/go-tree-sitter` plus the Go, TypeScript/TSX and Rust
@@ -692,10 +786,13 @@ duplication, and are dropped below a threshold.
 
 - Generated code. A file is generated when its leading comment block (the
   comments before the first line of code) contains `@generated` or "do not
-  edit", or a comment starting with "Generated by" or "Code generated".
-  Only the header counts, so a generator's own source, which mentions these
-  phrases in templates, is still analysed. Skipped files are counted in the
-  summary (`generated_files`). Configured paths come later.
+  edit", a comment starting with "Generated by" or "Code generated", or
+  one saying the file is or was generated ("This file is auto-generated by
+  @hey-api/openapi-ts"; on tRPC that marks 192 files and takes duplication
+  from 22.8% to 3.8%). Only the header counts, so a generator's own
+  source, which mentions these phrases in templates, is still analysed.
+  Skipped files are counted in the summary (`generated_files`). Configured
+  paths come later.
 - Known idioms per language (for example Go's `if err != nil { return err }`).
 - Fragments below a minimum size, measured in syntax nodes (`--min-nodes`).
 - Candidates that would be mostly parameters: fewer than 20 nodes per
@@ -2408,7 +2505,8 @@ main.go              entry point; calls internal/cli (kept at the root so
                      `go install github.com/heikki-laitala/ddslop@latest` works)
 internal/cli/        flag parsing, orchestration, exit codes
 internal/unit/       the language-neutral unit and leaf types
-internal/lang/       language adapters (golang, typescript, rust)
+internal/lang/       language adapters (golang, typescript, rust), and tsfile:
+                     TypeScript files by name, without a parser
 internal/parse/      tree-sitter parsing and unit extraction
 internal/clone/      hashing, LSH, verification, grouping
 internal/unify/      anti-unification and hole classification

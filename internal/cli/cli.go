@@ -23,10 +23,13 @@ import (
 	"github.com/heikki-laitala/ddslop/internal/codemap"
 	"github.com/heikki-laitala/ddslop/internal/config"
 	"github.com/heikki-laitala/ddslop/internal/flow"
+	"github.com/heikki-laitala/ddslop/internal/group"
 	"github.com/heikki-laitala/ddslop/internal/index"
 	"github.com/heikki-laitala/ddslop/internal/lang/golang"
 	"github.com/heikki-laitala/ddslop/internal/lang/rust"
 	"github.com/heikki-laitala/ddslop/internal/lang/syntax"
+	"github.com/heikki-laitala/ddslop/internal/lang/tsfile"
+	"github.com/heikki-laitala/ddslop/internal/lang/typescript"
 	"github.com/heikki-laitala/ddslop/internal/pattern"
 	"github.com/heikki-laitala/ddslop/internal/report"
 	"github.com/heikki-laitala/ddslop/internal/similarity"
@@ -68,16 +71,18 @@ Run "ddslop <command> -h" for a command's flags.
 
 const checkUsage = `usage: ddslop check [flags] [path]
 
-Finds duplicated Rust and Go code under path (default ".") and proposes
-refactoring candidates: exact copies, renamed copies, near-miss copies
-with added, removed or changed statements, copied blocks of statements
-inside larger functions, features running the same pipeline, structs with
-the same fields, constants declared twice or written inline, unused public
-functions of unpublished crates, wrappers that only forward their
-parameters, and traits with a single implementation. Generated files are
-skipped, and so is test code unless --tests is given. Extracted functions are kept in an index at
-<path>/.ddslop/index.db so unchanged files are not parsed again. Files are
-parsed on half the CPU cores; set DDSLOP_INDEX_THREADS to change that.
+Finds duplicated Rust, Go and TypeScript code under path (default ".")
+and proposes refactoring candidates: exact copies, renamed copies,
+near-miss copies with added, removed or changed statements, copied
+blocks of statements inside larger functions, features running the same
+pipeline, structs with the same fields, constants declared twice or
+written inline, unused public functions of unpublished crates, wrappers
+that only forward their parameters, and traits with a single
+implementation. Generated files are skipped, and so is test code unless
+--tests is given. Extracted functions are kept in an index at
+<path>/.ddslop/index.db so unchanged files are not parsed again. Files
+are parsed on half the CPU cores; set DDSLOP_INDEX_THREADS to change
+that.
 
 With --diff <ref>, the whole repository is still analysed, but only
 candidates touching lines changed since ref are reported, and the changed
@@ -568,10 +573,10 @@ type options struct {
 }
 
 // syncIndex opens the index under root and brings it up to date with the
-// Rust and Go files there that .ddslop.yaml does not exclude. The caller
-// closes the database.
+// Rust, Go and TypeScript files there that .ddslop.yaml does not exclude,
+// TypeScript declaration files aside. The caller closes the database.
 func syncIndex(root string) (*index.DB, index.Stats, error) {
-	paths, err := source.Files(root, ".rs", ".go")
+	paths, err := source.Files(root, append([]string{".rs", ".go"}, tsfile.Extensions...)...)
 	if err != nil {
 		return nil, index.Stats{}, err
 	}
@@ -579,7 +584,9 @@ func syncIndex(root string) (*index.DB, index.Stats, error) {
 	if err != nil {
 		return nil, index.Stats{}, err
 	}
-	paths = slices.DeleteFunc(paths, func(p string) bool { return cfg.Excluded(filepath.ToSlash(p)) })
+	paths = slices.DeleteFunc(paths, func(p string) bool {
+		return cfg.Excluded(filepath.ToSlash(p)) || tsfile.IsDeclarationFile(p)
+	})
 	version, err := extractorVersion()
 	if err != nil {
 		return nil, index.Stats{}, err
@@ -719,20 +726,46 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 	found, conventions := drifts(units, packages(root, files), judged)
 	r := report.Build(languageOf, report.Findings{
 		Groups: append(groups, helperGroups...), NearMisses: nearMisses, Blocks: blocks, Flows: flows,
-		Structs:  clone.Structs(structs, minStructFields),
-		Enums:    clone.Enums(enums),
-		Consts:   clone.Constants(consts),
-		Inlined:  clone.InlinedConstants(consts, units, flow.CrateOf),
+		Structs: byLanguage(structs, func(_ string, s []unit.Struct) []clone.StructGroup { return clone.Structs(s, minStructFields) }),
+		Enums:   byLanguage(enums, func(_ string, e []unit.Enum) []clone.EnumGroup { return clone.Enums(e) }),
+		Consts:  byLanguage(consts, func(_ string, c []unit.Const) []clone.ConstGroup { return clone.Constants(c) }),
+		Inlined: byLanguage(consts, func(lang string, c []unit.Const) []clone.InlinedConst {
+			return clone.InlinedConstants(c, inLanguage(lang, units), flow.CrateOf)
+		}),
 		Dead:     simplify.Dead(units, wordCounts(files), internal),
 		Wrappers: simplify.PassThrough(g),
 		Traits:   simplify.SingleImpl(decls, internal),
-		Scopes:   pattern.Scopes(units),
-		Kinds:    pattern.StringKinds(units),
-		Params:   pattern.ParameterGroups(units, decls.FuncTypes),
-		Drifts:   found,
-		Cycles:   dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files), opts.tests),
+		Scopes:   byLanguage(units, func(_ string, u []unit.Unit) []pattern.ScopeGroup { return pattern.Scopes(u) }),
+		Kinds:    byLanguage(units, func(_ string, u []unit.Unit) []pattern.StringKind { return pattern.StringKinds(u) }),
+		Params: byLanguage(units, func(_ string, u []unit.Unit) []pattern.ParamGroup {
+			return pattern.ParameterGroups(u, decls.FuncTypes)
+		}),
+		Drifts: found,
+		Cycles: dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files), opts.tests),
 	}, summary)
 	return r, conventions, recordHealth(db, root, r.Summary.Health)
+}
+
+// languages are the languages check analyses, each on its own.
+var languages = []string{"go", "rust", "typescript"}
+
+// byLanguage runs detect on each language's items on its own, so no
+// candidate puts together declarations or functions of two languages,
+// which neither could share.
+func byLanguage[T group.Located, G any](items []T, detect func(lang string, items []T) []G) []G {
+	var out []G
+	for _, lang := range languages {
+		out = append(out, detect(lang, inLanguage(lang, items))...)
+	}
+	return out
+}
+
+// inLanguage keeps the items whose file is in lang.
+func inLanguage[T group.Located](lang string, items []T) []T {
+	return slices.DeleteFunc(slices.Clone(items), func(x T) bool {
+		file, _ := x.At()
+		return languageOf(file) != lang
+	})
 }
 
 // drifts finds the convention drifts in the units check analyses (no
@@ -748,7 +781,7 @@ func drifts(units []unit.Unit, crates *codemap.Packages, judged map[string]map[s
 	g := &flow.Graph{Units: units}
 	var out []report.Drift
 	measured := map[string]map[string]codemap.Convention{}
-	for _, lang := range []string{"go", "rust"} {
+	for _, lang := range languages {
 		for _, test := range []bool{false, true} {
 			key := side(lang, test)
 			in := codemap.Grouping(func(u unit.Unit) string {
@@ -969,7 +1002,9 @@ func wordCounts(files []index.File) map[string]int {
 
 // internalCrates reports, for a file, whether its crate or package serves
 // only the analysed code (see rust.Unpublished and golang.Internal). The
-// Rust workspace manifest is the one at root.
+// Rust workspace manifest is the one at root. TypeScript code is never
+// known to be internal: calls through package imports, such as another
+// workspace package's, are not followed.
 func internalCrates(root string, files []index.File) func(file string) bool {
 	workspace := manifest(root, ".")
 	libraries := packages(root, files).Libraries
@@ -979,9 +1014,10 @@ func internalCrates(root string, files []index.File) func(file string) bool {
 		if _, done := internal[dir]; done {
 			continue
 		}
-		if languageOf(f.Path) == "go" {
+		switch languageOf(f.Path) {
+		case "go":
 			internal[dir] = golang.Internal(f.Path, f.Decls.Package)
-		} else {
+		case "rust":
 			pkg := libraries.PackageOf(f.Path) // a placed target's crate is not its package
 			if pkg == "" {
 				pkg = dir
@@ -989,7 +1025,9 @@ func internalCrates(root string, files []index.File) func(file string) bool {
 			internal[dir] = rust.Unpublished(manifest(root, pkg), workspace)
 		}
 	}
-	return func(file string) bool { return internal[libraries.CrateOf(file)] }
+	return func(file string) bool {
+		return languageOf(file) != "typescript" && internal[libraries.CrateOf(file)]
+	}
 }
 
 // frequentBlockNodes, frequentBlockLines and frequentBlockDuplicated keep
@@ -1240,19 +1278,25 @@ func parseFile(path string, src []byte) (index.Parsed, error) {
 // place given (see rust.ParseAs).
 func parseSource(file syntax.Source) (index.Parsed, error) {
 	path, src := file.Path, file.Src
-	golangFile := languageOf(path) == "go"
+	language := languageOf(path)
 	if syntax.IsGenerated(src) {
-		entries := rust.Traits(src)
-		if golangFile {
+		var entries []string
+		switch language {
+		case "go":
 			entries = golang.InterfaceMethods(src)
+		case "rust":
+			entries = rust.Traits(src)
 		}
 		return index.Parsed{Generated: true, Traits: entries, Words: source.Words(src)}, nil
 	}
 	var parsed index.Parsed
 	var err error
-	if golangFile {
+	switch language {
+	case "go":
 		parsed.Units, parsed.Decls, err = golang.Parse(path, src)
-	} else {
+	case "typescript":
+		parsed.Units, parsed.Decls, err = typescript.Parse(path, src)
+	case "rust":
 		parsed, err = parseRust(file)
 	}
 	for i := range parsed.Units {
@@ -1264,8 +1308,11 @@ func parseSource(file syntax.Source) (index.Parsed, error) {
 
 // languageOf names the language of a source file by its extension.
 func languageOf(path string) string {
-	if strings.HasSuffix(path, ".go") {
+	switch {
+	case strings.HasSuffix(path, ".go"):
 		return "go"
+	case tsfile.IsSource(path):
+		return "typescript"
 	}
 	return "rust"
 }

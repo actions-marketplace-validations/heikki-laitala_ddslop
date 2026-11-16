@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/heikki-laitala/ddslop/internal/clone"
+	"github.com/heikki-laitala/ddslop/internal/lang/tsfile"
 	"github.com/heikki-laitala/ddslop/internal/similarity"
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
@@ -92,11 +93,15 @@ type Inputs struct {
 }
 
 // Build resolves every unit's calls. A call finds only functions of its
-// own language: each language, told by file extension, has its own index.
+// own language: each language, told by file extension, has its own index,
+// all of TypeScript's extensions one.
 func Build(in Inputs, units []unit.Unit) *Graph {
 	langs := map[string]*index{}
 	indexOf := func(file string) *index {
 		ext := filepath.Ext(file)
+		if tsfile.IsSource(file) {
+			ext = ".ts"
+		}
 		if langs[ext] == nil {
 			langs[ext] = &index{free: map[string][]int{}, methods: map[string][]int{}, owned: map[string][]int{}, owners: map[string]bool{},
 				impls: map[string][]string{}, rustModules: map[string]map[string]bool{},
@@ -277,6 +282,9 @@ func (r *callResolver) resolveCall(c unit.Call) (int, bool, bool) {
 // by its method name alone (see Graph.ByName), and whether through a
 // value of a trait type (see Graph.Dispatched).
 func (ix index) resolve(units []unit.Unit, caller unit.Unit, owner string, c unit.Call) (int, bool, bool) {
+	if tsfile.IsSource(caller.File) {
+		return ix.resolveTypeScript(units, caller, owner, c), false, false
+	}
 	if c.Kind != unit.MethodCall || c.Qualifier == "self" {
 		return ix.resolveNamed(units, caller, owner, c), false, false
 	}
@@ -732,6 +740,32 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 		return -1 // an outside crate, such as tokio
 	}
 	return only(units, ix.free[target], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
+}
+
+// resolveTypeScript resolves a TypeScript call. A name the file does not
+// import is its own function's, or a global's, unless the caller declares
+// it (a parameter), its own name aside (a recursive call); an imported
+// one (a path call qualified by its module) is the exported function of
+// that name in the module a relative path names (see tsfile.ModuleIs),
+// never a package's; a call on this is the caller's class's method.
+// Without types, the name of any other method says nothing: it is not
+// resolved.
+func (ix index) resolveTypeScript(units []unit.Unit, caller unit.Unit, owner string, c unit.Call) int {
+	sameFile := func(u unit.Unit) bool { return u.File == caller.File }
+	switch {
+	case c.Kind == unit.FreeCall:
+		if c.Name != caller.Name && slices.ContainsFunc(caller.Leaves, func(l unit.Leaf) bool { return l.Declares && l.Text == c.Name }) {
+			return -1
+		}
+		return only(units, ix.free[c.Name], sameFile)
+	case c.Kind == unit.PathCall:
+		return only(units, ix.free[c.Name], func(u unit.Unit) bool {
+			return u.Public && tsfile.ModuleIs(caller.File, c.Qualifier, u.File)
+		})
+	case c.Qualifier == "self" && owner != "":
+		return only(units, ix.owned[owner+"::"+c.Name], sameFile)
+	}
+	return -1
 }
 
 // pick chooses among candidates the one in the caller's file, else the
