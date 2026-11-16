@@ -896,7 +896,7 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 			modules[codemap.Module(f.Path, crates)] = true
 		}
 	}
-	rootValues, selfAliases := map[string]bool{}, map[string]bool{}
+	rootValues, selfAliases, rootImports := map[string]bool{}, map[string]bool{}, map[string]string{}
 	for _, f := range files {
 		crate, rel := codemap.CratePath(f.Path, crates)
 		root := rel == "lib.rs" || rel == "main.rs" && !libraries[crate]
@@ -913,8 +913,9 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 		}
 		// a name the root imports (pub use values::foo) beside its mod foo
 		// cannot be a module too: it is a value
-		for name := range f.Imports {
+		for name, path := range f.Imports {
 			rootValues[strings.TrimPrefix(name, "r#")] = true
+			rootImports[strings.TrimPrefix(name, "r#")] = path
 		}
 		for _, r := range f.References {
 			if r.Alias != "" && (tests || !r.Test) {
@@ -922,7 +923,7 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 			}
 		}
 	}
-	facts := codemap.CrateFacts{Modules: modules, RootValues: rootValues, SelfAliases: selfAliases}
+	facts := codemap.CrateFacts{Modules: modules, RootValues: rootValues, SelfAliases: selfAliases, RootImports: rootImports}
 	var deps []codemap.Dependency
 	for _, f := range files {
 		if generated[f.Path] || codemap.Crate(f.Path, crates) != name || !inLibrary(f.Path, crates, libraries) {
