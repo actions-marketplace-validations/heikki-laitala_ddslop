@@ -3,6 +3,7 @@ package integrate
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -103,15 +104,20 @@ func TestInstallCodexAndCopilot(t *testing.T) {
 	}
 }
 
+// A section an earlier ddslop wrote is brought up to date in place.
 func TestInstallIsIdempotentAndUpdatesTheSectionInPlace(t *testing.T) {
 	root := t.TempDir()
-	write(t, root, "AGENTS.md", "# Rules\n\n## ddslop\n\nOld text.\n\n## Testing\n\nRun tests.\n")
+	former, err := os.ReadFile("templates/former/1.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "AGENTS.md", "# Rules\n\n"+string(former)+"\n## Testing\n\nRun tests.\n")
 
 	install(t, root, Codex)
 	second := install(t, root, Codex)
 
 	agents := read(t, root, "AGENTS.md")
-	if strings.Count(agents, sectionTitle) != 1 || strings.Contains(agents, "Old text.") {
+	if strings.Count(agents, sectionTitle) != 1 || !strings.Contains(agents, section) {
 		t.Errorf("section not replaced in place:\n%s", agents)
 	}
 	if !strings.HasPrefix(agents, "# Rules\n\n## ddslop\n") || !strings.HasSuffix(agents, "## Testing\n\nRun tests.\n") {
@@ -231,5 +237,44 @@ func TestUninstallRemovesEverythingButOtherContent(t *testing.T) {
 	}
 	if exists(filepath.Join(root, indexDir)) {
 		t.Error("purge left .ddslop/")
+	}
+}
+
+// A section edited by hand is the project's own rules: init keeps it while
+// it updates the skill, uninstall keeps it while it removes the skill, and
+// each says so, every time it runs.
+func TestASectionEditedByHandIsKept(t *testing.T) {
+	own := "# Rules\n\n## ddslop\n\nRun our gate, not --diff HEAD.\n\n## Testing\n\nRun tests.\n"
+	for _, tc := range []struct {
+		name  string
+		run   func(t *testing.T, root string) []string
+		skill bool // whether the skill is installed afterwards
+	}{
+		{"init", func(t *testing.T, root string) []string { return install(t, root, Codex) }, true},
+		{"uninstall", func(t *testing.T, root string) []string {
+			install(t, root, Codex)
+			changes, err := Uninstall(root, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return changes
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			write(t, root, "AGENTS.md", own)
+			for range 2 {
+				changes := tc.run(t, root)
+				if got := read(t, root, "AGENTS.md"); got != own {
+					t.Errorf("AGENTS.md = %q, want it as edited", got)
+				}
+				if got := exists(filepath.Join(root, ".codex/skills/ddslop/SKILL.md")); got != tc.skill {
+					t.Errorf("skill installed = %v, want %v", got, tc.skill)
+				}
+				if !slices.ContainsFunc(changes, func(c string) bool { return strings.Contains(c, "kept the ddslop section") }) {
+					t.Errorf("changes = %v, want a line saying the edited section was kept", changes)
+				}
+			}
+		})
 	}
 }

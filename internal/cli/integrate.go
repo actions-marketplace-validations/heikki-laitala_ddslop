@@ -19,7 +19,8 @@ Sets ddslop up in the project at path (default "."): a ddslop skill for
 each chosen coding agent, a "## ddslop" section in its instructions file
 (CLAUDE.md, AGENTS.md or .github/copilot-instructions.md), a .ddslop/
 entry in .gitignore, and the index. Without agent flags, installs for
-Claude Code. Running it again only updates what changed.
+Claude Code. Running it again only updates what changed, and keeps a
+section edited by hand.
 
 Flags:
 `
@@ -100,7 +101,8 @@ func presence(ok bool) string {
 const uninstallUsage = `usage: ddslop uninstall [--purge] [path]
 
 Removes ddslop's skills, instruction sections and .gitignore entry from
-the project at path (default "."). Other content of those files is kept.
+the project at path (default "."). Other content of those files is kept,
+and so is an instructions section edited by hand.
 
 Flags:
 `
