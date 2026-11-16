@@ -99,6 +99,9 @@ const (
 type Form struct {
 	Concern, Form string
 	Line          int
+	// Ignored is true when a ddslop:ignore comment marks the form's line:
+	// it neither sets a convention nor drifts from one.
+	Ignored bool
 }
 
 // Param is one parameter: its name and its type as written, without
@@ -401,6 +404,15 @@ func (s Struct) At() (file string, line int) { return s.File, s.StartLine }
 
 // At returns where an enum starts.
 func (e Enum) At() (file string, line int) { return e.File, e.StartLine }
+
+// Size is a unit's number of syntax nodes.
+func (u Unit) Size() int { return u.Nodes }
+
+// Size is a struct's number of syntax nodes.
+func (s Struct) Size() int { return s.Nodes }
+
+// Size is an enum's number of syntax nodes.
+func (e Enum) Size() int { return e.Nodes }
 
 // At returns where a constant is declared.
 func (c Const) At() (file string, line int) { return c.File, c.Line }

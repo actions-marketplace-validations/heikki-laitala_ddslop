@@ -64,10 +64,7 @@ type grammar struct {
 // Prefix keeps Go's symbols apart from other languages' alike-named kinds.
 func (grammar) Prefix() string { return "go:" }
 
-func (grammar) Leaf(kind string) (unit.LeafKind, bool) {
-	k, ok := leafKinds[kind]
-	return k, ok
-}
+func (grammar) Leaves() map[string]unit.LeafKind { return leafKinds }
 
 // Declares: the function's name, parameter names, and the names
 // short variable declarations, var and const specs and range clauses
@@ -490,7 +487,10 @@ func formatVerbs(format string) string {
 
 // errorComparison returns the error check an == or != comparison is: on
 // err.Error() a check of the message, between an error value and anything
-// but nil a check against a sentinel (err == io.EOF).
+// but nil a check against a sentinel (err == io.EOF). An error interface
+// is never compared with a string, so a name that only ends like an
+// error's compared with a string literal (stderr == "") is no error; err
+// itself so compared can only be a string-backed error type, and is one.
 func errorComparison(n *sitter.Node, src []byte) unit.Form {
 	form := unit.Form{Line: syntax.Line(n.StartPosition())}
 	op := n.ChildByFieldName("operator")
@@ -501,10 +501,21 @@ func errorComparison(n *sitter.Node, src []byte) unit.Form {
 	switch {
 	case isErrorMessage(left, src) || isErrorMessage(right, src):
 		form.Concern, form.Form = unit.ErrorChecks, "message"
+	case (isStringLiteral(left) && !isErr(right, src)) || (isStringLiteral(right) && !isErr(left, src)):
 	case (isErrorValue(left, src) && right.Kind() != "nil") || (isErrorValue(right, src) && left.Kind() != "nil"):
 		form.Concern, form.Form = unit.ErrorChecks, "=="
 	}
 	return form
+}
+
+// isErr reports whether n is the identifier err.
+func isErr(n *sitter.Node, src []byte) bool {
+	return n.Kind() == "identifier" && n.Utf8Text(src) == "err"
+}
+
+// isStringLiteral reports whether n is a string literal, quoted or raw.
+func isStringLiteral(n *sitter.Node) bool {
+	return n.Kind() == "interpreted_string_literal" || n.Kind() == "raw_string_literal"
 }
 
 // isErrorValue reports whether n names an error by Go's naming habit: err,

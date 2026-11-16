@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -186,6 +187,24 @@ func outputFormat(format string, stdout io.Writer, allowed ...string) (string, e
 		return "", fmt.Errorf("unknown format %q, want %s", format, strings.Join(allowed, ", "))
 	}
 	return format, nil
+}
+
+// writeOutput writes a command's result v to stdout, as indented JSON when
+// format is "json" and with text otherwise, and returns the command's
+// exit code.
+func writeOutput[T any](stdout, stderr io.Writer, format string, v T, text func(io.Writer, T) error) int {
+	var err error
+	if format == "json" {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		err = enc.Encode(v)
+	} else {
+		err = text(stdout, v)
+	}
+	if err != nil {
+		return fail(stderr, err)
+	}
+	return exitClean
 }
 
 // parseRoot parses a command's flags and its optional path argument (see
@@ -393,7 +412,7 @@ func filteredCheck(root string, opts options, f filters) (report.Report, error) 
 			return report.Report{}, err
 		}
 	}
-	r, err := check(root, opts)
+	r, _, err := check(root, opts, known.Conventions)
 	if err != nil {
 		return report.Report{}, err
 	}
@@ -468,11 +487,12 @@ func baselineAt(root string, opts options, ref string) (baseline.Baseline, error
 	if err := sameConfig(root, dir); err != nil {
 		return baseline.Baseline{}, err
 	}
-	r, err := check(dir, opts)
+	r, conventions, err := check(dir, opts, nil)
 	if err != nil {
 		return baseline.Baseline{}, err
 	}
 	b := baseline.FromReport(r)
+	b.Conventions = conventions
 	if b.Functions, err = functionsAt(dir); err != nil {
 		return baseline.Baseline{}, err
 	}
@@ -482,11 +502,10 @@ func baselineAt(root string, opts options, ref string) (baseline.Baseline, error
 // functionsAt lists the functions of the code at dir, as "file#function",
 // from the index check left there.
 func functionsAt(dir string) (map[string]bool, error) {
-	db, files, _, err := openFiles(dir)
+	files, err := indexedFiles(dir)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = db.Close() }()
 	functions := map[string]bool{}
 	for _, f := range files {
 		for _, u := range f.Units {
@@ -527,7 +546,7 @@ func runBaseline(args []string, stdout, stderr io.Writer) int {
 	if path == "" {
 		path = filepath.Join(root, baselineFile)
 	}
-	r, err := check(root, opts)
+	r, _, err := check(root, opts, nil)
 	if err != nil {
 		return fail(stderr, err)
 	}
@@ -592,15 +611,28 @@ func openFiles(root string) (*index.DB, []index.File, index.Stats, error) {
 	return db, files, stats, nil
 }
 
+// indexedFiles brings the index under root up to date and loads its
+// files (see openFiles), for a command that needs nothing else from it.
+func indexedFiles(root string) ([]index.File, error) {
+	db, files, _, err := openFiles(root)
+	if err != nil {
+		return nil, err
+	}
+	return files, db.Close()
+}
+
 // threadCount is how many goroutines parse files and verify near misses.
 func threadCount() int {
 	return index.ResolveThreads(os.Getenv("DDSLOP_INDEX_THREADS"), runtime.NumCPU())
 }
 
-func check(root string, opts options) (report.Report, error) {
+// check analyses the code at root, judging its convention drifts by judged
+// where it names a concern (see drifts), and returns its report with the
+// conventions measured on that code, by language.
+func check(root string, opts options, judged map[string]map[string]codemap.Convention) (report.Report, map[string]map[string]codemap.Convention, error) {
 	db, files, stats, err := openFiles(root)
 	if err != nil {
-		return report.Report{}, err
+		return report.Report{}, nil, err
 	}
 	defer func() { _ = db.Close() }()
 	threads := threadCount()
@@ -684,6 +716,7 @@ func check(root string, opts options) (report.Report, error) {
 	g, traits := callGraph(root, files)
 	internal := internalCrates(root, files)
 	flows := parallelFlows(g, traits, opts.minNodes)
+	found, conventions := drifts(units, packages(root, files), judged)
 	r := report.Build(languageOf, report.Findings{
 		Groups: append(groups, helperGroups...), NearMisses: nearMisses, Blocks: blocks, Flows: flows,
 		Structs:  clone.Structs(structs, minStructFields),
@@ -696,29 +729,61 @@ func check(root string, opts options) (report.Report, error) {
 		Scopes:   pattern.Scopes(units),
 		Kinds:    pattern.StringKinds(units),
 		Params:   pattern.ParameterGroups(units, decls.FuncTypes),
-		Drifts:   drifts(units, packages(root, files)),
+		Drifts:   found,
 		Cycles:   dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files), opts.tests),
 	}, summary)
-	return r, recordHealth(db, root, r.Summary.Health)
+	return r, conventions, recordHealth(db, root, r.Summary.Health)
 }
 
 // drifts finds the convention drifts in the units check analyses (no
 // generated code, test code only with --tests), each language on its own
-// (see codemap.Drifts): Go's and Rust's forms are never compared.
-func drifts(units []unit.Unit, crates *codemap.Packages) []report.Drift {
+// (see codemap.Drifts): Go's and Rust's forms are never compared. Test
+// code has conventions of its own: it asserts an error's message and
+// fails with a string where production code would not, so it is measured
+// and judged apart from production code, which it neither sets
+// conventions for nor is held to. A concern judged has the convention
+// judged gives it, else the one measured here; the conventions measured
+// here come back, by side (see side).
+func drifts(units []unit.Unit, crates *codemap.Packages, judged map[string]map[string]codemap.Convention) ([]report.Drift, map[string]map[string]codemap.Convention) {
 	g := &flow.Graph{Units: units}
 	var out []report.Drift
+	measured := map[string]map[string]codemap.Convention{}
 	for _, lang := range []string{"go", "rust"} {
-		inLang := codemap.Grouping(func(u unit.Unit) string {
-			if languageOf(u.File) != lang {
-				return ""
-			}
-			return lang
-		})
-		for _, d := range codemap.Drifts(g, inLang, codemap.ByModule(crates)) {
-			out = append(out, report.Drift{Concern: d.Concern, Form: d.Form, Convention: d.Convention,
-				Unit: g.Units[d.Unit], Lines: d.Lines, Target: g.Units[d.Target], TargetLine: d.TargetLine})
+		for _, test := range []bool{false, true} {
+			key := side(lang, test)
+			in := codemap.Grouping(func(u unit.Unit) string {
+				if languageOf(u.File) != lang || u.Test != test {
+					return ""
+				}
+				return key
+			})
+			measured[key] = codemap.Conventions(g, in)
+			conventions := maps.Clone(measured[key])
+			maps.Copy(conventions, judged[key])
+			out = appendDrifts(out, g, codemap.Drifts(g, in, codemap.ByModule(crates), conventions))
 		}
+	}
+	return out, measured
+}
+
+// side names the code a convention is measured on: a language's
+// production code ("rust") or its test code ("rust tests").
+func side(lang string, test bool) string {
+	if test {
+		return lang + " tests"
+	}
+	return lang
+}
+
+// appendDrifts appends codemap's drifts as the report's.
+func appendDrifts(out []report.Drift, g *flow.Graph, found []codemap.Drift) []report.Drift {
+	for _, d := range found {
+		r := report.Drift{Concern: d.Concern, Form: d.Form, Convention: d.Convention, Share: d.Share,
+			Unit: g.Units[d.Unit], Lines: d.Lines}
+		if d.Target >= 0 {
+			r.Target, r.TargetLine = g.Units[d.Target], d.TargetLine
+		}
+		out = append(out, r)
 	}
 	return out
 }
@@ -1121,6 +1186,7 @@ func parseLibrariesUnderTestPaths(root string, files []index.File) error {
 }
 
 // markTest marks everything a file declares as test code.
+// ddslop:ignore each loop sets Test on another declaration type, a field Go generics cannot reach
 func markTest(f *index.File) {
 	for i := range f.Units {
 		f.Units[i].Test = true

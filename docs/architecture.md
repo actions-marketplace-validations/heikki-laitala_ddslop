@@ -1700,6 +1700,10 @@ lines (`Unit.Forms`), from syntax alone: a check is `errors.Is` or
 `strings.Contains` and its kin; wrapping is `fmt.Errorf` with `%w`, or
 with `%v` or `%s` and an error among its arguments. An error value is
 told by Go's naming habit: `err`, or a name ending in `err` or `Err`.
+An error interface is never compared with a string, so a name that only
+ends like one compared with a string literal (`stderr == ""`) is no
+check; `err` itself so compared can only be a string-backed error type
+(`type Err string`), and is one.
 The map counts each concern's forms over the non-test functions in its
 scope and calls the most used form the convention when it holds a
 majority of at least 5 occurrences; otherwise it names the adapter's
@@ -1781,26 +1785,49 @@ Section 5 is built for the error idioms (`codemap.Drifts`, kind
 `convention-drift`, action `follow-convention`). `check` finds, per
 language (Go's and Rust's forms are never compared), every occurrence of
 another form in a concern whose convention holds at least 90% of at
-least 5 occurrences across the repository. The map names a convention
+least 5 occurrences across the repository's production code. With
+`--tests`, test code has conventions of its own, measured and judged
+apart: a test asserts an error's message and fails with a string where
+production code would not, so held to production's conventions every
+such test would drift, and counted with production code a suite free to
+check errors by message once took a convention below 90% and every
+drift of its concern, production code's included, with it. Measured on
+a Rust workspace, its tests' error checks and wrapping hold their
+conventions at 100%, and their error values are a mix (76% variants),
+so a test drifts only from what the other tests do. The map names a convention
 at a simple majority, which describes the code; drift needs more,
 because below it the forms are a mix the code chose, not a slip:
 the Rust service wraps errors with `map_err` in 69% and anyhow's
 `context` in the rest, throughout its main crate. The candidate gives
-the drifting form in `values`, the concern in `concern`, the
+the drifting form in `values`, the concern in `concern`, the share of
+the concern's occurrences the convention holds in `share` (how close it
+is to lapsing; the text line says "convention at N%"), the
 convention's form as the suggestion's `pattern`, and as `target` the
 convention's closest occurrence: in the same file the nearest, else the
 first in the same module, else the first anywhere. Drift reads the code
 `check` analyses: no generated files, and test code only with
 `--tests`. The occurrences of one form in one function are one
 candidate with an occurrence per line, so diff mode and SARIF see those
-lines and not the code between them. Its fingerprint holds the concern,
+lines and not the code between them. A `ddslop:ignore` on a form's line
+leaves that form out of the convention and the drifts, and the rest of
+the function in. Its fingerprint holds the concern,
 the form and the function, not the line, and a baseline matches a drift
 only by that fingerprint, in both directions: matching on
 `file#function`, as other kinds are matched, would let another kind's
 entry, or a drift of another form in the same function, hide a new
 drift, and a drift's entry hide a new candidate of another kind. No other candidate covers an
 error concern, so rule 3 of the concerns model (one candidate per
-occurrence and concern) has nothing to suppress yet.
+occurrence and concern) has nothing to suppress yet. With
+`--baseline-ref`, the change is judged by the conventions of the code
+it started from, measured in the ref's checkout as its candidates are:
+a share crossing 90% would otherwise make a drift of every old
+occurrence of the other form, all new to a baseline that had no
+convention, and fail a change that touched none of them, while one
+falling below would hide the change's own drifts. A change may leave no
+occurrence of the ref's conventional form at all, rewriting every one;
+its drifts are reported with no `target`. A concern the ref has no
+occurrence of is judged by the change's own convention; a baseline
+file records no conventions.
 
 Measured on the four codebases: one candidate, on the Rust workspace,
 where a tool checks a `serde_yaml` error by searching its
@@ -2144,7 +2171,7 @@ A linter on a sloppy codebase must not fail every build on day one:
   applies to the first line below it that is neither a comment nor an
   attribute; after code, to its own line. A function, method, struct,
   enum or constant starting on such a line is left out of the analysis,
-  and so is a string literal on it (a value that only happens to equal a
+  and so is an error form on it and a string literal on it (a value that only happens to equal a
   constant, which `inlined-constant` would otherwise report). Leaving the
   code out, rather than dropping occurrences from finished candidates,
   keeps differences, scores and health consistent. Parallel flows still
@@ -2339,10 +2366,11 @@ Built, following pruner's release setup:
   tests with the race detector and the coverage gate on Linux and macOS;
   an end-to-end smoke test of the built binary (`scripts/smoke-test.sh`);
   ddslop on its own code with no baseline, both the built binary (with
-  `--tests`, so test code too) and the latest release through the action
-  (its defaults, as users run it), failing on any candidate; the
-  action uploads its SARIF to code scanning, so pull requests carry the
-  same annotations as users'. Pull requests from forks and Dependabot,
+  `--tests`, so test code too, and the stricter `--min-nodes 30` and
+  `--min-block-nodes 80`) and the latest release through the action (its
+  defaults, as users run it), failing on any candidate; the action uploads
+  its SARIF to code scanning, so pull requests carry the same annotations
+  as users'. Pull requests from forks and Dependabot,
   whose token cannot upload, and `upload-sarif: "false"` get workflow annotations from the
   SARIF instead. The action job also runs the action on a sample with a
   renamed copy, whole and in diff mode on a sample history. The repository has the ddslop skill
