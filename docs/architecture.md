@@ -418,7 +418,9 @@ before the declaration or in an export clause (`export { load }`,
 protected or `#named`. A member with a computed name
 (`[Symbol.iterator]`) is no unit: code never calls it by name. Nested
 functions stay part of their function, and a return in one leaves only
-it. `.test` and `.spec` files and `__tests__` directories are test code;
+it. `.test` and `.spec` files and `__tests__` directories are test
+code, and so are Storybook's `.stories` files, whose exports Storybook
+loads;
 test runners take their cases as callbacks (`it("...", () => {})`), so
 no TypeScript unit is a test case. Declaration files (`.d.ts`) are not
 indexed: they hold no code. Module-level declarations feed the type and
@@ -444,33 +446,130 @@ function (`import { verify as check } from "../auth/verify.js"`) is a
 path call qualified by its module as written, under its exported name,
 and so is one through a namespace import (`db.query`); another plain
 name is a free call, a call on `this` a self call, one on a field of
-`this` a method call on that field. They resolve without types: a free
-call to the caller's file's function (a name a file does not import is
-its own, or a global, unless the caller declares the name, as a
-parameter does), a relative import to the exported function of that
-name in the file it names, extension or not, or in its `index` file (a
-default import is taken under its local name, which a private function
-of the module may share), and a self call to the class's method. A package's import (`node:fs`, `@acme/db`)
-resolves to nothing, even a workspace package's, and nor does any other
-method call: JavaScript's own method names (`map`, `get`, `then`) are
-too many to tell from the code's. Wrappers work as in Go, but a
-function giving a parameter a default value (`opts = {}`) or taking an
-optional one (`id?: string`) is no wrapper: inlined, its callers that
-leave the argument out would change;
+`this` a method call on that field. They resolve by name, and by the
+types the code states (below): a free call to the caller's file's
+function (a name a file does not import is its own, or a global, unless
+the caller declares the name, as a parameter does), a relative import to
+the exported function of that name in the file it names, extension or
+not, or in its `index` file (a default import is taken under its local
+name, which a private function of the module may share), and a self call
+to the class's method. A method call on a value whose type the code
+states resolves to that class's method: a typed parameter
+(`repo: UserRepo`), a constant typed or made with `new`, or a field of
+`this` typed by its class (a typed field, one set with `new`, or a
+constructor's parameter property, `constructor(private repo: UserRepo)`,
+the usual dependency injection), or a field of a typed variable, read
+from its interface, object type or class (`deps.repo.find()` with
+`deps: ControllerDeps`). Types are written as Go's are, an imported one
+qualified by its module (`../store/users.UserRepo`), so the class is the
+one that module, or workspace package, declares; a local type is the
+file's own class of the name, and one the file does not declare a global
+(`Response`, `Map`), whatever class of ours shares its name. On
+Excalidraw this resolved 688 more calls (44% of them, from 41%); on tRPC
+and Hono a few dozen, and no finding changed. An import of a workspace
+package, by its `package.json` name or a subpath of it (`@acme/db`,
+`@acme/db/query`), resolves to the exported function of that name
+anywhere in the package's directory outside the packages nested in it,
+when exactly one is there: its `main` and `exports` often name build
+output (`dist/`), and its entry file re-exports the rest, so the
+directory is what the name stands for, as a Go package's is. An outside
+package's import (`node:fs`, `lodash`) resolves to nothing, and nor does
+a method call on a value of no stated type: JavaScript's own method
+names (`map`, `get`, `then`) are too many to tell from the code's.
+Wrappers work as in Go, but a function giving a parameter a default
+value (`opts = {}`) or taking an optional one (`id?: string`) is no
+wrapper: inlined, its callers that leave the argument out would change;
 nor is an async function or a generator, whose callers get a promise or
-an iterator, not the call's value; class members are left out,
-as they may implement an interface, which TypeScript checks by shape.
-All TypeScript extensions share one call index, so a `.tsx` component
-calls a `.ts` helper. What the call graph needs to know of TypeScript
-files by name (which are source, which file a relative import names)
-lives in `internal/lang/tsfile`, which holds no parser, so `flow` links
-no grammar. Calls through packages are not followed, so no
-TypeScript code counts as internal to the analysed code and none is
-reported unused; and as module cycles are found among a Rust crate's
-modules, TypeScript files in a crate's directory (a Tauri app's
-frontend) are none of its modules. On Hono, Excalidraw and tRPC, 6
-wrappers, all passing their parameters on unchanged; most narrow the
-types (`createHTTPHandler` calling `createHandler`).
+an iterator, not the call's value; class members are left out, as they
+may implement an interface, which TypeScript checks by shape. All
+TypeScript extensions share one call index, so a `.tsx` component calls
+a `.ts` helper. What the call graph needs to know of TypeScript files by
+name (which are source, which file a relative import names) lives in
+`internal/lang/tsfile`, which holds no parser, so `flow` links no
+grammar. A TypeScript package serves only the analysed code when its
+`package.json`, the nearest above a file, is `"private": true`, which
+keeps it from being published, as Rust's `publish = false` does; there
+an exported function nothing names is unused. Code outside the analysed
+source calls some without naming them: a default export, under any name,
+though a default class's methods are called by name; Next.js's
+functions, by the names it calls (`getStaticProps`, `GET`,
+`generateMetadata`, `proxy`, `register`), and Remix's and SvelteKit's
+route functions (`loader`, `action`, `load`), anywhere, so a function of
+such a name elsewhere is only missed; and every export of a module
+another file imports whole (`import * as schema from "./schema"`, as
+drizzle takes its schema, or `import("./routes")`), through a path alias
+too (`@/db/schema`, matched by the end of a file's path, as only the
+project's tsconfig resolves it) or a workspace package's name
+(`@acme/db`, every file of that package). Files ddslop does not analyse
+but that may import TypeScript (`.js`, `.vue`, `.svelte`, `.astro`,
+`.mdx`) are read for the names they mention, and so are configuration
+files (`.json`, `.yaml`, `.toml`, `.html`), unreadable ones skipped: a
+Vue component calling a composable uses it, and a `serverless.yml`
+naming a Lambda handler does. None of these is a wrapper either: the
+framework, or
+a caller under another name, fixes its signature. A Tauri app's frontend
+with no private `package.json` is not internal for its Rust crate's
+`publish = false`. On tRPC (52 private packages: its examples and
+website), a first measure without these rules gave 15 unused exports,
+among them a drizzle schema's relations and a page's `getStaticPaths`;
+with them, 6, all named nowhere else (`useMenuState`, `highlightCode`);
+none on Excalidraw and Hono, and the wrappers stayed the same. Calls
+through path aliases (`@/lib/x`) are not followed, nor method calls on a
+value of no stated type or of an interface several classes implement. A
+name bound again inside a function (a nested function's parameter, a
+`for`-`of` loop's, a `catch` clause's, a destructuring) loses the outer
+one's type, and a name a nested function or block binds is that scope's:
+the outer name has its own type again after it. A parameter or local
+named like an import shadows the import, and `this` in a nested
+`function` (not an arrow function) is no class instance. And as module
+cycles are found among a Rust crate's modules, TypeScript files in a
+crate's directory (a Tauri app's frontend) are none of its modules. On
+Hono, Excalidraw and tRPC, 6 wrappers, all passing their parameters on
+unchanged; most narrow the types (`createHTTPHandler` calling
+`createHandler`). Following workspace packages found 3 more on
+Excalidraw, each calling into another of its packages
+(`cloneLibraryItems` passing on to `@excalidraw/common`'s `cloneJSON`).
+
+An interface declaring methods is a trait, the contract classes
+implement (`class Repo implements IRepo`); one of properties only is a
+data shape. A method call on a value of an interface's type resolves to
+the method of the one class implementing an interface of that name; with
+several, which runs is not known; an interface another extends
+(`interface CachedStore extends Store`) counts that one among its
+implementations, as every class of it implements both, and so does an
+object typed as the interface (`const mem: IRepo = {...}`) or a function
+typed to return it that returns an object literal (a factory): an
+interface with one class and one of these has two. A function returning
+`new PgRepo()` leaves the class the implementation. An unrelated class
+named like an interface of ours does not hide the interface.
+TypeScript checks interfaces by shape, so a class of the non-test code
+that declares every method of an interface implements it without an
+`implements` clause: such an interface has a further implementation, no
+call through it resolves, and it is not reported. The
+interface must be ours: matched by the file declaring it, as an imported
+type is, so a call on an outside one (`vscode`'s `Disposable`, the DOM's
+`EventListenerObject`) reaches no class of ours that implements it, and
+each language's traits are matched on their own. Single-implementation
+interfaces are reported as Rust's traits are, except one a test file
+names: a test's fake is its second implementation, and TypeScript gives
+it without a class (`const fake: IClock = { now: () => 1 }`). On a
+dependency-injected TypeScript service with about 120 interfaces, 78 had
+one class, tests named 60 of them, and the 18 left, all reported, follow
+the code's one-interface-per-repository convention; Excalidraw, tRPC and
+Hono have none.
+
+`ddslop map --lang typescript` describes TypeScript by directory (scope
+`directories`, as `packages` would read as npm packages): a directory is
+a module, as a Go package is, and its layers, breaks, cycles and shared
+helpers come from the calls resolved above, workspace packages included.
+It records no forms yet, so it has no idioms, and finds no entry points,
+so it has no features. On Excalidraw (about 4 seconds) the layers follow
+its packages, `common` and `math` at the bottom, then `element`,
+`excalidraw` and the app, and the shared helpers are what new code
+should reuse (`t`, `pointFrom`, `arrayToMap`); on tRPC its examples
+share `@trpc/client`'s `httpBatchLink` and `createTRPCClient`, though
+only 19% of its calls resolve, most being method chains (`t.router()`)
+no types follow.
 
 TypeScript functions record their parameters named by one name, each
 with its type as written (`""` when it has none), and their switches on
@@ -1685,7 +1784,8 @@ the map lists the pairs that call each other directly, with the calls
 each way and a call site each way, those with the fewest calls one way
 first, or, when no pair does, a shortest loop through the group; a
 workspace map counts each crate's modules in cycles (`cycle_modules`).
-A call through a value of a trait type (`dyn Store`, `S: Store`) is no
+A call through a value of a trait type (`dyn Store`, `S: Store`, a
+TypeScript interface of ours) is no
 module dependency, for the layers or the cycles: the call graph follows
 it to the trait's only implementation, but the caller depends on the
 trait, and the implementation's module, which imports the trait, would
@@ -1746,7 +1846,27 @@ whose `crate::` names its own modules). A site is a call where one makes the edg
 naming the module, under the item it is written in; test code counts only
 with `--tests`, and a `ddslop:ignore` on the line leaves the cycle out.
 A `pub use` re-export is no dependency: a crate root re-exporting its
-children while they use its items is Rust's facade, not a cycle.
+children while they use its items is Rust's facade, not a cycle. Nor is
+a path through it: a child naming `crate::Refusal`, which the root
+imports from `refusal`, depends on `refusal`, not on the root, and one
+naming a name the root imports from another crate depends on no module
+of its own. Root imports are the use declarations directly in the root
+file, not those of its inline modules, functions or blocks, nor those
+marked `#[cfg(test)]`; an alias of the root's own item or of the crate
+(`use crate as facade`) is the root's, one from an inline module is the
+root's too (it is part of the root module), chains of re-exports are
+followed to their source, and a name a glob re-export supplies
+(`pub use refusal::*`) is the module's that defines it visibly in its
+own scope (`TopExports`: its top-level items and modules with a
+visibility, not `pub(self)`, not an inline module's), else the module a
+visible top-level use of it there names (`pub use super::foo::X`, read
+from that module; `TopReexports`), else what that module's own visible
+globs supply, followed through every glob once. A generated module's
+names count too: paths resolve through it though its code is not
+analysed. Otherwise every
+crate whose root both re-exports a type and calls the module using it
+showed a cycle with its root, and a glob facade hid every cycle among
+its modules behind one with its root.
 The map's cycles stay those of calls, as its layers are. Measured on
 that workspace: 139 candidates where calls alone gave 31, the constants
 pair among them.
@@ -2474,8 +2594,16 @@ Built, following pruner's release setup:
   its SARIF to code scanning, so pull requests carry the same annotations
   as users'. Pull requests from forks and Dependabot,
   whose token cannot upload, and `upload-sarif: "false"` get workflow annotations from the
-  SARIF instead. The action job also runs the action on a sample with a
-  renamed copy, whole and in diff mode on a sample history. The repository has the ddslop skill
+  SARIF instead, unless `annotate: "false"`, which leaves the exit code
+  and the SARIF report only. The action job also runs the action on a
+  sample with a renamed copy, whole and in diff mode on a sample history,
+  with `fail: "false"` and `annotate: "false"` where it finds the copy:
+  a failed step, even one allowed to fail, puts an error on every pull
+  request's checks, so those runs report through `exit-code` and the
+  SARIF report instead. Its run under a duplication limit annotates, as
+  warnings, so the annotation code runs; no run takes the `exit 1` that
+  fails a job on candidates.
+  The repository has the ddslop skill
   installed for Claude Code and Codex (`ddslop init --claude --codex`).
 - **Releases** (`.github/workflows/release.yml`, on `vX.Y.Z` tags): Linux and
   macOS binaries for x86_64 and aarch64, built with cgo and each

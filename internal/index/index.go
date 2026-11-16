@@ -29,10 +29,23 @@ type Parsed struct {
 	Traits []string
 	// Imports maps names the file imports to the paths they refer to.
 	Imports map[string]string
+	// TopImports are the Imports of the file's own scope, not of the
+	// modules declared inline in it.
+	TopImports map[string]string
 	// TestModules are modules the file declares out of line for tests only.
 	TestModules []string
 	// Modules are all the modules the file declares out of line (Rust).
 	Modules []string
+	// InlineModules are the modules the file declares inline at its top
+	// level (Rust).
+	InlineModules []string
+	// TopNames are the names the file declares in its own scope, and
+	// TopReexports what its visible top-level uses bring in (Rust).
+	TopNames     []string
+	TopReexports map[string]string
+	// TopExports are the TopNames visible outside the module, and its
+	// public modules: what a glob of the module supplies of its own.
+	TopExports []string
 	// Decls are the file's declarations other than functions.
 	Decls unit.Decls
 	// References are the paths the file writes that name another module
@@ -96,14 +109,19 @@ const versionKey = "version"
 
 // stored is what the units column of a file row holds.
 type stored struct {
-	Units       []unit.Unit
-	Traits      []string
-	Imports     map[string]string
-	TestModules []string
-	Modules     []string
-	Decls       unit.Decls
-	References  []unit.Reference
-	Words       map[string]int
+	Units         []unit.Unit
+	Traits        []string
+	Imports       map[string]string
+	TopImports    map[string]string
+	TestModules   []string
+	Modules       []string
+	InlineModules []string
+	TopNames      []string
+	TopReexports  map[string]string
+	TopExports    []string
+	Decls         unit.Decls
+	References    []unit.Reference
+	Words         map[string]int
 }
 
 // DB is an open index database.
@@ -267,7 +285,7 @@ func (d *DB) write(reset bool, version string, changes []change, deleted []strin
 	defer func() { _ = upsert.Close() }()
 	for _, c := range changes {
 		var blob bytes.Buffer
-		if err = gob.NewEncoder(&blob).Encode(stored{c.parsed.Units, c.parsed.Traits, c.parsed.Imports, c.parsed.TestModules, c.parsed.Modules, c.parsed.Decls, c.parsed.References, c.parsed.Words}); err != nil {
+		if err = gob.NewEncoder(&blob).Encode(stored{c.parsed.Units, c.parsed.Traits, c.parsed.Imports, c.parsed.TopImports, c.parsed.TestModules, c.parsed.Modules, c.parsed.InlineModules, c.parsed.TopNames, c.parsed.TopReexports, c.parsed.TopExports, c.parsed.Decls, c.parsed.References, c.parsed.Words}); err != nil {
 			return err
 		}
 		if _, err = upsert.Exec(c.path, c.stamp.mtime, c.stamp.size, c.parsed.Generated, blob.Bytes()); err != nil {
@@ -313,7 +331,7 @@ func (d *DB) Files() ([]File, error) {
 		if err := gob.NewDecoder(bytes.NewReader(blob)).Decode(&st); err != nil {
 			return f, fmt.Errorf("index: %s: %w", f.Path, err)
 		}
-		f.Units, f.Traits, f.Imports, f.TestModules, f.Modules, f.Decls, f.References, f.Words = st.Units, st.Traits, st.Imports, st.TestModules, st.Modules, st.Decls, st.References, st.Words
+		f.Units, f.Traits, f.Imports, f.TopImports, f.TestModules, f.Modules, f.InlineModules, f.TopNames, f.TopReexports, f.TopExports, f.Decls, f.References, f.Words = st.Units, st.Traits, st.Imports, st.TopImports, st.TestModules, st.Modules, st.InlineModules, st.TopNames, st.TopReexports, st.TopExports, st.Decls, st.References, st.Words
 		return f, nil
 	})
 }

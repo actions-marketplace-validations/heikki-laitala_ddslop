@@ -219,6 +219,29 @@ func CratePath(file string, crates *Packages) (name, rel string) {
 // root module, and the names extern crate self gives the crate.
 type CrateFacts struct {
 	Modules, RootValues, SelfAliases map[string]bool
+	// RootImports are the names the root module imports in its own scope,
+	// each with the path its use declaration names (pub use
+	// refusal::Refusal): a path through the root to one of them reaches
+	// that path's module.
+	RootImports map[string]string
+	// RootItems are the items the root module defines itself: functions,
+	// constants, types and traits.
+	RootItems map[string]bool
+	// RootGlobs are the paths the root re-exports every item of (pub use
+	// refusal::*), in order.
+	RootGlobs []string
+	// InlineModules are the modules the root declares inline, part of the
+	// root module.
+	InlineModules map[string]bool
+	// ModuleItems are, by module, the items each defines at its top level.
+	ModuleItems map[string]map[string]bool
+	// ModuleReexports are, by module, the crate:: paths its visible
+	// top-level use declarations bring in under each name: what a glob of
+	// it supplies besides its own items.
+	ModuleReexports map[string]map[string]string
+	// ModuleGlobs are, by module, the crate:: paths its visible top-level
+	// globs re-export: a glob of it supplies theirs too.
+	ModuleGlobs map[string][]string
 }
 
 // ReferencedModule returns the module of its crate a reference written in
@@ -256,6 +279,27 @@ func ReferencedModule(file string, crates *Packages, ref unit.Reference, crate C
 	if resolved != "" {
 		at = strings.Split(resolved, "::")
 	}
+	// A name the root imports (crate::Refusal for its pub use
+	// refusal::Refusal) is the imported module's, not the root's: the root
+	// only passes it on.
+	if len(at) > 0 {
+		// A path going on past a module's name (crate::one::Thing) is the
+		// module's, though the root imports a function one: they are
+		// different namespaces.
+		if (len(at) > 1 || !ref.Leaf) && crate.Modules[moduleName(name, at[0])] {
+			return moduleName(name, at[0])
+		}
+		if target, ok := crate.RootImports[at[0]]; ok {
+			return importedModule(name, target, crate, map[string]bool{at[0]: true})
+		}
+		// A name a glob re-export supplies (pub use refusal::*) is the
+		// module's that defines it.
+		if !crate.RootItems[at[0]] {
+			if m := globSupplier(name, at[0], crate, crate.RootGlobs, map[string]bool{}); m != "" {
+				return m
+			}
+		}
+	}
 	// A path ending at a root value's name (crate::foo for the root's fn
 	// foo) names that value, though a module foo may exist beside it.
 	rootValue := ref.Leaf && len(at) == 1 && (ref.Macro || crate.RootValues[at[0]])
@@ -263,6 +307,103 @@ func ReferencedModule(file string, crates *Packages, ref unit.Reference, crate C
 		return moduleName(name, at[0])
 	}
 	return moduleName(name, "")
+}
+
+// globSupplier returns the module that supplies item through globs (the
+// crate:: paths of pub use m::*), "" for none: a module defining it comes
+// first, then one re-exporting it by name, then one whose own globs
+// supply it; seen holds the modules looked through already.
+func globSupplier(crate, item string, facts CrateFacts, globs []string, seen map[string]bool) string {
+	var sources []string
+	for _, glob := range globs {
+		if m := importedModule(crate, glob, facts, map[string]bool{}); m != moduleName(crate, "") && !seen[m] {
+			seen[m] = true
+			sources = append(sources, m)
+		}
+	}
+	for _, m := range sources {
+		if facts.ModuleItems[m][item] {
+			return m
+		}
+	}
+	for _, m := range sources {
+		if path, ok := facts.ModuleReexports[m][item]; ok {
+			return importedModule(crate, path, facts, map[string]bool{item: true})
+		}
+	}
+	for _, m := range sources {
+		if supplier := globSupplier(crate, item, facts, facts.ModuleGlobs[m], seen); supplier != "" {
+			return supplier
+		}
+	}
+	return ""
+}
+
+// importedModule returns the module of crate a root import's path names:
+// refusal::Refusal or crate::refusal::Refusal names refusal, and
+// crate::Error, or a bare name the root defines, names the root itself. A
+// name the root itself imports (pub use foo::X; pub use X as Y) is
+// followed to where it comes from; seen holds the names followed so far,
+// so an alias loop ends. Any other path leads out of the crate, to no
+// module of it (""), and crate itself (use crate as facade) is the root.
+func importedModule(crate, path string, facts CrateFacts, seen map[string]bool) string {
+	segments := strings.Split(path, "::")
+	inCrate := false
+	for len(segments) > 0 && (segments[0] == "crate" || segments[0] == "self") {
+		segments, inCrate = segments[1:], true
+	}
+	if len(segments) == 0 {
+		if inCrate {
+			return moduleName(crate, "")
+		}
+		return ""
+	}
+	first := strings.TrimPrefix(segments[0], "r#")
+	// A name the root's own scope imports is that import, though a type
+	// of an inline module may share it: the root cannot both import and
+	// define a name in one namespace.
+	if facts.Modules[moduleName(crate, first)] {
+		return moduleName(crate, first)
+	}
+	if facts.InlineModules[first] {
+		return moduleName(crate, "") // an inline module is part of the root
+	}
+	if next, ok := facts.RootImports[first]; ok && !seen[first] {
+		seen[first] = true
+		return importedModule(crate, next, facts, seen)
+	}
+	if inCrate || facts.RootItems[first] {
+		return moduleName(crate, "")
+	}
+	return ""
+}
+
+// OwnFile reports whether file is the file of a top-level module of its
+// crate (facade.rs or facade/mod.rs), whose scope is the module's own: a
+// submodule's file (facade/nested.rs) is grouped with the module but
+// declares in the submodule.
+func OwnFile(file string, crates *Packages) bool {
+	name, rel := CratePath(file, crates)
+	return name != "" && len(fileModules(rel)) == 1
+}
+
+// ReexportPath returns the crate:: path a re-export written in file names,
+// read from the file's module (super::foo::X in facade.rs is crate::foo::X),
+// or false for a path that does not start in the crate.
+func ReexportPath(file string, crates *Packages, path string) (string, bool) {
+	name, rel := CratePath(file, crates)
+	first, _, _ := strings.Cut(path, "::")
+	if name == "" || (first != "crate" && first != "self" && first != "super") {
+		return "", false
+	}
+	resolved, ok := flow.ResolvePath(path, strings.Join(fileModules(rel), "::"))
+	if !ok {
+		return "", false
+	}
+	if resolved == "" {
+		return "crate", true
+	}
+	return "crate::" + resolved, true
 }
 
 // fileModules returns the module path of a file under src/: store/client

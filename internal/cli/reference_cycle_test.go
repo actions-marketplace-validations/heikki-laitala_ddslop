@@ -369,3 +369,266 @@ func TestABlockLocalCrateAliasIsNotCrateWide(t *testing.T) {
 	}
 	wantCycles(t, 0, "none: a's root is not this crate", repo(t, files))
 }
+
+// reexportingCrate's root re-exports refusal's type and calls request,
+// which names the type through the root: crate::Refusal.
+func reexportingCrate(refusal string) map[string]string {
+	return map[string]string{
+		"Cargo.toml": "[package]\nname = \"app\"\n",
+		"src/lib.rs": "mod refusal;\nmod request;\npub use refusal::Refusal;\npub fn encode() -> u8 { request::encode() }\n",
+		"src/request.rs": `use crate::Refusal;
+pub fn encode() -> u8 { refuse(Refusal::Empty) }
+pub fn refuse(_: Refusal) -> u8 { 1 }
+`,
+		"src/refusal.rs": refusal,
+	}
+}
+
+// A name the root re-exports is its module's, not the root's: request,
+// naming crate::Refusal, depends on refusal, so the root calling request
+// closes no loop. Where refusal depends on request in turn, that is the
+// loop, between the two modules.
+func TestARootReexportIsADependencyOnItsModule(t *testing.T) {
+	wantCycles(t, 0, "the root re-exports refusal's type; request uses it",
+		repo(t, reexportingCrate("pub enum Refusal { Empty }\n")))
+
+	wantCycleBetween(t, "refusal -> request, request -> refusal",
+		repo(t, reexportingCrate("pub enum Refusal { Empty }\npub fn code() -> u8 { crate::request::refuse(Refusal::Empty) }\n")))
+
+	// A name the root imports from another crate is no module of its own.
+	external := reexportingCrate("pub enum Refusal { Empty }\n")
+	external["src/lib.rs"] = "mod refusal;\nmod request;\npub use other::Refusal;\npub fn encode() -> u8 { request::encode() }\n"
+	wantCycles(t, 0, "the root re-exports another crate's type; request uses it", repo(t, external))
+}
+
+// Root imports, as Rust scopes them: an inline module's use is its own,
+// not the root's; an alias of the root's own item is the root's; and a
+// macro the root imports is its module's.
+func TestRootImportsAreTheRootsOwn(t *testing.T) {
+	crate := func(lib, child string, more ...string) map[string]string {
+		files := map[string]string{"Cargo.toml": "[package]\nname = \"app\"\n", "src/lib.rs": lib, "src/child.rs": child}
+		for i := 0; i+1 < len(more); i += 2 {
+			files[more[i]] = more[i+1]
+		}
+		return files
+	}
+	t.Run("an inline module's use is its own", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\nmod foo;\npub struct Thing;\nmod nested {\n    use crate::foo::Thing;\n    pub fn n(_: Thing) {}\n}\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _t: Option<crate::Thing> = None; 1 }\n",
+			"src/foo.rs", "pub struct Thing;\n")))
+	})
+	t.Run("an alias of the root's own item is the root's", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\npub struct Error;\npub use crate::Error as PublicError;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _e: Option<crate::PublicError> = None; 1 }\n")))
+	})
+	t.Run("a use in a root function is that function's", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\nmod foo;\npub struct Thing;\npub fn local() {\n    use crate::foo::Thing;\n    let _t: Option<Thing> = None;\n}\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _t: Option<crate::Thing> = None; 1 }\n",
+			"src/foo.rs", "pub struct Thing;\n")))
+	})
+	t.Run("a path through a module is the module's, though a function shares its name", func(t *testing.T) {
+		wantCycleBetween(t, "child -> one, one -> child", repo(t, crate(
+			"mod child;\nmod one;\nmod values;\npub use values::one;\n",
+			"pub fn f() -> u8 { let _t: Option<crate::one::Thing> = None; 1 }\n",
+			"src/one.rs", "pub struct Thing;\npub fn g() -> u8 { crate::child::f() }\n",
+			"src/values.rs", "pub fn one() -> u8 { 1 }\n")))
+	})
+	t.Run("a chained re-export reaches the module it started from", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"mod child;\nmod foo;\npub use foo::X;\npub use X as Y;\n",
+			"pub fn f() -> u8 { let _y: Option<crate::Y> = None; 1 }\n",
+			"src/foo.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("a root item is the root's though a nested use shares its name", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\nmod foo;\npub fn make() -> u8 { 1 }\npub use make as public_make;\nmod nested {\n    use crate::foo::make;\n    pub fn n() -> u8 { make() }\n}\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { crate::public_make() }\n",
+			"src/foo.rs", "pub fn make() -> u8 { 2 }\n")))
+	})
+	t.Run("a chained re-export passes an inline module's type of that name", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"mod child;\nmod foo;\nmod nested {\n    pub struct X;\n}\npub use foo::X;\npub use X as Y;\n",
+			"pub fn f() -> u8 { let _y: Option<crate::Y> = None; 1 }\n",
+			"src/foo.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("an alias of the crate itself is the root", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\npub struct Thing;\npub(crate) use crate as facade;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _t: Option<crate::facade::Thing> = None; 1 }\n")))
+	})
+	t.Run("a long chain of re-exports reaches the module it started from", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"mod child;\nmod foo;\npub use foo::X as X1;\npub use X1 as X2;\npub use X2 as X3;\npub use X3 as X4;\npub use X4 as X5;\npub use X5 as X6;\npub use X6 as X7;\npub use X7 as X8;\npub use X8 as X9;\npub use X9 as X10;\n",
+			"pub fn f() -> u8 { let _y: Option<crate::X10> = None; 1 }\n",
+			"src/foo.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("an alias loop ends", func(t *testing.T) {
+		wantCycles(t, 0, "two aliases naming each other lead nowhere", repo(t, crate(
+			"mod child;\npub use A as B;\npub use B as A;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _a: Option<crate::A> = None; 1 }\n")))
+	})
+	t.Run("a glob re-export is the module that defines the name", func(t *testing.T) {
+		wantCycles(t, 0, "the root re-exports refusal's items by glob; child uses one", repo(t, crate(
+			"mod child;\nmod refusal;\npub use refusal::*;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _r: Option<crate::Refusal> = None; 1 }\n",
+			"src/refusal.rs", "pub enum Refusal { Empty }\n")))
+	})
+	t.Run("a test-only root import is not production's", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\nmod foo;\n#[cfg(test)]\nuse crate::foo::Thing;\n#[cfg(not(test))]\npub struct Thing;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _t: Option<crate::Thing> = None; 1 }\n",
+			"src/foo.rs", "pub struct Thing;\n")))
+	})
+	t.Run("a re-export from an inline module is the root's", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\nmod nested {\n    pub struct Thing;\n}\npub use nested::Thing;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _t: Option<crate::Thing> = None; 1 }\n")))
+	})
+	t.Run("a glob re-export follows its module's own re-exports", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"mod child;\nmod facade;\nmod foo;\npub use facade::*;\n",
+			"pub fn f() -> u8 { let _x: Option<crate::X> = None; 1 }\n",
+			"src/facade.rs", "pub use crate::foo::X;\n",
+			"src/foo.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("a glob's own use of a name another glob defines is no re-export of it", func(t *testing.T) {
+		wantCycleBetween(t, "client -> envelope, envelope -> client", repo(t, map[string]string{
+			"Cargo.toml":      "[package]\nname = \"app\"\n",
+			"src/lib.rs":      "mod client;\nmod envelope;\npub use client::*;\npub use envelope::*;\n",
+			"src/client.rs":   "use crate::Response;\npub enum Failure { Down }\npub fn call() -> Option<Response> { None }\n",
+			"src/envelope.rs": "pub struct Response;\npub fn fail() -> Option<crate::Failure> { None }\n",
+		}))
+	})
+	t.Run("a comment between cfg(test) and its use keeps the use test code's", func(t *testing.T) {
+		wantCycleBetween(t, ". -> child, child -> .", repo(t, crate(
+			"mod child;\nmod foo;\n#[cfg(test)]\n// only the tests take foo's\nuse crate::foo::Thing;\n#[cfg(not(test))]\npub struct Thing;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { let _t: Option<crate::Thing> = None; 1 }\n",
+			"src/foo.rs", "pub struct Thing;\n")))
+	})
+	t.Run("a macro the root imports is its module's", func(t *testing.T) {
+		wantCycles(t, 0, "child invokes the macro the root imports from macros", repo(t, crate(
+			"#[macro_use]\nmod macros;\nmod child;\npub(crate) use macros::one;\npub fn run() -> u8 { child::f() }\n",
+			"pub fn f() -> u8 { crate::one!() }\n",
+			"src/macros.rs", "macro_rules! one_ { () => { 1 } }\npub(crate) use one_ as one;\n")))
+	})
+}
+
+// What a glob of a module supplies is that module's own scope: its
+// top-level items and the uses it makes visible, not an inline module's
+// items nor a private use, and a relative re-export is read from the
+// module that writes it.
+func TestAGlobSuppliesItsModulesOwnScope(t *testing.T) {
+	crate := func(files ...string) map[string]string {
+		out := map[string]string{"Cargo.toml": "[package]\nname = \"app\"\n"}
+		for i := 0; i+1 < len(files); i += 2 {
+			out[files[i]] = files[i+1]
+		}
+		return out
+	}
+	foo := "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n"
+	child := "pub fn f() -> u8 { let _x: Option<crate::X> = None; 1 }\n"
+	t.Run("not an inline module's item", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod foo;\npub use facade::*;\npub use foo::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "mod nested {\n    pub struct X;\n}\n",
+			"src/foo.rs", foo)))
+	})
+	t.Run("not a private use", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod foo;\nmod other;\npub use facade::*;\npub use other::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "use crate::other::X;\npub fn h(_: X) {}\n",
+			"src/other.rs", "pub use crate::foo::X;\n",
+			"src/foo.rs", foo)))
+	})
+	t.Run("through a glob of a glob", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod foo;\npub use facade::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "pub use crate::foo::*;\n",
+			"src/foo.rs", foo)))
+	})
+	t.Run("a public module of the globbed module", func(t *testing.T) {
+		wantCycleBetween(t, "child -> facade, facade -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\npub use facade::*;\n",
+			"src/child.rs", "pub fn f() -> u8 { let _x: Option<crate::nested::X> = None; 1 }\n",
+			"src/facade.rs", "pub mod nested;\n",
+			"src/facade/nested.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("not a private item", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod foo;\npub use facade::*;\npub use foo::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "struct X;\npub fn h() { let _x = X; }\n",
+			"src/foo.rs", foo)))
+	})
+	t.Run("not a pub(self) use", func(t *testing.T) {
+		wantCycleBetween(t, "bar -> child, child -> bar", repo(t, crate(
+			"src/lib.rs", "mod bar;\nmod child;\nmod facade;\nmod foo;\nmod other;\npub use facade::*;\npub use other::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "pub(self) use crate::foo::X;\npub fn h(_: X) {}\n",
+			"src/other.rs", "pub use crate::bar::X;\n",
+			"src/foo.rs", "pub struct X;\n",
+			"src/bar.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("a generated module's trait", func(t *testing.T) {
+		wantCycles(t, 0, "child names the trait the root's glob takes from a generated module", repo(t, crate(
+			"src/lib.rs", "mod api;\nmod child;\npub use api::*;\npub fn run() -> u8 { child::f() }\n",
+			"src/child.rs", "pub fn f() -> u8 { let _a: Option<&dyn crate::GeneratedApi> = None; 1 }\n",
+			"src/api.rs", "// @generated by a code generator. DO NOT EDIT.\npub trait GeneratedApi {}\n")))
+	})
+	t.Run("not a submodule's declarations", func(t *testing.T) {
+		wantCycleBetween(t, "child -> provider, provider -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod provider;\npub use facade::*;\npub use provider::*;\n",
+			"src/child.rs", "pub fn f() -> u8 { let _x: Option<crate::deep::X> = None; 1 }\n",
+			"src/facade.rs", "pub mod nested;\n",
+			"src/facade/nested.rs", "pub mod deep;\n",
+			"src/facade/nested/deep.rs", "pub struct X;\n",
+			"src/provider.rs", "pub mod deep;\n",
+			"src/provider/deep.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("a bare re-export through a module the file declares", func(t *testing.T) {
+		wantCycleBetween(t, "child -> facade, facade -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\npub use facade::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "pub mod inner;\npub use inner::X;\n",
+			"src/facade/inner.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("a bare re-export through a name the module imports", func(t *testing.T) {
+		for _, facade := range []string{
+			"use crate::foo;\npub use foo::X;\n",
+			"pub use crate::foo::X as Z;\npub use Z as X;\n",
+		} {
+			wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+				"src/lib.rs", "mod child;\nmod facade;\nmod foo;\npub use facade::*;\n",
+				"src/child.rs", child,
+				"src/facade.rs", facade,
+				"src/foo.rs", foo)))
+		}
+	})
+	t.Run("a generated facade's bare re-export", func(t *testing.T) {
+		wantCycleBetween(t, "child -> facade, facade -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\npub use facade::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "// @generated by a code generator. DO NOT EDIT.\npub mod inner;\npub use inner::X;\n",
+			"src/facade/inner.rs", "pub struct X;\npub fn g() -> u8 { crate::child::f() }\n")))
+	})
+	t.Run("not a visibility restricted to the module", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod foo;\npub use facade::*;\npub use foo::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "pub(in crate::facade) struct X;\npub fn h() { let _x = X; }\n",
+			"src/foo.rs", foo)))
+	})
+	t.Run("a relative re-export from the module writing it", func(t *testing.T) {
+		wantCycleBetween(t, "child -> foo, foo -> child", repo(t, crate(
+			"src/lib.rs", "mod child;\nmod facade;\nmod foo;\npub use facade::*;\n",
+			"src/child.rs", child,
+			"src/facade.rs", "pub use super::foo::X;\n",
+			"src/foo.rs", foo)))
+	})
+}

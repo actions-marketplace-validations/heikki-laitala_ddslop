@@ -92,6 +92,7 @@ func TestTestFilesAreTestCode(t *testing.T) {
 		"src/store.spec.tsx":          true,
 		"src/__tests__/store.ts":      true,
 		"__tests__/helpers/render.ts": true,
+		"src/Button.stories.tsx":      true,
 		"src/latest.ts":               false,
 	} {
 		units, _ := testutil.Parse(t, Parse, path, "function f() {}\n")
@@ -489,4 +490,265 @@ const cast = (function (x: number) { return x; }) as Fn;
 `)
 	testutil.Lines(t, "units", testutil.Format(units, func(u unit.Unit) string { return u.Name + " -> " + u.Forwards }),
 		[]string{"typed -> work", "cast -> "})
+}
+
+// Code outside the analysed source calls a default export, under any
+// name, and a framework's functions by their names (Next.js's
+// getStaticProps, a route's GET): none is unused when nothing names it.
+func TestDefaultAndFrameworkExportsAreCalledFromOutside(t *testing.T) {
+	units, _ := testutil.Parse(t, Parse, "src/pages/index.tsx", `export default function Page() { return null; }
+export async function getStaticProps() { return { props: {} }; }
+export async function GET(req: Request) { return new Response(); }
+export const generateMetadata = async () => ({});
+export function proxy(request: Request) { return request; }
+function save() {}
+export default save;
+export function helper() {}
+`)
+	testutil.Lines(t, "units", testutil.Format(units, func(u unit.Unit) string { return fmt.Sprintf("%s external=%v", u.Name, u.External) }),
+		[]string{"Page external=true", "getStaticProps external=true", "GET external=true", "generateMetadata external=true",
+			"proxy external=true", "save external=true", "helper external=false"})
+}
+
+// A default-exported class is called from outside; its methods are
+// called by name like any other.
+func TestOnlyTheDefaultClassItselfIsExternal(t *testing.T) {
+	units, _ := testutil.Parse(t, Parse, "src/store.ts", "export default class Store {\n  load() { return 1; }\n}\n")
+	testutil.Lines(t, "units", testutil.Format(units, func(u unit.Unit) string { return fmt.Sprintf("%s external=%v", u.Name, u.External) }),
+		[]string{"Store.load external=false"})
+}
+
+// A file importing another whole (import * as schema, import("./user"))
+// may use any of its exports without naming it.
+func TestImportsOfWholeModulesAreRecorded(t *testing.T) {
+	_, decls := testutil.Parse(t, Parse, "src/db/client.ts", `import * as schema from "./schema";
+import { open } from "./open";
+export async function load() {
+  const routes = await import("./routes");
+  return [schema, routes, open];
+}
+`)
+	testutil.Lines(t, "whole imports", decls.WholeImports, []string{"./schema", "./routes"})
+}
+
+// A class's fields record the types the code states, as Call.Type writes
+// them: an imported type qualified by its module, a local one bare.
+func TestClassFieldsRecordTheirTypes(t *testing.T) {
+	_, decls := testutil.Parse(t, Parse, "src/users/service.ts", `import { UserRepo } from "../store/users";
+import type { Mailer } from "@acme/mail";
+
+export class UserService {
+  private cache = new Cache<string>();
+  clock: Clock;
+  private readonly names: string[];
+  constructor(private readonly repo: UserRepo, public mailer: Mailer, plain: number, readonly clock2: Clock) {}
+}
+
+class Cache<T> {}
+`)
+	testutil.Lines(t, "field types", testutil.Format(decls.FieldTypes, func(f unit.FieldType) string {
+		return fmt.Sprintf("%s.%s %s test=%v", f.Struct, f.Field, f.Type, f.Test)
+	}), []string{
+		"UserService.cache Cache test=false",
+		"UserService.clock Clock test=false",
+		"UserService.repo ../store/users.UserRepo test=false",
+		"UserService.mailer @acme/mail.Mailer test=false",
+		"UserService.clock2 Clock test=false",
+	})
+}
+
+// A method call records its operand's type where the code states it: a
+// typed parameter, or a constant typed or made with new. A name bound
+// again (a constant of no stated type, a nested function's parameter, a
+// for-of loop, a catch clause, a destructuring) is no longer the typed
+// outer one; one a nested closure or block binds is that scope's.
+func TestMethodCallsRecordTheTypeTheCodeStates(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		want      []string
+	}{
+		{"stated", `import { UserRepo } from "../store/users";
+
+export async function handle(repo: UserRepo, id: string) {
+  const cache = new Map<string, User>();
+  const mailer: Mailer = makeMailer();
+  repo.find(id);
+  cache.get(id);
+  mailer.send(id);
+  other.run();
+  {
+    const repo = make();
+    repo.find(id);
+  }
+}
+`, []string{"find ../store/users.UserRepo", "get Map", "send Mailer", "run ", "find "}},
+		{"inner scopes", `export function f(repo: Repo, flag: boolean) {
+  items.forEach(() => {
+    const repo: Cache = new Cache();
+  });
+  if (flag) {
+    const repo = new Cache();
+  }
+  repo.find();
+}
+`, []string{"forEach ", "find Repo"}},
+		{"bound again", `export function main(item: Item, store: Store, repo: Repo, cache: Cache, svc: Service) {
+  others.map((item) => item.save());
+  for (const store of stores) {
+    store.put();
+  }
+  try {
+    run();
+  } catch (repo) {
+    repo.find();
+  }
+  const { cache } = context;
+  cache.get();
+  const { a = svc } = context;
+  svc.run();
+}
+`, []string{"map ", "save ", "put ", "find ", "get ", "run Service"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			units, _ := testutil.Parse(t, Parse, "src/users/handler.ts", tc.src)
+			testutil.Lines(t, "calls", testutil.Format(units[0].Calls, func(c unit.Call) string {
+				if c.Kind != unit.MethodCall {
+					return ""
+				}
+				return c.Name + " " + c.Type
+			}), tc.want)
+		})
+	}
+}
+
+// An interface's or object type's properties record their types too, and
+// a method call on a typed variable's property records both: the
+// variable's type and the property.
+func TestCallsThroughATypedVariablesFieldRecordBoth(t *testing.T) {
+	units, decls := testutil.Parse(t, Parse, "src/controllers/cluster.ts", `import type { IClusterRepo } from "../repositories/cluster";
+
+export interface ClusterDeps {
+  clusters: IClusterRepo;
+  limit: number;
+}
+
+type Options = { clock: Clock };
+
+export function createController(deps: ClusterDeps) {
+  return deps.clusters.findById("1");
+}
+`)
+	testutil.Lines(t, "field types", testutil.Format(decls.FieldTypes, func(f unit.FieldType) string { return f.Struct + "." + f.Field + " " + f.Type }),
+		[]string{"ClusterDeps.clusters ../repositories/cluster.IClusterRepo", "Options.clock Clock"})
+	testutil.Lines(t, "calls", testutil.Format(units[0].Calls, func(c unit.Call) string { return c.Name + " " + c.Type + " " + c.Field }),
+		[]string{"findById ClusterDeps clusters"})
+}
+
+// An interface declaring methods is a contract classes implement, as a
+// Rust trait is; one only of properties is a data shape, no contract.
+func TestInterfacesWithMethodsAndTheirImplementationsAreRecorded(t *testing.T) {
+	_, decls := testutil.Parse(t, Parse, "src/store/repo.ts", `import type { Other } from "./other";
+
+export interface IRepo {
+  find(id: string): Row;
+}
+
+interface Row {
+  id: string;
+}
+
+export class Repo extends Base implements IRepo, Other<string> {
+  find(id: string) { return { id }; }
+}
+
+class Plain {}
+
+interface ICachedRepo extends IRepo {
+  flush(): void;
+}
+`)
+	testutil.Lines(t, "traits", testutil.Format(decls.Traits, func(tr unit.Trait) string {
+		return fmt.Sprintf("%s %d-%d public=%v %v", tr.Name, tr.StartLine, tr.EndLine, tr.Public, tr.Methods)
+	}), []string{"IRepo 3-5 public=true [find]", "ICachedRepo 17-19 public=false [flush]"})
+	testutil.Lines(t, "impls", testutil.Format(decls.Impls, func(im unit.Impl) string {
+		return fmt.Sprintf("%s %s %s %d-%d", im.Type, im.Trait, im.TraitPath, im.StartLine, im.EndLine)
+	}), []string{"Repo IRepo IRepo 11-13", "Repo Other ./other.Other 11-13", "ICachedRepo IRepo IRepo 17-19"})
+	testutil.Lines(t, "type names", decls.TypeNames, []string{"Repo", "Plain"})
+}
+
+// this is the class's instance in its methods and their arrow functions,
+// but not in a nested function, which has a this of its own.
+func TestThisInANestedFunctionIsNoSelf(t *testing.T) {
+	units, _ := testutil.Parse(t, Parse, "src/repo.ts", `export class Repo {
+  load() {
+    const handler = { run: function () { return this.save(); } };
+    return () => this.save();
+  }
+  save() {}
+}
+`)
+	testutil.Lines(t, "calls", testutil.Format(units[0].Calls, func(c unit.Call) string { return c.Name + " " + c.Qualifier }),
+		[]string{"save ", "save self"})
+}
+
+// A parameter or local of an imported name shadows the import.
+func TestAShadowedImportIsNoPathCall(t *testing.T) {
+	units, _ := testutil.Parse(t, Parse, "src/run.ts", `import { log } from "./log";
+
+export function run(log: Write) {
+  log("x");
+}
+
+export function other() {
+  log("y");
+}
+
+export function destructured({ log }: Deps) {
+  log("z");
+}
+
+export function afterLoop(names: string[]) {
+  for (const log in names) {}
+  log("w");
+}
+`)
+	testutil.Lines(t, "calls", testutil.Format(units, func(u unit.Unit) string {
+		last := u.Calls[len(u.Calls)-1]
+		return fmt.Sprintf("%s: %d %s", u.Name, last.Kind, last.Qualifier)
+	}), []string{
+		fmt.Sprintf("run: %d ", unit.FreeCall),
+		fmt.Sprintf("other: %d ./log", unit.PathCall),
+		fmt.Sprintf("destructured: %d ", unit.FreeCall),
+		fmt.Sprintf("afterLoop: %d ./log", unit.PathCall),
+	})
+}
+
+// An object typed as an interface, or one a function typed to return it
+// makes, implements it as a class does; a function returning another
+// value of the type does not.
+func TestObjectsTypedAsAnInterfaceImplementIt(t *testing.T) {
+	_, decls := testutil.Parse(t, Parse, "src/memory.ts", `import type { IRepo } from "./repo";
+
+export const memoryRepo: IRepo = { find() { return 1; } };
+
+export function createRepo(db: Db): IRepo {
+  return { find() { return db.get(); } };
+}
+
+export function createPg(db: Db): IRepo {
+  ({ find: db.get });
+  return new PgRepo(db);
+}
+
+export function createCached(db: Db): IRepo {
+  if (db.cached) {
+    return { find() { return 2; } };
+  }
+  throw new Error("no cache");
+}
+
+export const getRepo = (): IRepo => memoryRepo;
+`)
+	testutil.Lines(t, "impls", testutil.Format(decls.Impls, func(im unit.Impl) string { return im.Type + " " + im.TraitPath }),
+		[]string{"memoryRepo ./repo.IRepo", "createRepo ./repo.IRepo", "createCached ./repo.IRepo"})
 }

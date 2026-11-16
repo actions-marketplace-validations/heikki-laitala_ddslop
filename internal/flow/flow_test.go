@@ -1326,3 +1326,153 @@ func TestBuildResolvesTypeScriptCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildResolvesTypeScriptCallsThroughWorkspacePackages(t *testing.T) {
+	units := []unit.Unit{
+		fn("packages/api/src/handler.ts", "handle", unit.Call{Kind: unit.PathCall, Qualifier: "@acme/db", Name: "query"}),
+		fn("packages/api/src/handler.ts", "sub", unit.Call{Kind: unit.PathCall, Qualifier: "@acme/db/query", Name: "query"}),
+		exported(fn("packages/db/src/query.ts", "query")),
+		exported(fn("packages/other/src/query.ts", "query")),
+		// an outside package's function is none of ours, whatever its name
+		fn("packages/api/src/handler.ts", "chunked", unit.Call{Kind: unit.PathCall, Qualifier: "lodash", Name: "chunk"}),
+		exported(fn("packages/db/src/chunk.ts", "chunk")),
+		// a package's private function is not what it exports
+		fn("packages/api/src/handler.ts", "peek", unit.Call{Kind: unit.PathCall, Qualifier: "@acme/db", Name: "secret"}),
+		fn("packages/db/src/secret.ts", "secret"),
+		// two exported functions of the name: which one is not known
+		fn("packages/api/src/handler.ts", "either", unit.Call{Kind: unit.PathCall, Qualifier: "@acme/db", Name: "open"}),
+		exported(fn("packages/db/src/a.ts", "open")),
+		exported(fn("packages/db/src/b.ts", "open")),
+		// a package nested in another is a package of its own, and so is
+		// the root's
+		fn("packages/api/src/handler.ts", "nested", unit.Call{Kind: unit.PathCall, Qualifier: "@acme/db", Name: "demo"}),
+		exported(fn("packages/db/examples/demo/src/demo.ts", "demo")),
+		fn("packages/api/src/handler.ts", "rooted", unit.Call{Kind: unit.PathCall, Qualifier: "acme", Name: "query"}),
+		exported(fn("src/query.ts", "query")),
+	}
+	g := Build(Inputs{TSPackages: map[string]string{".": "acme", "packages/db": "@acme/db", "packages/other": "@acme/other",
+		"packages/db/examples/demo": "demo"}}, units)
+	for caller, want := range map[string]string{
+		"packages/api/src/handler.ts handle":  "[packages/db/src/query.ts query]",
+		"packages/api/src/handler.ts sub":     "[packages/db/src/query.ts query]",
+		"packages/api/src/handler.ts chunked": "[]",
+		"packages/api/src/handler.ts peek":    "[]",
+		"packages/api/src/handler.ts either":  "[]",
+		"packages/api/src/handler.ts nested":  "[]",
+		"packages/api/src/handler.ts rooted":  "[src/query.ts query]",
+	} {
+		if got := callees(g, caller); got != want {
+			t.Errorf("%s calls %s, want %s", caller, got, want)
+		}
+	}
+}
+
+func TestBuildResolvesTypeScriptMethodCallsByTheirType(t *testing.T) {
+	units := []unit.Unit{
+		// the type names the class's module: of two UserRepo, the imported one
+		fn("src/users/handler.ts", "handle", unit.Call{Kind: unit.MethodCall, Name: "find", Type: "../store/users.UserRepo"}),
+		exported(fn("src/store/users.ts", "UserRepo.find")),
+		exported(fn("src/legacy/users.ts", "UserRepo.find")),
+		// a local type is the caller's file's class; one the file does not
+		// declare is a global (Response), whatever class shares its name
+		fn("src/users/cache.ts", "warm", unit.Call{Kind: unit.MethodCall, Name: "fill", Type: "Cache"}),
+		fn("src/users/cache.ts", "Cache.fill"),
+		fn("src/users/report.ts", "print", unit.Call{Kind: unit.MethodCall, Name: "render", Type: "Table"}),
+		fn("src/ui/table.ts", "Table.render"),
+		// a field of this, typed by the class's declaration
+		fn("src/users/service.ts", "UserService.load", unit.Call{Kind: unit.MethodCall, Field: "repo", Name: "find"}),
+		// a type no class of ours has: an outside one
+		fn("src/users/handler.ts", "lookup", unit.Call{Kind: unit.MethodCall, Name: "get", Type: "Map"}),
+		fn("src/other/map.ts", "Registry.get"),
+	}
+	g := Build(Inputs{Fields: map[string]map[string]FieldType{
+		"src/users": {"UserService.repo": {Type: "../store/users.UserRepo", File: "src/users/service.ts"}},
+	}}, units)
+	for caller, want := range map[string]string{
+		"src/users/handler.ts handle":           "[src/store/users.ts UserRepo.find]",
+		"src/users/cache.ts warm":               "[src/users/cache.ts Cache.fill]",
+		"src/users/report.ts print":             "[]",
+		"src/users/service.ts UserService.load": "[src/store/users.ts UserRepo.find]",
+		"src/users/handler.ts lookup":           "[]",
+	} {
+		if got := callees(g, caller); got != want {
+			t.Errorf("%s calls %s, want %s", caller, got, want)
+		}
+	}
+}
+
+func TestBuildResolvesTypeScriptCallsThroughATypedVariablesField(t *testing.T) {
+	units := []unit.Unit{
+		// deps: ClusterDeps, declared in another module, whose clusters
+		// field is a ClusterRepo
+		fn("src/controllers/cluster.ts", "createController", unit.Call{Kind: unit.MethodCall, Name: "findById", Type: "../deps.ClusterDeps", Field: "clusters"}),
+		exported(fn("src/repositories/cluster.ts", "ClusterRepo.findById")),
+		// a field the type does not declare: unknown
+		fn("src/controllers/cluster.ts", "other", unit.Call{Kind: unit.MethodCall, Name: "findById", Type: "../deps.ClusterDeps", Field: "missing"}),
+		// a local type is the caller's file's
+		fn("src/controllers/local.ts", "local", unit.Call{Kind: unit.MethodCall, Name: "findById", Type: "LocalDeps", Field: "clusters"}),
+		// a type of the name in another module is not the one imported
+		fn("src/controllers/cluster.ts", "elsewhere", unit.Call{Kind: unit.MethodCall, Name: "findById", Type: "../wiring.ClusterDeps", Field: "clusters"}),
+	}
+	g := Build(Inputs{Fields: map[string]map[string]FieldType{
+		"src/deps.ts":              {"ClusterDeps.clusters": {Type: "./repositories/cluster.ClusterRepo", File: "src/deps.ts"}},
+		"src/other/deps.ts":        {"ClusterDeps.clusters": {Type: "../repositories/cluster.ClusterRepo", File: "src/other/deps.ts"}},
+		"src/controllers/local.ts": {"LocalDeps.clusters": {Type: "../repositories/cluster.ClusterRepo", File: "src/controllers/local.ts"}},
+	}}, units)
+	for caller, want := range map[string]string{
+		"src/controllers/cluster.ts createController": "[src/repositories/cluster.ts ClusterRepo.findById]",
+		"src/controllers/cluster.ts other":            "[]",
+		"src/controllers/local.ts local":              "[src/repositories/cluster.ts ClusterRepo.findById]",
+		"src/controllers/cluster.ts elsewhere":        "[]",
+	} {
+		if got := callees(g, caller); got != want {
+			t.Errorf("%s calls %s, want %s", caller, got, want)
+		}
+	}
+}
+
+func TestBuildResolvesTypeScriptCallsOnAnInterfaceToItsOnlyClass(t *testing.T) {
+	findByID := exported(fn("src/repositories/cluster.ts", "ClusterRepo.findById"))
+	findByID.Dispatched = true // as every class method
+	units := []unit.Unit{
+		fn("src/controllers/cluster.ts", "load", unit.Call{Kind: unit.MethodCall, Name: "findById", Type: "../repositories/cluster.IClusterRepo"}),
+		findByID,
+		// two classes implement IStore: which one runs is not known
+		fn("src/controllers/cluster.ts", "save", unit.Call{Kind: unit.MethodCall, Name: "put", Type: "../store.IStore"}),
+		exported(fn("src/store/memory.ts", "MemoryStore.put")),
+		exported(fn("src/store/disk.ts", "DiskStore.put")),
+		// an outside interface (vscode's Disposable) is none of ours,
+		// whatever class of ours implements it
+		fn("src/controllers/cluster.ts", "close", unit.Call{Kind: unit.MethodCall, Name: "dispose", Type: "vscode.Disposable"}),
+		exported(fn("src/ext.ts", "Foo.dispose")),
+		// an unrelated class named like an interface of ours does not hide it
+		fn("src/controllers/cluster.ts", "read", unit.Call{Kind: unit.MethodCall, Name: "get", Type: "../types.Cache"}),
+		exported(fn("src/mem.ts", "MemCache.get")),
+		exported(fn("src/legacy.ts", "Cache.get")),
+		// a call on the class itself
+		fn("src/controllers/cluster.ts", "direct", unit.Call{Kind: unit.MethodCall, Name: "findById", Type: "../repositories/cluster.ClusterRepo"}),
+	}
+	g := Build(Inputs{Impls: []unit.Impl{
+		{File: "src/repositories/cluster.ts", Trait: "IClusterRepo", TraitPath: "IClusterRepo", Type: "ClusterRepo"},
+		{File: "src/store/memory.ts", Trait: "IStore", TraitPath: "../store.IStore", Type: "MemoryStore"},
+		{File: "src/store/disk.ts", Trait: "IStore", TraitPath: "../store.IStore", Type: "DiskStore"},
+		{File: "src/ext.ts", Trait: "Disposable", TraitPath: "vscode.Disposable", Type: "Foo"},
+		{File: "src/mem.ts", Trait: "Cache", TraitPath: "./types.Cache", Type: "MemCache"},
+	}, TSInterfaces: map[string][]string{"IClusterRepo": {"src/repositories/cluster.ts"}, "IStore": {"src/store.ts"}, "Cache": {"src/types.ts"}}}, units)
+	for caller, want := range map[string]string{
+		"src/controllers/cluster.ts load":   "[src/repositories/cluster.ts ClusterRepo.findById]",
+		"src/controllers/cluster.ts save":   "[]",
+		"src/controllers/cluster.ts close":  "[]",
+		"src/controllers/cluster.ts read":   "[src/mem.ts MemCache.get]",
+		"src/controllers/cluster.ts direct": "[src/repositories/cluster.ts ClusterRepo.findById]",
+	} {
+		if got := callees(g, caller); got != want {
+			t.Errorf("%s calls %s, want %s", caller, got, want)
+		}
+	}
+	// load runs the class through the interface, depending on the
+	// interface only (see Graph.Dispatched); direct depends on the class
+	if got := fmt.Sprint(g.Dispatched[0], g.Dispatched[len(units)-1]); got != "[true] [false]" {
+		t.Errorf("Dispatched of load and direct = %s, want [true] [false]", got)
+	}
+}

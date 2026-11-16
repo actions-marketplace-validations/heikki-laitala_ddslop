@@ -10,9 +10,11 @@ it writes the next copy.**
 > `defer` already is the idiom. In TypeScript (`.ts`, `.tsx`, `.mts`,
 > `.cts`) it finds exact, renamed and near-miss copies, copied blocks,
 > types and constants declared again, wrappers that only pass their
-> parameters on, parameters passed together and strings switched on in
-> many functions; unused exports, the map and feature flows are in
-> progress. Files in other languages are not analysed.
+> parameters on, parameters passed together, strings switched on in
+> many functions, unused exports of private packages and
+> single-implementation interfaces, and `ddslop map` describes its
+> layers and shared helpers; feature flows and
+> idioms are in progress. Files in other languages are not analysed.
 
 Coding agents regenerate rather than reuse. Each session that cannot see
 the helper written in the last one writes it again, a little differently:
@@ -163,7 +165,7 @@ the check that stops an agent adding the next copy.
 | **Code to simplify** | | |
 | `dead-code` | a public function nothing in the repository uses | delete it |
 | `pass-through` | a wrapper that only forwards its parameters | call the target |
-| `single-impl-trait` | a trait with one implementation and no test double | drop the trait |
+| `single-impl-trait` | a trait or TypeScript interface with one implementation and no test double | drop the trait |
 
 Each candidate carries everything an agent needs to fix it:
 
@@ -281,10 +283,14 @@ Pin an exact [release](https://github.com/heikki-laitala/ddslop/releases)
 such as `@v1.0.0` to stay on one. Other inputs: `diff` (report only
 candidates touching changed lines), `baseline` (a baseline file instead of
 `baseline-ref`), `path`, `fail-over`
-(fail only above this duplication percentage), `args` and `upload-sarif`.
-A pull request from a fork or Dependabot cannot upload to code scanning,
-so there, and with `upload-sarif: "false"`, candidates show as workflow
-annotations instead. Elsewhere, use `ddslop check --format sarif`.
+(fail only above this duplication percentage), `args`, `upload-sarif`,
+`annotate` and `fail` (`"false"` reports without failing the job, through
+the `exit-code` output, the SARIF report and annotations as warnings).
+A pull request from a fork or Dependabot cannot upload to code
+scanning, so there, and with `upload-sarif: "false"`, candidates show as
+workflow annotations instead; `annotate: "false"` leaves annotations out,
+for a workflow that reads the exit code and the SARIF report itself.
+Elsewhere, use `ddslop check --format sarif`.
 
 Mark intended duplication in the code, with a reason:
 

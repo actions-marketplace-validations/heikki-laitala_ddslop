@@ -67,8 +67,9 @@ func importClause(clause *sitter.Node, module string, src []byte, names map[stri
 // call classifies a call by its callee: an imported function, or one
 // through a namespace import (db.query), is a path call qualified by its
 // module; any other plain name a free call; a call on this a self call,
-// one on a field of this (this.store.get) a method call on that field,
-// and any other a method call.
+// one on a field of this (this.store.get) or of a typed variable
+// (deps.store.get) a method call on that field, and any other a method
+// call.
 // ddslop:ignore the Go adapter's classification over TypeScript's node kinds; each changes with its own grammar
 func (g grammar) call(n *sitter.Node, src []byte) (unit.Call, bool) {
 	fn := n.ChildByFieldName("function")
@@ -78,7 +79,7 @@ func (g grammar) call(n *sitter.Node, src []byte) (unit.Call, bool) {
 		return c, false
 	case fn.Kind() == "identifier":
 		c.Kind, c.Name = unit.FreeCall, fn.Utf8Text(src)
-		if im, ok := g.imports[c.Name]; ok && im.name != "" {
+		if im, ok := g.imports[c.Name]; ok && im.name != "" && !g.bound(c.Name) {
 			c.Kind, c.Qualifier, c.Name = unit.PathCall, im.module, im.name
 		}
 	case fn.Kind() == "member_expression":
@@ -89,20 +90,36 @@ func (g grammar) call(n *sitter.Node, src []byte) (unit.Call, bool) {
 		c.Kind, c.Name = unit.MethodCall, property.Utf8Text(src)
 		switch object.Kind() {
 		case "this":
-			c.Qualifier = "self"
+			if *g.otherThis == 0 {
+				c.Qualifier = "self"
+			}
 		case "identifier":
-			if im, ok := g.imports[object.Utf8Text(src)]; ok && im.name == "" {
+			if im, ok := g.imports[object.Utf8Text(src)]; ok && im.name == "" && !g.bound(object.Utf8Text(src)) {
 				c.Kind, c.Qualifier = unit.PathCall, im.module
+			} else {
+				c.Type = g.vars[object.Utf8Text(src)]
 			}
 		case "member_expression":
-			if this, field := object.ChildByFieldName("object"), object.ChildByFieldName("property"); this != nil && field != nil && this.Kind() == "this" {
+			// this.repo.find(), or deps.repo.find() on a typed variable
+			switch inner, field := object.ChildByFieldName("object"), object.ChildByFieldName("property"); {
+			case inner == nil || field == nil:
+			case inner.Kind() == "this" && *g.otherThis == 0:
 				c.Field = field.Utf8Text(src)
+			case inner.Kind() == "identifier" && g.vars[inner.Utf8Text(src)] != "":
+				c.Type, c.Field = g.vars[inner.Utf8Text(src)], field.Utf8Text(src)
 			}
 		}
 	default:
 		return c, false // a called call's result, an immediately invoked function
 	}
 	return c, true
+}
+
+// bound reports whether the function binds a name, which then shadows an
+// import of the name.
+func (g grammar) bound(name string) bool {
+	_, ok := g.vars[name]
+	return ok
 }
 
 // forwards returns the callee when a function's whole body is one call,
@@ -154,14 +171,7 @@ func forwards(fn *sitter.Node, src []byte) string {
 
 // asyncOrGenerator reports whether a function is async or a generator,
 // by its async or * token.
-func asyncOrGenerator(fn *sitter.Node) bool {
-	for i := uint(0); i < fn.ChildCount(); i++ {
-		if k := fn.Child(i).Kind(); k == "async" || k == "*" {
-			return true
-		}
-	}
-	return false
-}
+func asyncOrGenerator(fn *sitter.Node) bool { return hasChild(fn, "async") || hasChild(fn, "*") }
 
 // params returns a function's parameters that bind one name, in order,
 // each with its type as written ("" for none), and whether all are plain
@@ -172,29 +182,45 @@ func params(fn *sitter.Node, src []byte) ([]unit.Param, bool) {
 	if p := fn.ChildByFieldName("parameter"); p != nil {
 		return []unit.Param{{Name: p.Utf8Text(src)}}, true // x => g(x)
 	}
-	list := fn.ChildByFieldName("parameters")
-	if list == nil {
+	if fn.ChildByFieldName("parameters") == nil {
 		return nil, false
 	}
 	var out []unit.Param
 	plain := true
-	for i := uint(0); i < list.NamedChildCount(); i++ {
+	eachParam(fn, func(p, name, typ *sitter.Node) {
+		if name == nil {
+			plain = false
+			return
+		}
+		plain = plain && p.Kind() == "required_parameter" && p.ChildByFieldName("value") == nil
+		param := unit.Param{Name: name.Utf8Text(src)}
+		if typ != nil {
+			param.Type = syntax.Compact(typ.Utf8Text(src))
+		}
+		out = append(out, param)
+	})
+	return out, plain
+}
+
+// eachParam calls each with every parameter in a function's parameter
+// list but a this parameter: its name, or nil when it binds no one name
+// (a rest or destructured parameter), and its type, or nil.
+func eachParam(fn *sitter.Node, each func(p, name, typ *sitter.Node)) {
+	list := fn.ChildByFieldName("parameters")
+	for i := uint(0); list != nil && i < list.NamedChildCount(); i++ {
 		p := list.NamedChild(i)
 		pattern, typ := p.ChildByFieldName("pattern"), p.ChildByFieldName("type")
+		if typ != nil {
+			typ = typ.NamedChild(0)
+		}
 		switch {
 		case pattern != nil && pattern.Kind() == "this":
 		case (p.Kind() != "required_parameter" && p.Kind() != "optional_parameter") || pattern == nil || pattern.Kind() != "identifier":
-			plain = false
+			each(p, nil, typ)
 		default:
-			plain = plain && p.Kind() == "required_parameter" && p.ChildByFieldName("value") == nil
-			param := unit.Param{Name: pattern.Utf8Text(src)}
-			if typ != nil && typ.NamedChild(0) != nil {
-				param.Type = syntax.Compact(typ.NamedChild(0).Utf8Text(src))
-			}
-			out = append(out, param)
+			each(p, pattern, typ)
 		}
 	}
-	return out, plain
 }
 
 // noBorrow: TypeScript passes arguments as they are.

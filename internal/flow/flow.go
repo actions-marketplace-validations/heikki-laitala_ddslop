@@ -36,10 +36,11 @@ type Graph struct {
 	// by its method name, which may be another type's method).
 	Targets [][]int
 	// Dispatched marks, parallel to Targets, the calls that reached their
-	// target through a value of a trait type (dyn Store, S: Store) in the
-	// trait's only implementation, which the caller runs without
-	// depending on it. A call reaching the trait's own default is not
-	// marked: it is in the trait's module, which the caller depends on.
+	// target through a value of a trait type (dyn Store, S: Store, a
+	// TypeScript interface) in the trait's only implementation, which the
+	// caller runs without depending on it. A call reaching the trait's own
+	// default is not marked: it is in the trait's module, which the caller
+	// depends on.
 	Dispatched [][]bool
 	// Calls and Resolved count all call sites and the resolved ones.
 	Calls, Resolved int
@@ -47,18 +48,22 @@ type Graph struct {
 
 // index finds units by name.
 type index struct {
-	free        map[string][]int                // free functions by name
-	methods     map[string][]int                // methods by method name
-	owned       map[string][]int                // methods by "Owner::method", owner simplified
-	owners      map[string]bool                 // the types with methods, simplified
-	impls       map[string][]string             // Rust trait, simplified -> the crate directory of each implementation
-	rustModules map[string]map[string]bool      // Rust crate directory -> its modules' paths (foo::bar), from its files' paths
-	crates      map[string]string               // workspace crate name -> crate directory
-	imports     map[string]map[string]string    // file -> imported name -> path
-	deps        map[string]map[string]bool      // crate directory -> workspace crates it imports from
-	fields      map[string]map[string]FieldType // package or crate directory -> "Struct.field" -> its type
-	modules     map[string]string               // go.mod directory -> module path
-	libraries   Libraries                       // Rust libraries moved out of src/lib.rs
+	free         map[string][]int                // free functions by name
+	methods      map[string][]int                // methods by method name
+	owned        map[string][]int                // methods by "Owner::method", owner simplified
+	owners       map[string]bool                 // the types with methods, simplified
+	impls        map[string][]string             // Rust trait, simplified -> the crate directory of each implementation
+	rustModules  map[string]map[string]bool      // Rust crate directory -> its modules' paths (foo::bar), from its files' paths
+	crates       map[string]string               // workspace crate name -> crate directory
+	imports      map[string]map[string]string    // file -> imported name -> path
+	deps         map[string]map[string]bool      // crate directory -> workspace crates it imports from
+	fields       map[string]map[string]FieldType // package or crate directory -> "Struct.field" -> its type
+	modules      map[string]string               // go.mod directory -> module path
+	tsPackages   map[string]string               // TypeScript package.json directory -> package name
+	tsFields     map[string][]FieldType          // TypeScript "Type.field" -> the field's type in each type of that name, one per file
+	tsImpls      map[string][]unit.Impl          // TypeScript "declaring file#interface" -> the classes implementing it
+	tsInterfaces map[string][]string             // TypeScript interface name -> the files declaring one of that name
+	libraries    Libraries                       // Rust libraries moved out of src/lib.rs
 }
 
 // FieldType is a struct field's type, as unit.Call.Type writes types,
@@ -82,6 +87,12 @@ type Inputs struct {
 	Fields map[string]map[string]FieldType
 	// Modules maps the directory of each go.mod to its module path.
 	Modules map[string]string
+	// TSPackages maps the directory of each TypeScript package.json to
+	// the package's name (@acme/db).
+	TSPackages map[string]string
+	// TSInterfaces maps the name of each TypeScript interface declaring
+	// methods to the files declaring one of that name.
+	TSInterfaces map[string][]string
 	// RustFiles are the Rust files analysed, functions or not: their
 	// paths name their crates' modules.
 	RustFiles []string
@@ -106,7 +117,8 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 			langs[ext] = &index{free: map[string][]int{}, methods: map[string][]int{}, owned: map[string][]int{}, owners: map[string]bool{},
 				impls: map[string][]string{}, rustModules: map[string]map[string]bool{},
 				crates: map[string]string{}, imports: in.Imports, deps: map[string]map[string]bool{},
-				fields: in.Fields, modules: in.Modules, libraries: in.Libraries}
+				fields: in.Fields, modules: in.Modules, tsPackages: in.TSPackages, tsFields: map[string][]FieldType{}, tsImpls: map[string][]unit.Impl{}, tsInterfaces: in.TSInterfaces,
+				libraries: in.Libraries}
 		}
 		return langs[ext]
 	}
@@ -131,7 +143,22 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 		ix.owners[owner] = true
 	}
 
+	for _, byKey := range in.Fields {
+		for key, ft := range byKey {
+			if tsfile.IsSource(ft.File) {
+				ix := indexOf(ft.File)
+				ix.tsFields[key] = append(ix.tsFields[key], ft)
+			}
+		}
+	}
 	for _, im := range in.Impls {
+		if tsfile.IsSource(im.File) {
+			ix := indexOf(im.File)
+			if decl, ok := ix.tsInterfaceFile(im.File, im.TraitPath); ok {
+				ix.tsImpls[decl+"#"+im.Trait] = append(ix.tsImpls[decl+"#"+im.Trait], im)
+			}
+			continue
+		}
 		ix, crate := indexOf(im.File), in.Libraries.CrateOf(im.File)
 		ix.impls[im.Trait] = append(ix.impls[im.Trait], crate)
 		// impl api::Store for Disk, without a use: a dependency all the same.
@@ -171,7 +198,7 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 			g.Calls++
 			callee, byName, dispatched := r.resolve(k)
 			g.Targets[i][k] = callee
-			g.Dispatched[i][k] = dispatched && callee >= 0 && units[callee].Trait != ""
+			g.Dispatched[i][k] = dispatched && callee >= 0 && units[callee].ViaInterface()
 			if byName {
 				g.Targets[i][k] = -1
 			}
@@ -283,7 +310,8 @@ func (r *callResolver) resolveCall(c unit.Call) (int, bool, bool) {
 // value of a trait type (see Graph.Dispatched).
 func (ix index) resolve(units []unit.Unit, caller unit.Unit, owner string, c unit.Call) (int, bool, bool) {
 	if tsfile.IsSource(caller.File) {
-		return ix.resolveTypeScript(units, caller, owner, c), false, false
+		callee, dispatched := ix.resolveTypeScript(units, caller, owner, c)
+		return callee, false, dispatched
 	}
 	if c.Kind != unit.MethodCall || c.Qualifier == "self" {
 		return ix.resolveNamed(units, caller, owner, c), false, false
@@ -744,28 +772,110 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 
 // resolveTypeScript resolves a TypeScript call. A name the file does not
 // import is its own function's, or a global's, unless the caller declares
-// it (a parameter), its own name aside (a recursive call); an imported
-// one (a path call qualified by its module) is the exported function of
-// that name in the module a relative path names (see tsfile.ModuleIs),
-// never a package's; a call on this is the caller's class's method.
-// Without types, the name of any other method says nothing: it is not
-// resolved.
-func (ix index) resolveTypeScript(units []unit.Unit, caller unit.Unit, owner string, c unit.Call) int {
+// it (a parameter), its own name aside (a recursive call); an imported one
+// (a path call qualified by its module) is the exported function of that
+// name in the module a relative path names (see tsfile.ModuleIs), or
+// anywhere in the workspace package a package path names (@acme/db,
+// @acme/db/query) outside the packages nested in it, never an outside
+// package's (see tsfile.ModuleFiles); a call on this is the caller's
+// class's method; one on a value whose type the code states (a typed
+// parameter, a field of this or of a typed variable) is the method of that
+// type's class (see resolveTSMethod, tsFieldType). Without a type, the
+// name of any other method says nothing: it is not resolved.
+func (ix index) resolveTypeScript(units []unit.Unit, caller unit.Unit, owner string, c unit.Call) (int, bool) {
 	sameFile := func(u unit.Unit) bool { return u.File == caller.File }
 	switch {
 	case c.Kind == unit.FreeCall:
 		if c.Name != caller.Name && slices.ContainsFunc(caller.Leaves, func(l unit.Leaf) bool { return l.Declares && l.Text == c.Name }) {
-			return -1
+			return -1, false
 		}
-		return only(units, ix.free[c.Name], sameFile)
+		return only(units, ix.free[c.Name], sameFile), false
 	case c.Kind == unit.PathCall:
-		return only(units, ix.free[c.Name], func(u unit.Unit) bool {
-			return u.Public && tsfile.ModuleIs(caller.File, c.Qualifier, u.File)
-		})
+		inModule := tsfile.ModuleFiles(caller.File, c.Qualifier, ix.tsPackages)
+		return only(units, ix.free[c.Name], func(u unit.Unit) bool { return u.Public && inModule(u.File) }), false
 	case c.Qualifier == "self" && owner != "":
-		return only(units, ix.owned[owner+"::"+c.Name], sameFile)
+		return only(units, ix.owned[owner+"::"+c.Name], sameFile), false
+	case c.Field != "" && (c.Type != "" || owner != ""):
+		// deps.repo.find() on a typed variable, or this.repo.find() on the
+		// caller's own class: the field's type, read where its type is
+		// declared
+		typ := c.Type
+		if typ == "" {
+			typ = owner
+		}
+		ft, ok := ix.tsFieldType(caller.File, typ, c.Field)
+		if !ok {
+			return -1, false
+		}
+		return ix.resolveTSMethod(units, ft.File, ft.Type, c.Name)
 	}
-	return -1
+	return ix.resolveTSMethod(units, caller.File, c.Type, c.Name)
+}
+
+// resolveTSMethod resolves a method call on a value of a TypeScript type,
+// as unit.Call.Type writes it, read in the file home: a type imported
+// from a module is that module's class of the name, a local one the
+// file's own class of the name: one the file does not declare is a
+// global (Response, Map), whatever class of ours shares its name. An
+// interface of ours (IRepo) that a single class implements stands for
+// that class, reached through the interface (see Graph.Dispatched); with
+// several, which one runs is not known.
+func (ix index) resolveTSMethod(units []unit.Unit, home, typ, method string) (int, bool) {
+	if typ == "" {
+		return -1, false
+	}
+	name := typ[strings.LastIndex(typ, ".")+1:]
+	if decl, ok := ix.tsInterfaceFile(home, typ); ok {
+		// an interface of ours one class implements: that class's method runs
+		if impls := ix.tsImpls[decl+"#"+name]; len(impls) == 1 {
+			im := impls[0]
+			return only(units, ix.owned[im.Type+"::"+method], func(u unit.Unit) bool { return u.File == im.File }), true
+		}
+		return -1, false
+	}
+	declares := ix.tsDeclares(home, typ)
+	return only(units, ix.owned[name+"::"+method], func(u unit.Unit) bool { return declares(u.File) }), false
+}
+
+// tsDeclares reports, for a file, whether it is where the TypeScript type
+// typ, as unit.Call.Type writes it read in home, is declared: in the
+// module it is imported from (see tsfile.ModuleFiles), or home itself for
+// a local type.
+func (ix index) tsDeclares(home, typ string) func(file string) bool {
+	if i := strings.LastIndex(typ, "."); i >= 0 {
+		return tsfile.ModuleFiles(home, typ[:i], ix.tsPackages)
+	}
+	return func(file string) bool { return file == home }
+}
+
+// onlyOne returns the single item keep accepts, false when there is none
+// or more than one.
+func onlyOne[T any](items []T, keep func(T) bool) (T, bool) {
+	var found T
+	n := 0
+	for _, item := range items {
+		if keep(item) {
+			found, n = item, n+1
+		}
+	}
+	return found, n == 1
+}
+
+// tsFieldType returns the type of a field of a TypeScript class,
+// interface or object type, typ as unit.Call.Type writes it read in the
+// file home: the field of the type of that name the module declares, or
+// home itself for a local type.
+func (ix index) tsFieldType(home, typ, field string) (FieldType, bool) {
+	declares := ix.tsDeclares(home, typ)
+	return onlyOne(ix.tsFields[typ[strings.LastIndex(typ, ".")+1:]+"."+field], func(ft FieldType) bool { return declares(ft.File) })
+}
+
+// tsInterfaceFile returns the file declaring the interface typ, as
+// unit.Call.Type writes it read in home: of the files declaring an
+// interface of that name, the one the module names, or home itself for a
+// local one. An outside interface (vscode's Disposable) has none.
+func (ix index) tsInterfaceFile(home, typ string) (string, bool) {
+	return onlyOne(ix.tsInterfaces[typ[strings.LastIndex(typ, ".")+1:]], ix.tsDeclares(home, typ))
 }
 
 // pick chooses among candidates the one in the caller's file, else the
@@ -799,17 +909,10 @@ func (l Libraries) onlyIn(units []unit.Unit, cands []int, in func(crate string) 
 // only returns the single candidate accepted by keep, or -1 when there is
 // none or more than one.
 func only(units []unit.Unit, cands []int, keep func(unit.Unit) bool) int {
-	found := -1
-	for _, c := range cands {
-		if !keep(units[c]) {
-			continue
-		}
-		if found >= 0 {
-			return -1
-		}
-		found = c
+	if c, ok := onlyOne(cands, func(c int) bool { return keep(units[c]) }); ok {
+		return c
 	}
-	return found
+	return -1
 }
 
 // firstSegment returns the part of a path before its first "::".

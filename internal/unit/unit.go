@@ -188,13 +188,15 @@ type Call struct {
 	// Type is the type of a method call's operand where the code states
 	// it (a parameter, var x T, x := T{}), as a Go package's import path
 	// and the type name ("example.com/app/store.DB"), or the name alone
-	// for the caller's own package. Go only.
+	// for the caller's own package; TypeScript writes an imported type as
+	// its module and name ("../store/users.UserRepo").
 	Type string
 	// Field is the field a method is called on, followed from the
 	// operand: the receiver's (store in s.store.Save(), Go's and Rust's
 	// self.store.get()) or, in Rust, a dotted path from the receiver, a
 	// typed variable (Type) or a call's result (From): ctx.db in
-	// self.ctx.db.query(), store in req.store.get().
+	// self.ctx.db.query(), store in req.store.get(); or, in TypeScript,
+	// this.store.get() and a typed variable's: repo in deps.repo.find().
 	Field string
 	// From is 1 + the index, among its unit's calls, of the call whose
 	// result the operand is (db.Save() after db, err := open(), or
@@ -271,19 +273,23 @@ type Decls struct {
 	// Package is the file's package name, for languages that declare one
 	// (Go).
 	Package string
-	Structs []Struct
-	Enums   []Enum
-	Consts  []Const
-	Traits  []Trait
-	Impls   []Impl
+	// WholeImports are the modules the file imports whole, as written
+	// (import * as schema from "./schema", import("./user")): it may use
+	// any of their exports without naming it. TypeScript only.
+	WholeImports []string
+	Structs      []Struct
+	Enums        []Enum
+	Consts       []Const
+	Traits       []Trait
+	Impls        []Impl
 	// TypeNames are the names of every type the file declares: structs of
 	// any kind, enums, unions and type aliases.
 	TypeNames []string
 	// FuncTypes are the function types the file declares; Go only.
 	FuncTypes []FuncType
-	// FieldTypes are the types of the file's struct fields, written as
-	// Call.Type; fields of other types (slices, maps) are left out. Go
-	// only.
+	// FieldTypes are the types of the file's struct fields, or a
+	// TypeScript class's, interface's or object type's fields, written as
+	// Call.Type; fields of other types (slices, maps) are left out.
 	FieldTypes []FieldType
 }
 
@@ -318,6 +324,9 @@ type Trait struct {
 	// Public is true when the trait is visible outside its crate.
 	Public bool
 	Test   bool
+	// Methods are the names of the methods a TypeScript interface
+	// declares: a class declaring them all implements it.
+	Methods []string
 }
 
 // Impl is an implementation of a trait for a type, both as simple names

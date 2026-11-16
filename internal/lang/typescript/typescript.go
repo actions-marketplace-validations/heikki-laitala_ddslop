@@ -57,6 +57,15 @@ var functionKinds = map[string]bool{
 type grammar struct {
 	fn      [2]uint
 	imports map[string]imported
+	// vars maps the names the function binds (its parameters and
+	// variables, and its nested functions' and blocks' while they are
+	// open) to the type the code states for them, as Call.Type writes it
+	// (see parser.typeOf), or "" for none: a bound name shadows an import.
+	vars map[string]string
+	// otherThis counts the open nested functions, but arrow functions,
+	// that have a this of their own: in them this is no class instance.
+	otherThis *int
+	p         *parser
 }
 
 // Prefix keeps TypeScript's symbols apart from other languages'
@@ -101,6 +110,22 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 		if c, ok := g.call(n, s.Src); ok {
 			s.Calls = append(s.Calls, c)
 		}
+	case n.Kind() == "variable_declarator":
+		// const repo: Repo = make(), const cache = new Cache(); a variable
+		// of no stated type, or a destructured one, shadows any earlier one's
+		name := n.ChildByFieldName("name")
+		if typ := g.p.declaredType(n); name != nil && name.Kind() == "identifier" && typ != "" {
+			g.vars[name.Utf8Text(s.Src)] = typ
+		} else {
+			g.bind(name, s.Src)
+		}
+	case n.Kind() == "for_in_statement" || n.Kind() == "catch_clause":
+		restore := syntax.Scope(g.vars) // the loop's or catch's own variable
+		g.bind(n.ChildByFieldName("left"), s.Src)
+		g.bind(n.ChildByFieldName("parameter"), s.Src)
+		return restore
+	case n.Kind() == "statement_block":
+		return syntax.Scope(g.vars) // a block's variables are its own
 	case n.Kind() == "switch_statement":
 		s.RecordStringMatch(n, caseStrings(n, s.Src))
 	case n.Kind() == "return_statement":
@@ -108,10 +133,46 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 			s.Exits++
 		}
 	case functionKinds[n.Kind()] && syntax.Span(n) != g.fn:
+		// a nested function's parameters shadow the outer names, in it
+		restore := syntax.Scope(g.vars)
+		g.bind(n.ChildByFieldName("parameter"), s.Src)
+		eachParam(n, func(p, _, _ *sitter.Node) { g.bind(p.ChildByFieldName("pattern"), s.Src) })
+		ownThis := n.Kind() != "arrow_function"
+		if ownThis {
+			*g.otherThis++
+		}
 		s.Closures++
-		return func() { s.Closures-- }
+		return func() {
+			s.Closures--
+			if ownThis {
+				*g.otherThis--
+			}
+			restore()
+		}
 	}
 	return nil
+}
+
+// bind records the names a binding (a name, or a destructuring pattern)
+// introduces, of no stated type: they shadow any earlier variable or
+// import of the name in the open scope.
+// ddslop:ignore the Rust adapter's forget over TypeScript's node kinds; each changes with its own grammar
+func (g grammar) bind(binding *sitter.Node, src []byte) {
+	if binding == nil {
+		return
+	}
+	switch binding.Kind() {
+	case "identifier", "shorthand_property_identifier_pattern":
+		g.vars[binding.Utf8Text(src)] = ""
+	case "assignment_pattern", "object_assignment_pattern":
+		g.bind(binding.ChildByFieldName("left"), src) // a default value binds nothing
+	case "pair_pattern":
+		g.bind(binding.ChildByFieldName("value"), src) // nor does a key
+	default:
+		for i := uint(0); i < binding.NamedChildCount(); i++ {
+			g.bind(binding.NamedChild(i), src)
+		}
+	}
 }
 
 // Parse parses TypeScript source and returns one unit per function,
@@ -125,13 +186,20 @@ func Parse(file string, src []byte) ([]unit.Unit, unit.Decls, error) {
 	p := &parser{file: file, src: src, test: IsTestPath(file)}
 	err := syntax.Parse(languageOf(file), src, func(root *sitter.Node) {
 		p.imports = imports(root, src)
+		p.decls.WholeImports = wholeImports(root, src)
 		for i := uint(0); i < root.NamedChildCount(); i++ {
-			n, exported := root.NamedChild(i), false
+			n, exported, byDefault := root.NamedChild(i), false, false
 			if d := n.ChildByFieldName("declaration"); n.Kind() == "export_statement" && d != nil {
-				n, exported = d, true
+				// A default class is called from outside, its methods by name.
+				n, exported, byDefault = d, true, hasChild(n, "default") && d.Kind() != "class_declaration" && d.Kind() != "abstract_class_declaration"
 			}
-			if !n.HasError() {
-				p.declaration(n, exported)
+			if n.HasError() {
+				continue
+			}
+			from := len(p.units)
+			p.declaration(n, exported)
+			for j := from; j < len(p.units); j++ {
+				p.units[j].External = byDefault
 			}
 		}
 		p.markExported(root)
@@ -145,14 +213,15 @@ func Parse(file string, src []byte) ([]unit.Unit, unit.Decls, error) {
 // re-exporting another module's names (export { x } from "./y") lists
 // none of the file's.
 func (p *parser) markExported(root *sitter.Node) {
-	names := map[string]bool{}
+	names, defaults := map[string]bool{}, map[string]bool{}
 	for i := uint(0); i < root.NamedChildCount(); i++ {
 		n := root.NamedChild(i)
 		if n.Kind() != "export_statement" || n.ChildByFieldName("declaration") != nil || n.ChildByFieldName("source") != nil {
 			continue
 		}
 		if v := n.ChildByFieldName("value"); v != nil && v.Kind() == "identifier" {
-			names[v.Utf8Text(p.src)] = true
+			name := v.Utf8Text(p.src)
+			names[name], defaults[name] = true, true
 		}
 		for j := uint(0); j < n.NamedChildCount(); j++ {
 			clause := n.NamedChild(j)
@@ -167,8 +236,53 @@ func (p *parser) markExported(root *sitter.Node) {
 		}
 	}
 	for i := range p.units {
-		p.units[i].Public = p.units[i].Public || names[p.units[i].Name]
+		u := &p.units[i]
+		u.Public = u.Public || names[u.Name]
+		u.External = u.External || defaults[u.Name] || (u.Public && frameworkExports[u.Name])
 	}
+}
+
+// wholeImports returns the modules a file imports whole, in source order:
+// by a namespace import (import * as schema from "./schema") or a
+// dynamic one (import("./routes")).
+func wholeImports(root *sitter.Node, src []byte) []string {
+	var out []string
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		switch fn, args := n.ChildByFieldName("function"), n.ChildByFieldName("arguments"); {
+		case n.Kind() == "import_statement" && n.ChildByFieldName("source") != nil && hasNamespaceImport(n):
+			out = append(out, strings.Trim(n.ChildByFieldName("source").Utf8Text(src), `"'`))
+		case n.Kind() == "call_expression" && fn != nil && fn.Kind() == "import" && args != nil && args.NamedChildCount() > 0 && args.NamedChild(0).Kind() == "string":
+			out = append(out, strings.Trim(args.NamedChild(0).Utf8Text(src), `"'`))
+		}
+		for i := uint(0); i < n.NamedChildCount(); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(root)
+	return out
+}
+
+// hasNamespaceImport reports whether an import statement imports its
+// module whole (import * as schema).
+func hasNamespaceImport(n *sitter.Node) bool {
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		if clause := n.NamedChild(i); clause.Kind() == "import_clause" && hasChild(clause, "namespace_import") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasChild reports whether a node has a child of a kind, named or not:
+// a token (async, default, ?) or a node (accessibility_modifier).
+func hasChild(n *sitter.Node, kind string) bool {
+	for i := uint(0); i < n.ChildCount(); i++ {
+		if n.Child(i).Kind() == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // languageOf picks the grammar for a file: TSX for .tsx files, which
@@ -197,6 +311,9 @@ func (p *parser) declaration(n *sitter.Node, exported bool) {
 	case "function_declaration", "generator_function_declaration":
 		if name := n.ChildByFieldName("name"); name != nil {
 			p.units = append(p.units, p.unit(name.Utf8Text(p.src), n, n, exported))
+			if makesObject(n.ChildByFieldName("body")) {
+				p.typedAs(n, name.Utf8Text(p.src), n.ChildByFieldName("return_type"))
+			}
 		}
 	case "lexical_declaration", "variable_declaration":
 		kind := n.ChildByFieldName("kind")
@@ -204,18 +321,27 @@ func (p *parser) declaration(n *sitter.Node, exported bool) {
 		for i := uint(0); i < n.NamedChildCount(); i++ {
 			d := n.NamedChild(i)
 			name, value := d.ChildByFieldName("name"), d.ChildByFieldName("value")
+			if name != nil && value != nil && unwrapped(value).Kind() == "object" {
+				p.typedAs(d, name.Utf8Text(p.src), d.ChildByFieldName("type"))
+			}
 			switch {
 			case d.Kind() != "variable_declarator" || name == nil || name.Kind() != "identifier" || value == nil:
 			case isFunction(unwrapped(value)):
 				p.units = append(p.units, p.unit(name.Utf8Text(p.src), d, unwrapped(value), exported))
+				if fn := unwrapped(value); makesObject(fn.ChildByFieldName("body")) {
+					p.typedAs(d, name.Utf8Text(p.src), fn.ChildByFieldName("return_type"))
+				}
 			case constant && isConstant(value) && (!exported || !p.routeOption(name.Utf8Text(p.src))):
 				p.constant(name, value)
 			}
 		}
 	case "class_declaration", "abstract_class_declaration":
 		p.members(n, exported)
+		p.implementations(n)
 	case "interface_declaration":
 		p.structure(n, n.ChildByFieldName("body"))
+		p.contract(n, exported)
+		p.bases(n)
 	case "type_alias_declaration":
 		switch value := n.ChildByFieldName("value"); {
 		case value == nil:
@@ -227,6 +353,21 @@ func (p *parser) declaration(n *sitter.Node, exported bool) {
 	case "enum_declaration":
 		p.enum(n)
 	}
+}
+
+// frameworkExports are the names under which Next.js calls a module's
+// exported functions: a page's data functions, a route's handlers, the
+// app router's metadata and static parameters, middleware (proxy since
+// Next.js 16) and instrumentation; and Remix's and SvelteKit's route
+// modules' data functions. Unlike routeOptions, they count in any file:
+// a function of such a name elsewhere is only missed as unused.
+var frameworkExports = map[string]bool{
+	"getStaticProps": true, "getStaticPaths": true, "getServerSideProps": true,
+	"generateMetadata": true, "generateStaticParams": true, "generateViewport": true,
+	"generateImageMetadata": true, "generateSitemaps": true, "middleware": true, "proxy": true,
+	"register": true, "onRequestError": true,
+	"loader": true, "action": true, "clientLoader": true, "clientAction": true, "load": true,
+	"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true, "HEAD": true, "OPTIONS": true,
 }
 
 // routeOptions are the names under which a Next.js page, layout or route
@@ -243,6 +384,37 @@ func (p *parser) routeOption(name string) bool {
 	switch strings.TrimSuffix(base, path.Ext(base)) {
 	case "page", "layout", "route":
 		return routeOptions[name]
+	}
+	return false
+}
+
+// makesObject reports whether a function body returns an object literal,
+// as a factory implementing an interface does; one returning an instance
+// of a class leaves the class the implementation.
+func makesObject(body *sitter.Node) bool {
+	if body == nil {
+		return false
+	}
+	if body.Kind() != "statement_block" {
+		return unwrapped(body).Kind() == "object" // () => ({ ... })
+	}
+	return returnsObject(body)
+}
+
+// returnsObject reports whether a return in n, outside nested functions,
+// returns an object literal.
+func returnsObject(n *sitter.Node) bool {
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		c := n.NamedChild(i)
+		switch {
+		case isFunction(c):
+		case c.Kind() == "return_statement":
+			if c.NamedChildCount() > 0 && unwrapped(c.NamedChild(0)).Kind() == "object" {
+				return true
+			}
+		case returnsObject(c):
+			return true
+		}
 	}
 	return false
 }
@@ -303,7 +475,8 @@ func (p *parser) constant(name, value *sitter.Node) {
 // structure records an interface or object type as a struct of its
 // properties, each with its type as written, an optional one's as
 // T|undefined; methods are left out. An interface's bases are a field
-// named extends (extends:Base,Other<T>): they are part of its type.
+// named extends (extends:Base,Other<T>): they are part of its type. Each
+// property's named type is recorded too, as a class field's is.
 func (p *parser) structure(decl, body *sitter.Node) {
 	name := decl.ChildByFieldName("name")
 	if name == nil || body == nil {
@@ -330,6 +503,7 @@ func (p *parser) structure(decl, body *sitter.Node) {
 			t += "|undefined"
 		}
 		s.Fields = append(s.Fields, unit.Field{Name: field.Utf8Text(p.src), Type: t, Line: syntax.Line(prop.StartPosition())})
+		p.addFieldType(s.Name, field, p.typeOf(typ.NamedChild(0)))
 	}
 	p.decls.Structs = append(p.decls.Structs, s)
 }
@@ -345,14 +519,7 @@ func typeList(clause *sitter.Node, src []byte) string {
 
 // optional reports whether a property is optional (a?: T): its value may
 // be undefined.
-func optional(prop *sitter.Node) bool {
-	for i := uint(0); i < prop.ChildCount(); i++ {
-		if prop.Child(i).Kind() == "?" {
-			return true
-		}
-	}
-	return false
-}
+func optional(prop *sitter.Node) bool { return hasChild(prop, "?") }
 
 // enum records an enum, a variant's initialiser as its payload ("=10").
 func (p *parser) enum(decl *sitter.Node) {
@@ -450,6 +617,7 @@ func (p *parser) members(class *sitter.Node, exported bool) {
 	for i := uint(0); i < body.NamedChildCount(); i++ {
 		m := body.NamedChild(i)
 		member, fn := m.ChildByFieldName("name"), m
+		p.fieldTypes(name.Utf8Text(p.src), m)
 		if m.Kind() == "public_field_definition" {
 			fn = nil
 			if value := m.ChildByFieldName("value"); value != nil {
@@ -463,6 +631,142 @@ func (p *parser) members(class *sitter.Node, exported bool) {
 		u.Dispatched = true // it may implement an interface, which TypeScript checks by shape
 		p.units = append(p.units, u)
 	}
+}
+
+// fieldTypes records the type of a class member that is a field: a typed
+// field (clock: Clock), one set with new (cache = new Cache()), or a
+// constructor's parameter property (constructor(private repo: Repo)).
+func (p *parser) fieldTypes(class string, m *sitter.Node) {
+	switch name := m.ChildByFieldName("name"); {
+	case m.Kind() == "public_field_definition":
+		p.addFieldType(class, name, p.declaredType(m))
+	case m.Kind() == "method_definition" && name != nil && name.Utf8Text(p.src) == "constructor":
+		eachParam(m, func(param, field, typ *sitter.Node) {
+			if hasChild(param, "accessibility_modifier") || hasChild(param, "readonly") {
+				p.addFieldType(class, field, p.typeOf(typ))
+			}
+		})
+	}
+}
+
+// addFieldType records that a class's, interface's or object type's
+// field has a type, as Call.Type writes it, when it has one.
+func (p *parser) addFieldType(owner string, field *sitter.Node, typ string) {
+	if field != nil && typ != "" {
+		p.decls.FieldTypes = append(p.decls.FieldTypes, unit.FieldType{Struct: owner, Field: field.Utf8Text(p.src), Type: typ, File: p.file, Test: p.test})
+	}
+}
+
+// declaredType returns the type a variable or field declaration states:
+// its annotation's (x: Repo), or the class its value makes (new Repo()).
+func (p *parser) declaredType(n *sitter.Node) string {
+	if annotation := n.ChildByFieldName("type"); annotation != nil {
+		return p.typeOf(annotation.NamedChild(0))
+	}
+	if value := n.ChildByFieldName("value"); value != nil && unwrapped(value).Kind() == "new_expression" {
+		return p.typeOf(unwrapped(value).ChildByFieldName("constructor"))
+	}
+	return ""
+}
+
+// typeOf returns a named type (Repo, Cache<T>) as Call.Type writes it,
+// without type arguments: an imported one qualified by the module it is
+// imported from and its exported name (../store/users.UserRepo), a local
+// one bare; "" for any other type (string[], A | B).
+func (p *parser) typeOf(n *sitter.Node) string {
+	if n != nil && n.Kind() == "generic_type" {
+		n = n.ChildByFieldName("name")
+	}
+	if n == nil || (n.Kind() != "type_identifier" && n.Kind() != "identifier") {
+		return ""
+	}
+	name := n.Utf8Text(p.src)
+	if im, ok := p.imports[name]; ok && im.name != "" {
+		return im.module + "." + im.name
+	}
+	return name
+}
+
+// contract records an interface declaring methods as a trait, the
+// contract classes implement; one of properties only is a data shape.
+// ddslop:ignore fills unit.Trait as addEnum fills unit.Enum; only a data model change could merge them
+func (p *parser) contract(decl *sitter.Node, exported bool) {
+	name, body := decl.ChildByFieldName("name"), decl.ChildByFieldName("body")
+	if name == nil || body == nil {
+		return
+	}
+	var methods []string
+	for i := uint(0); i < body.NamedChildCount(); i++ {
+		if m := body.NamedChild(i); m.Kind() == "method_signature" && m.ChildByFieldName("name") != nil {
+			methods = append(methods, m.ChildByFieldName("name").Utf8Text(p.src))
+		}
+	}
+	if len(methods) == 0 {
+		return
+	}
+	p.decls.Traits = append(p.decls.Traits, unit.Trait{
+		File: p.file, Name: name.Utf8Text(p.src),
+		StartLine: syntax.Line(decl.StartPosition()), EndLine: syntax.Line(decl.EndPosition()),
+		Nodes: syntax.CountNodes(decl), Public: exported, Test: p.test, Methods: methods,
+	})
+}
+
+// implementations records a class's name, and each interface it
+// implements (class Repo implements IRepo) as an impl of that trait.
+func (p *parser) implementations(class *sitter.Node) {
+	name := class.ChildByFieldName("name")
+	if name == nil {
+		return
+	}
+	p.decls.TypeNames = append(p.decls.TypeNames, name.Utf8Text(p.src))
+	for i := uint(0); i < class.NamedChildCount(); i++ {
+		if heritage := class.NamedChild(i); heritage.Kind() == "class_heritage" {
+			p.implementedIn(class, heritage, "implements_clause", name.Utf8Text(p.src))
+		}
+	}
+}
+
+// typedAs records an object typed as an interface (const mem: IRepo =
+// {...}), or a function whose result is typed as one (a factory, (): IRepo
+// => ({...})), as implementing it: the interface has an implementation
+// besides its classes. annotation is the declared type, if any.
+func (p *parser) typedAs(decl *sitter.Node, name string, annotation *sitter.Node) {
+	if annotation != nil {
+		p.implementation(decl, name, annotation.NamedChild(0))
+	}
+}
+
+// bases records each interface an interface extends as implemented by
+// it: every class implementing it implements those too, so they are no
+// single class's.
+func (p *parser) bases(decl *sitter.Node) {
+	if name := decl.ChildByFieldName("name"); name != nil {
+		p.implementedIn(decl, decl, "extends_type_clause", name.Utf8Text(p.src))
+	}
+}
+
+// implementedIn records the declaration decl, named name, as implementing
+// each interface listed by the clauses of a kind among holder's children.
+func (p *parser) implementedIn(decl, holder *sitter.Node, clause, name string) {
+	for i := uint(0); i < holder.NamedChildCount(); i++ {
+		c := holder.NamedChild(i)
+		for j := uint(0); c.Kind() == clause && j < c.NamedChildCount(); j++ {
+			p.implementation(decl, name, c.NamedChild(j))
+		}
+	}
+}
+
+// implementation records that a class, or an interface extending it,
+// implements the interface typ.
+func (p *parser) implementation(decl *sitter.Node, name string, typ *sitter.Node) {
+	path := p.typeOf(typ)
+	if path == "" {
+		return
+	}
+	p.decls.Impls = append(p.decls.Impls, unit.Impl{
+		File: p.file, Trait: path[strings.LastIndex(path, ".")+1:], TraitPath: path, Type: name,
+		StartLine: syntax.Line(decl.StartPosition()), EndLine: syntax.Line(decl.EndPosition()), Test: p.test,
+	})
 }
 
 // isFunction reports whether a value is a function expression of any kind.
@@ -486,7 +790,20 @@ func isPrivate(m, name *sitter.Node) bool {
 
 // unit makes a unit of the declaration n, whose own function is fn.
 func (p *parser) unit(name string, n, fn *sitter.Node, public bool) unit.Unit {
-	s := syntax.Flatten(n, p.src, grammar{fn: syntax.Span(fn), imports: p.imports})
+	vars := map[string]string{}
+	if param := fn.ChildByFieldName("parameter"); param != nil {
+		vars[param.Utf8Text(p.src)] = "" // x => f(x)
+	}
+	otherThis := 0
+	g := grammar{fn: syntax.Span(fn), imports: p.imports, vars: vars, otherThis: &otherThis, p: p}
+	eachParam(fn, func(param, name, typ *sitter.Node) {
+		if name != nil {
+			vars[name.Utf8Text(p.src)] = p.typeOf(typ)
+		} else {
+			g.bind(param.ChildByFieldName("pattern"), p.src)
+		}
+	})
+	s := syntax.Flatten(n, p.src, g)
 	ps, _ := params(fn, p.src)
 	return unit.Unit{
 		File:      p.file,
@@ -511,11 +828,12 @@ func (p *parser) unit(name string, n, fn *sitter.Node, public bool) unit.Unit {
 
 // IsTestPath reports whether a file is test code by the conventions of
 // TypeScript test runners: a .test or .spec file, or a file under a
-// __tests__ directory.
+// __tests__ directory; or a Storybook .stories file, whose exports
+// Storybook loads.
 func IsTestPath(file string) bool {
 	slashed := filepath.ToSlash(file)
 	base := path.Base(slashed)
 	stem := strings.TrimSuffix(base, path.Ext(base))
-	return strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec") ||
+	return strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec") || strings.HasSuffix(stem, ".stories") ||
 		slices.Contains(strings.Split(path.Dir(slashed), "/"), "__tests__")
 }

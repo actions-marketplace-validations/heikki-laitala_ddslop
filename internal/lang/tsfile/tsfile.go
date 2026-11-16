@@ -4,6 +4,7 @@
 package tsfile
 
 import (
+	"encoding/json"
 	"path"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,16 @@ import (
 
 // Extensions are the file extensions of TypeScript source.
 var Extensions = []string{".ts", ".tsx", ".mts", ".cts"}
+
+// Importers are the extensions of files that may import TypeScript code
+// without being TypeScript: JavaScript, and the components of Vue,
+// Svelte, Astro and MDX.
+var Importers = []string{".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro", ".mdx"}
+
+// Configs are the extensions of files that may name a TypeScript export
+// as an entry point without importing it: a Lambda handler in
+// serverless.yml, a script in package.json.
+var Configs = []string{".json", ".yml", ".yaml", ".toml", ".html"}
 
 // IsSource reports whether a file is TypeScript source, by its extension.
 func IsSource(file string) bool {
@@ -34,6 +45,24 @@ func ModuleIs(importer, module, file string) bool {
 	return stem == named || stem == named+"/index"
 }
 
+// AliasMayBe reports whether a module path written through a path alias
+// ("@/db/schema", "~/server/db") or a package.json import ("#db/schema"),
+// which only the project's configuration resolves, may name file: one whose path, without extension,
+// ends in the path after the alias, or in its index file. It errs towards
+// yes, for uses that may only drop findings.
+func AliasMayBe(module, file string) bool {
+	rest, imported := strings.CutPrefix(module, "#")
+	if imported {
+		rest = strings.TrimPrefix(rest, "/")
+	} else if alias, after, ok := strings.Cut(module, "/"); ok && (alias == "@" || alias == "~") {
+		rest = after
+	} else {
+		return false
+	}
+	stem := "/" + strings.TrimSuffix(filepath.ToSlash(file), path.Ext(file))
+	return strings.HasSuffix(stem, "/"+rest) || strings.HasSuffix(stem, "/"+rest+"/index")
+}
+
 // IsDeclarationFile reports whether a file only declares types for code
 // elsewhere (.d.ts): it holds no code to compare.
 func IsDeclarationFile(file string) bool {
@@ -43,4 +72,54 @@ func IsDeclarationFile(file string) bool {
 		}
 	}
 	return false
+}
+
+// Manifest is what a package.json says of its package: its name
+// (@acme/db), and whether it is private, never published.
+type Manifest struct {
+	Name    string `json:"name"`
+	Private bool   `json:"private"`
+}
+
+// ReadManifest reads a package.json, reporting false when it is no JSON.
+func ReadManifest(data []byte) (Manifest, bool) {
+	var m Manifest
+	return m, json.Unmarshal(data, &m) == nil
+}
+
+// PackageDir returns the nearest directory above a file that packages
+// holds, "." when none does.
+func PackageDir[T any](file string, packages map[string]T) string {
+	dir := filepath.ToSlash(filepath.Dir(file))
+	for {
+		if _, ok := packages[dir]; ok || dir == "." || dir == "/" {
+			return dir
+		}
+		dir = path.Dir(dir)
+	}
+}
+
+// ModuleFiles reports, for a file, whether it is the module a module path
+// names as importer imports it: the file a relative path names (see
+// ModuleIs), or one of the workspace package a package path names
+// (@acme/db, @acme/db/query; packages maps each named package's directory
+// to its name), outside the packages nested in it.
+func ModuleFiles(importer, module string, packages map[string]string) func(file string) bool {
+	if dir, ok := packageNamed(module, packages); ok {
+		return func(file string) bool { return PackageDir(file, packages) == dir }
+	}
+	return func(file string) bool { return ModuleIs(importer, module, file) }
+}
+
+// packageNamed returns the directory of the workspace package a module
+// path names, itself or a subpath of it, when exactly one package has
+// that name.
+func packageNamed(module string, packages map[string]string) (string, bool) {
+	found, n := "", 0
+	for dir, name := range packages {
+		if module == name || strings.HasPrefix(module, name+"/") {
+			found, n = dir, n+1
+		}
+	}
+	return found, n == 1
 }

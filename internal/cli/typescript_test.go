@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -50,9 +52,9 @@ func TestCheckReportsCopiesInTypeScriptCode(t *testing.T) {
 	}
 }
 
-// TypeScript calls through package imports are not followed, so no
-// exported function is known to be unused, even in an unpublished Rust
-// crate's directory (a Tauri app's frontend).
+// A TypeScript package is internal by its own package.json, not by the
+// Rust crate whose directory holds it (a Tauri app's frontend): with no
+// private package.json, no export is known to be unused.
 func TestTypeScriptExportsAreNotReportedUnused(t *testing.T) {
 	root := repo(t, map[string]string{
 		"Cargo.toml":    "[package]\nname = \"app\"\npublish = false\n",
@@ -300,4 +302,205 @@ export function canCancel(state: string): boolean {
 	_, stdout, _ := run("check", "--format", "json", root)
 
 	testutil.Lines(t, "candidates", candidateLines(decode(t, stdout), "duplicate-constant", "string-kinds", "inlined-constant"), nil)
+}
+
+// A call through a workspace package's name (@acme/db) finds the
+// function that package exports, so a wrapper around it is one.
+func TestCheckFollowsTypeScriptWorkspacePackages(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json":                `{"name": "acme", "private": true, "workspaces": ["packages/*"]}`,
+		"packages/db/package.json":    `{"name": "@acme/db", "main": "dist/index.js"}`,
+		"packages/db/src/index.ts":    `export * from "./query";` + "\n",
+		"packages/db/src/query.ts":    "export function query(sql: string) {\n  const trimmed = sql.trim();\n  return trimmed.length;\n}\n",
+		"packages/api/package.json":   `{"name": "@acme/api"}`,
+		"packages/api/src/handler.ts": "import { query } from \"@acme/db\";\n\nexport function select(sql: string) {\n  return query(sql);\n}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "wrappers", candidateLines(decode(t, stdout), "pass-through"), []string{
+		"typescript pass-through [packages/api/src/handler.ts select]",
+	})
+}
+
+// A private package's exports serve only the analysed code: one nothing
+// names is unused. A default export, a framework's function and the
+// exports of a module imported whole are called without their names.
+func TestCheckReportsUnusedExportsOfPrivateTypeScriptPackages(t *testing.T) {
+	root := repo(t, map[string]string{
+		"apps/web/package.json":        `{"name": "web", "private": true}`,
+		"apps/web/src/util.ts":         "export function usedHelper(s: string) {\n  return s.trim();\n}\n\nexport function forgottenHelper(s: string) {\n  return s.toUpperCase();\n}\n",
+		"apps/web/src/pages/index.tsx": "import { usedHelper } from \"../util\";\n\nexport default function Home() {\n  return usedHelper(\" x \");\n}\n\nexport async function getStaticProps() {\n  return { props: {} };\n}\n",
+		"apps/web/src/db/schema.ts":    "export function postRelations() {\n  return [];\n}\n",
+		"apps/web/src/db/client.ts":    "import * as schema from \"./schema\";\n\nexport const db = { schema };\n",
+		"apps/web/src/auth/schema.ts":  "export function sessionRelations() {\n  return [];\n}\n",
+		"apps/web/src/auth/client.ts":  "import * as schema from \"@/auth/schema\";\n\nexport const auth = { schema };\n",
+		"apps/web/src/util.test.ts":    "export function fixtureOnly() {\n  return 1;\n}\n",
+		"packages/lib/package.json":    `{"name": "@acme/lib"}`,
+		"packages/lib/src/index.ts":    "export function publishedApi() {\n  return 1;\n}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), []string{
+		"typescript dead-code [apps/web/src/util.ts forgottenHelper]",
+	})
+}
+
+// An interface a single class implements is an abstraction nothing uses,
+// unless a test names it: its fake is a second implementation.
+func TestCheckReportsTypeScriptInterfacesWithOneImplementation(t *testing.T) {
+	root := repo(t, map[string]string{
+		"apps/web/package.json":      `{"name": "web", "private": true}`,
+		"apps/web/src/repo.ts":       "export interface IRepo {\n  find(id: string): string;\n}\n\nexport class Repo implements IRepo {\n  find(id: string) {\n    return id;\n  }\n}\n",
+		"apps/web/src/clock.ts":      "export interface IClock {\n  now(): number;\n}\n\nexport class SystemClock implements IClock {\n  now() {\n    return Date.now();\n  }\n}\n",
+		"apps/web/src/clock.test.ts": "import type { IClock } from \"./clock\";\n\nconst fake: IClock = { now: () => 1 };\n",
+		"packages/lib/package.json":  `{"name": "@acme/lib"}`,
+		"packages/lib/src/api.ts":    "export interface IApi {\n  call(): void;\n}\n\nexport class Api implements IApi {\n  call() {}\n}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "single implementations", candidateLines(decode(t, stdout), "single-impl-trait"), []string{
+		"typescript single-impl-trait [apps/web/src/repo.ts IRepo, apps/web/src/repo.ts IRepo for Repo]",
+	})
+}
+
+// TypeScript checks an interface by shape: a class declaring all its
+// methods implements it without saying so, and is a second one.
+func TestAClassOfAnInterfacesShapeImplementsIt(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json": `{"name": "web", "private": true}`,
+		"src/repo.ts":  "export interface IRepo {\n  find(id: string): string;\n}\n\nexport class Repo implements IRepo {\n  find(id: string) {\n    return id;\n  }\n}\n",
+		"src/pg.ts":    "export class PgRepo {\n  find(id: string) {\n    return id;\n  }\n  close() {}\n}\n",
+		"src/clock.ts": "export interface IClock {\n  now(): number;\n  tick(): void;\n}\n\nexport class SystemClock implements IClock {\n  now() {\n    return 1;\n  }\n  tick() {}\n}\n",
+		"src/timer.ts": "export class Timer {\n  now() {\n    return 2;\n  }\n}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "single implementations", candidateLines(decode(t, stdout), "single-impl-trait"), []string{
+		"typescript single-impl-trait [src/clock.ts IClock, src/clock.ts IClock for SystemClock]",
+	})
+}
+
+// A Rust trait and a TypeScript class are of two languages: a class
+// named like the type a Rust impl is for makes that type no type of ours.
+func TestSingleImplementationsKeepTheirLanguage(t *testing.T) {
+	root := repo(t, map[string]string{
+		"Cargo.toml":       "[package]\nname = \"app\"\npublish = false\n",
+		"src/lib.rs":       "trait Codec {\n    fn encode(&self) -> String;\n}\n\nimpl Codec for Value {\n    fn encode(&self) -> String {\n        String::new()\n    }\n}\n",
+		"web/package.json": `{"name": "web", "private": true}`,
+		"web/src/value.ts": "export class Value {}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "single implementations", candidateLines(decode(t, stdout), "single-impl-trait"), nil)
+}
+
+// Files ddslop does not analyse (.vue, .js) call TypeScript exports too:
+// one they name is not unused.
+func TestExportsOnlyOtherFilesNameAreNotUnused(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json":                  `{"name": "web", "private": true}`,
+		"src/composables/useCounter.ts": "export function useCounter() {\n  return 1;\n}\n",
+		"src/composables/useTitle.ts":   "export function useTitle() {\n  return \"\";\n}\n",
+		"src/components/Counter.vue":    "<script setup>\nimport { useCounter } from \"../composables/useCounter\";\nconst n = useCounter();\n</script>\n",
+		"src/legacy.js":                 "import { useTitle } from \"./composables/useTitle\";\nuseTitle();\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), nil)
+}
+
+// Entry points that only a deployment config names (a Lambda handler in
+// serverless.yml), that Storybook loads (stories) or that a router calls
+// (Remix's loader and action, SvelteKit's load) are not unused.
+func TestEntryPointsFrameworksCallAreNotUnused(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json":             `{"name": "web", "private": true}`,
+		"serverless.yml":           "functions:\n  hello:\n    handler: src/handler.handler\n",
+		"src/handler.ts":           "export const handler = async () => {\n  return 1;\n};\n",
+		"src/Button.stories.tsx":   "export const WithIcon = () => {\n  return 1;\n};\n",
+		"app/routes/posts.tsx":     "export async function loader() {\n  return 1;\n}\n\nexport async function action() {\n  return 2;\n}\n",
+		"src/routes/blog/+page.ts": "export function load() {\n  return 1;\n}\n",
+		"src/forgotten.ts":         "export function forgotten() {\n  return 1;\n}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), []string{
+		"typescript dead-code [src/forgotten.ts forgotten]",
+	})
+}
+
+// A file that only adds to the word count, and cannot be read (a dangling
+// symlink), is skipped: it fails no check.
+func TestAnUnreadableImporterIsSkipped(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json": `{"name": "web", "private": true}`,
+		"src/main.ts":  "export function forgotten() {\n  return 1;\n}\n",
+	})
+	if err := os.Symlink(filepath.Join(root, "missing.js"), filepath.Join(root, "src", "broken.js")); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := run("check", "--format", "json", root)
+
+	if code != 1 {
+		t.Fatalf("exit %d, stderr %q, want 1", code, stderr)
+	}
+	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), []string{
+		"typescript dead-code [src/main.ts forgotten]",
+	})
+}
+
+// A module imported whole through its workspace package's name may have
+// any export used, as drizzle uses a schema package's relations.
+func TestExportsOfAWorkspacePackageImportedWholeAreNotUnused(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json":               `{"name": "acme", "private": true}`,
+		"packages/db/package.json":   `{"name": "@acme/db", "private": true}`,
+		"packages/db/src/schema.ts":  "export function usersRelations() {\n  return [];\n}\n",
+		"packages/app/package.json":  `{"name": "@acme/app", "private": true}`,
+		"packages/app/src/client.ts": "import * as schema from \"@acme/db\";\n\nexport const db = { schema };\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), nil)
+}
+
+// An interface another extends has the classes implementing that one as
+// implementations too: it is no single implementation's.
+func TestAnExtendedInterfaceIsNoSingleImplementation(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json":  `{"name": "web", "private": true}`,
+		"src/store.ts":  "export interface Store {\n  get(): string;\n}\n\nexport interface CachedStore extends Store {\n  flush(): void;\n}\n",
+		"src/disk.ts":   "import type { Store } from \"./store\";\n\nexport class DiskStore implements Store {\n  get() {\n    return \"disk\";\n  }\n}\n",
+		"src/memory.ts": "import type { CachedStore } from \"./store\";\n\nexport class MemStore implements CachedStore {\n  get() {\n    return \"mem\";\n  }\n  flush() {}\n}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "single implementations", candidateLines(decode(t, stdout), "single-impl-trait"), []string{
+		"typescript single-impl-trait [src/store.ts CachedStore, src/memory.ts CachedStore for MemStore]",
+	})
+}
+
+// A file .ddslop.yaml excludes (a committed build bundle) is not read for
+// the names it mentions: its copy of every export uses none.
+func TestExcludedFilesDoNotUseExports(t *testing.T) {
+	root := repo(t, map[string]string{
+		".ddslop.yaml":   "exclude:\n  - dist/**\n",
+		"package.json":   `{"name": "action", "private": true}`,
+		"src/main.ts":    "export function forgotten() {\n  return 1;\n}\n",
+		"dist/bundle.js": "function forgotten() { return 1; }\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), []string{"typescript dead-code [src/main.ts forgotten]"})
 }

@@ -27,7 +27,9 @@ type grammar struct {
 	self    string
 	generic map[string]string
 	imports map[string]string
-	vars    map[string]syntax.Operand
+	// vars holds the variables in scope; Rust assignments keep a variable's
+	// type, so a scope restores them exactly as they were.
+	vars map[string]syntax.Operand
 	// entries holds the variables as each open if found them, by the if's
 	// span, for its else.
 	entries *map[[2]uint]map[string]syntax.Operand
@@ -77,13 +79,13 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 		return func() { g.let(n, s.Src) }
 	case "closure_expression":
 		s.Closures++
-		restore := g.scope()
+		restore := syntax.Scope(g.vars)
 		if params := n.ChildByFieldName("parameters"); params != nil {
 			g.forget(params, s.Src)
 		}
 		return func() { s.Closures--; restore() }
 	case "match_arm":
-		restore := g.scope()
+		restore := syntax.Scope(g.vars)
 		if pattern := n.ChildByFieldName("pattern"); pattern != nil {
 			var value *sitter.Node
 			if block := n.Parent(); block != nil && block.Parent() != nil {
@@ -95,7 +97,7 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 	case "block":
 		// A for's pattern is in scope in its body alone, after the
 		// iterator. A block's use declarations hold throughout it.
-		restore := g.scope()
+		restore := syntax.Scope(g.vars)
 		if p := n.Parent(); p != nil && p.Kind() == "for_expression" && sameNode(p.ChildByFieldName("body"), n) {
 			if pattern := p.ChildByFieldName("pattern"); pattern != nil {
 				g.forget(pattern, s.Src)
@@ -118,7 +120,7 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 		// the if or while ends; an else starts from the variables as the
 		// if found them.
 		(*g.entries)[span(n)] = maps.Clone(g.vars)
-		restore := g.scope()
+		restore := syntax.Scope(g.vars)
 		return func() { delete(*g.entries, span(n)); restore() }
 	case "let_condition":
 		return func() {
@@ -146,17 +148,6 @@ func span(n *sitter.Node) [2]uint {
 // sameNode reports whether a and b are the same syntax node.
 func sameNode(a, b *sitter.Node) bool {
 	return a != nil && b != nil && span(a) == span(b)
-}
-
-// scope opens a lexical scope: the bindings made in it are undone by the
-// function it returns. Rust assignments keep a variable's type, so the
-// variables as they were are exactly what holds after it.
-func (g grammar) scope() func() {
-	outer := maps.Clone(g.vars)
-	return func() {
-		clear(g.vars)
-		maps.Copy(g.vars, outer)
-	}
 }
 
 // produced is a call's result: the call's syntax node and the result's
@@ -795,13 +786,20 @@ func Traits(src []byte) []string {
 // Imports maps each name a file brings into scope with use to the path it
 // refers to: "use a::b::{c, d as e}" gives c -> a::b::c and e -> a::b::d.
 // Wildcard imports and imports inside #[cfg(test)] modules are skipped.
-func Imports(src []byte) map[string]string {
-	var out map[string]string
-	_ = syntax.Parse(language, src, func(root *sitter.Node) { out = importsOf(root, src) })
-	return out
+// The second map is the file's own scope's: its top-level use
+// declarations, not those of an inline module, a function or a block,
+// with each glob (use a::b::*) under "*" and its source.
+func Imports(src []byte) (all, top map[string]string) {
+	_ = syntax.Parse(language, src, func(root *sitter.Node) {
+		all, top = importsOf(root, src), usesIn(root, src)
+		// A glob names no one item: only the root's are followed, through
+		// their source modules' items.
+		maps.DeleteFunc(all, func(name, _ string) bool { return strings.HasPrefix(name, "*") })
+	})
+	return all, top
 }
 
-// importsOf is Imports for a parsed file's root.
+// importsOf is the first map of Imports for a parsed file's root.
 func importsOf(root *sitter.Node, src []byte) map[string]string {
 	out := map[string]string{}
 	var walk func(n *sitter.Node)
@@ -867,6 +865,16 @@ func collectUse(n *sitter.Node, prefix string, src []byte, out map[string]string
 		for i := uint(0); i < n.NamedChildCount(); i++ {
 			collectUse(n.NamedChild(i), prefix, src, out)
 		}
+	case "use_wildcard":
+		// use a::b::* names no one item: it is recorded under "*" and its
+		// source, a key no name can be.
+		path := prefix
+		if n.NamedChildCount() > 0 {
+			path = join(n.NamedChild(0).Utf8Text(src))
+		}
+		if path != "" {
+			out["*"+path] = path
+		}
 	}
 }
 
@@ -915,15 +923,28 @@ func (e *extractor) visibleImports(item *sitter.Node) map[string]string {
 }
 
 // usesIn returns the imports of the use declarations directly in a
-// module's item list or a block, as Imports gives them.
+// module's item list or a block, as Imports gives them, but those marked
+// #[cfg(test)], which are test code's.
+//
+// ddslop:ignore Rust's use walk; TypeScript's import walk reads another grammar
 func usesIn(container *sitter.Node, src []byte) map[string]string {
 	out := map[string]string{}
+	test := false
 	for i := uint(0); i < container.NamedChildCount(); i++ {
-		if n := container.NamedChild(i); n.Kind() == "use_declaration" {
+		n := container.NamedChild(i)
+		if n.IsExtra() {
+			continue // a comment between an attribute and its item
+		}
+		if n.Kind() == "attribute_item" {
+			test = test || isCfgTest(n.Utf8Text(src))
+			continue
+		}
+		if n.Kind() == "use_declaration" && !test {
 			if arg := n.ChildByFieldName("argument"); arg != nil {
 				collectUse(arg, "", src, out)
 			}
 		}
+		test = false
 	}
 	return out
 }
@@ -1826,7 +1847,7 @@ func manifestValues(cargoToml []byte, key string, sections ...string) []string {
 // name;), at its top level, in source order: each one's name, or the file
 // a #[path] attribute places it in, ending in .rs.
 func DeclaredModules(src []byte) []string {
-	return outOfLineModules(src, func(name string, attrs []string) string {
+	return topModules(src, false, func(name string, attrs []string) string {
 		for _, attr := range attrs {
 			if file, ok := pathAttribute(attr); ok {
 				return file
@@ -1852,7 +1873,7 @@ func pathAttribute(attr string) (string, bool) {
 //
 // Only declarations at the top level of the file are considered.
 func TestModules(src []byte) []string {
-	return outOfLineModules(src, func(name string, attrs []string) string {
+	return topModules(src, false, func(name string, attrs []string) string {
 		if slices.ContainsFunc(attrs, isCfgTest) {
 			return name
 		}
@@ -1860,11 +1881,41 @@ func TestModules(src []byte) []string {
 	})
 }
 
-// outOfLineModules returns, for the modules a file declares out of line at
-// its top level, what entry makes of each one's name and attributes, ""
-// leaving it out.
-func outOfLineModules(src []byte, entry func(name string, attrs []string) string) []string {
+// InlineModules returns the names of the modules a file declares inline
+// (mod name { ... }) at its top level, in source order.
+func InlineModules(src []byte) []string {
+	return topModules(src, true, func(name string, _ []string) string { return name })
+}
+
+// topModules returns, for the modules a file declares at its top level,
+// inline ones or out-of-line ones, what entry makes of each one's name and
+// attributes, "" leaving it out.
+func topModules(src []byte, inline bool, entry func(name string, attrs []string) string) []string {
+	return topItems(src, func(item *sitter.Node, _ []string) bool {
+		return item.Kind() == "mod_item" && (item.ChildByFieldName("body") != nil) == inline
+	}, entry)
+}
+
+// topItems returns, for each item at the top of a file that keep accepts,
+// what entry makes of its name and attributes, "" leaving it out.
+func topItems(src []byte, keep func(item *sitter.Node, attrs []string) bool, entry func(name string, attrs []string) string) []string {
 	var names []string
+	topLevel(src, func(item *sitter.Node, attrs []string) {
+		if !keep(item, attrs) {
+			return
+		}
+		if name := item.ChildByFieldName("name"); name != nil {
+			if e := entry(name.Utf8Text(src), attrs); e != "" {
+				names = append(names, e)
+			}
+		}
+	})
+	return names
+}
+
+// topLevel parses src and calls visit with each item at the top of the
+// file and the attributes written above it.
+func topLevel(src []byte, visit func(item *sitter.Node, attrs []string)) {
 	_ = syntax.Parse(language, src, func(root *sitter.Node) {
 		var attrs []string
 		for i := uint(0); i < root.ChildCount(); i++ {
@@ -1875,17 +1926,70 @@ func outOfLineModules(src []byte, entry func(name string, attrs []string) string
 				continue
 			case child.IsExtra():
 				continue
-			case child.Kind() == "mod_item" && child.ChildByFieldName("body") == nil:
-				if name := child.ChildByFieldName("name"); name != nil {
-					if e := entry(name.Utf8Text(src), attrs); e != "" {
-						names = append(names, e)
-					}
-				}
 			}
+			visit(child, attrs)
 			attrs = nil
 		}
 	})
-	return names
+}
+
+// topItemKinds are the items whose name a file's own scope declares.
+var topItemKinds = map[string]bool{
+	"function_item": true, "struct_item": true, "enum_item": true, "union_item": true, "type_item": true,
+	"trait_item": true, "const_item": true, "static_item": true, "macro_definition": true,
+}
+
+// TopNames returns the names a file declares in its own scope: its
+// top-level functions, types, traits, constants, statics and macros, not
+// those of an inline module, nor test code's.
+func TopNames(src []byte) []string {
+	return topItems(src, func(item *sitter.Node, attrs []string) bool {
+		return topItemKinds[item.Kind()] && !slices.ContainsFunc(attrs, isCfgTest)
+	}, func(name string, _ []string) string { return strings.TrimPrefix(name, "r#") })
+}
+
+// TopExports returns the names a file's own scope makes visible outside
+// its module: what a glob of the module supplies of its own. They are
+// TopNames' items with a visibility, and its public modules.
+func TopExports(src []byte) []string {
+	return topItems(src, func(item *sitter.Node, attrs []string) bool {
+		return (topItemKinds[item.Kind()] || item.Kind() == "mod_item") && visible(item, src) &&
+			!slices.ContainsFunc(attrs, isCfgTest)
+	}, func(name string, _ []string) string { return strings.TrimPrefix(name, "r#") })
+}
+
+// TopReexports returns the names a file's top-level use declarations with
+// a visibility (pub, pub(crate)) bring in, each with its path: what a glob
+// of the file's module supplies besides its items. A visible glob (pub use
+// a::*) is kept under "*" and its source. Test code's uses are left out.
+func TopReexports(src []byte) map[string]string {
+	out := map[string]string{}
+	topLevel(src, func(item *sitter.Node, attrs []string) {
+		if item.Kind() != "use_declaration" || slices.ContainsFunc(attrs, isCfgTest) || !visible(item, src) {
+			return
+		}
+		if arg := item.ChildByFieldName("argument"); arg != nil {
+			collectUse(arg, "", src, out)
+		}
+	})
+	return out
+}
+
+// visible reports whether a declaration of a top-level module reaches the
+// crate root: pub, pub(crate) or pub(super), or pub(in) crate or super.
+// pub(self) and a path inside the module (pub(in crate::facade)) keep it
+// in the module.
+func visible(n *sitter.Node, src []byte) bool {
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		if m := n.NamedChild(i); m.Kind() == "visibility_modifier" {
+			switch strings.Join(strings.Fields(m.Utf8Text(src)), "") {
+			case "pub", "crate", "pub(crate)", "pub(super)", "pub(incrate)", "pub(insuper)":
+				return true
+			}
+			return false
+		}
+	}
+	return false
 }
 
 // Unpublished reports whether a crate is kept out of registries, so its

@@ -572,21 +572,29 @@ type options struct {
 	tests                                 bool
 }
 
+// includedFiles lists the files under root with one of the extensions
+// that .ddslop.yaml does not exclude (see source.Files).
+func includedFiles(root string, exts ...string) ([]string, error) {
+	paths, err := source.Files(root, exts...)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Load(root)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(paths, func(p string) bool { return cfg.Excluded(filepath.ToSlash(p)) }), nil
+}
+
 // syncIndex opens the index under root and brings it up to date with the
 // Rust, Go and TypeScript files there that .ddslop.yaml does not exclude,
 // TypeScript declaration files aside. The caller closes the database.
 func syncIndex(root string) (*index.DB, index.Stats, error) {
-	paths, err := source.Files(root, append([]string{".rs", ".go"}, tsfile.Extensions...)...)
+	paths, err := includedFiles(root, append([]string{".rs", ".go"}, tsfile.Extensions...)...)
 	if err != nil {
 		return nil, index.Stats{}, err
 	}
-	cfg, err := config.Load(root)
-	if err != nil {
-		return nil, index.Stats{}, err
-	}
-	paths = slices.DeleteFunc(paths, func(p string) bool {
-		return cfg.Excluded(filepath.ToSlash(p)) || tsfile.IsDeclarationFile(p)
-	})
+	paths = slices.DeleteFunc(paths, tsfile.IsDeclarationFile)
 	version, err := extractorVersion()
 	if err != nil {
 		return nil, index.Stats{}, err
@@ -649,8 +657,9 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 	var structs []unit.Struct
 	var enums []unit.Enum
 	var consts []unit.Const
-	var decls unit.Decls    // every file's, test code included, for traits
-	var helpers []unit.Unit // test code's helpers, fakes and fixtures, without --tests
+	var funcTypes []unit.FuncType
+	traitDecls := map[string]unit.Decls{} // each language's, test code included, for traits
+	var helpers []unit.Unit               // test code's helpers, fakes and fixtures, without --tests
 	for _, f := range files {
 		if f.Generated {
 			summary.GeneratedFiles++
@@ -672,10 +681,12 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 		structs = appendAnalysed(structs, f.Decls.Structs, opts.tests, &summary, func(s unit.Struct) (bool, bool) { return s.Test, s.Ignored })
 		consts = appendAnalysed(consts, f.Decls.Consts, opts.tests, &summary, func(c unit.Const) (bool, bool) { return c.Test, c.Ignored })
 		enums = appendAnalysed(enums, f.Decls.Enums, opts.tests, &summary, func(e unit.Enum) (bool, bool) { return e.Test, e.Ignored })
-		decls.Traits = append(decls.Traits, f.Decls.Traits...)
-		decls.Impls = append(decls.Impls, f.Decls.Impls...)
-		decls.TypeNames = append(decls.TypeNames, f.Decls.TypeNames...)
-		decls.FuncTypes = append(decls.FuncTypes, f.Decls.FuncTypes...)
+		d := traitDecls[languageOf(f.Path)]
+		d.Traits = append(d.Traits, f.Decls.Traits...)
+		d.Impls = append(d.Impls, f.Decls.Impls...)
+		d.TypeNames = append(d.TypeNames, f.Decls.TypeNames...)
+		traitDecls[languageOf(f.Path)] = d
+		funcTypes = append(funcTypes, f.Decls.FuncTypes...)
 	}
 	summary.Units = len(units) + len(helpers)
 	summary.Version = versionString()
@@ -724,6 +735,11 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 	internal := internalCrates(root, files)
 	flows := parallelFlows(g, traits, opts.minNodes)
 	found, conventions := drifts(units, packages(root, files), judged)
+	importedWhole := wholeImported(root, files)
+	words, err := wordCounts(root, files)
+	if err != nil {
+		return report.Report{}, nil, err
+	}
 	r := report.Build(languageOf, report.Findings{
 		Groups: append(groups, helperGroups...), NearMisses: nearMisses, Blocks: blocks, Flows: flows,
 		Structs: byLanguage(structs, func(_ string, s []unit.Struct) []clone.StructGroup { return clone.Structs(s, minStructFields) }),
@@ -732,13 +748,15 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 		Inlined: byLanguage(consts, func(lang string, c []unit.Const) []clone.InlinedConst {
 			return clone.InlinedConstants(c, inLanguage(lang, units), flow.CrateOf)
 		}),
-		Dead:     simplify.Dead(units, wordCounts(files), internal),
+		Dead: simplify.Dead(units, words, func(file string) bool {
+			return internal(file) && !importedWhole[file]
+		}),
 		Wrappers: simplify.PassThrough(g),
-		Traits:   simplify.SingleImpl(decls, internal),
+		Traits:   singleImpls(traitDecls, files, internal),
 		Scopes:   byLanguage(units, func(_ string, u []unit.Unit) []pattern.ScopeGroup { return pattern.Scopes(u) }),
 		Kinds:    byLanguage(units, func(_ string, u []unit.Unit) []pattern.StringKind { return pattern.StringKinds(u) }),
 		Params: byLanguage(units, func(_ string, u []unit.Unit) []pattern.ParamGroup {
-			return pattern.ParameterGroups(u, decls.FuncTypes)
+			return pattern.ParameterGroups(u, funcTypes)
 		}),
 		Drifts: found,
 		Cycles: dependencyCycles(cycleGraph(g, root, files, units, opts.tests), files, packages(root, files), opts.tests),
@@ -748,6 +766,9 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 
 // languages are the languages check analyses, each on its own.
 var languages = []string{"go", "rust", "typescript"}
+
+// languageNames are the languages' names in text output.
+var languageNames = map[string]string{"go": "Go", "rust": "Rust", "typescript": "TypeScript"}
 
 // byLanguage runs detect on each language's items on its own, so no
 // candidate puts together declarations or functions of two languages,
@@ -875,7 +896,44 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 			modules[codemap.Module(f.Path, crates)] = true
 		}
 	}
-	rootValues, selfAliases := map[string]bool{}, map[string]bool{}
+	rootValues, selfAliases, rootImports, rootItems := map[string]bool{}, map[string]bool{}, map[string]string{}, map[string]bool{}
+	inline, moduleItems, moduleReexports := map[string]bool{}, map[string]map[string]bool{}, map[string]map[string]string{}
+	moduleGlobs := map[string][]string{}
+	var globs []string
+	for _, f := range files {
+		if codemap.Crate(f.Path, crates) != name {
+			continue
+		}
+		m := codemap.Module(f.Path, crates)
+		if moduleItems[m] == nil {
+			moduleItems[m] = map[string]bool{}
+		}
+		if !codemap.OwnFile(f.Path, crates) {
+			continue // a submodule's scope is not what a glob of the module supplies
+		}
+		for _, n := range f.TopExports {
+			moduleItems[m][n] = true
+		}
+		declared := map[string]bool{}
+		for _, d := range append(slices.Clone(f.Modules), f.InlineModules...) {
+			declared[strings.TrimPrefix(d, "r#")] = true
+		}
+		for n, path := range f.TopReexports {
+			path = ownPath(path, declared, f.TopImports)
+			if strings.HasPrefix(n, "*") {
+				if target, ok := codemap.ReexportPath(f.Path, crates, path); ok {
+					moduleGlobs[m] = append(moduleGlobs[m], target)
+				}
+				continue
+			}
+			if target, ok := codemap.ReexportPath(f.Path, crates, path); ok {
+				if moduleReexports[m] == nil {
+					moduleReexports[m] = map[string]string{}
+				}
+				moduleReexports[m][strings.TrimPrefix(n, "r#")] = target
+			}
+		}
+	}
 	for _, f := range files {
 		crate, rel := codemap.CratePath(f.Path, crates)
 		root := rel == "lib.rs" || rel == "main.rs" && !libraries[crate]
@@ -890,10 +948,25 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 		for _, k := range f.Decls.Consts {
 			rootValues[strings.TrimPrefix(k.Name, "r#")] = true
 		}
+		for _, n := range f.TopNames {
+			rootItems[n] = true
+		}
 		// a name the root imports (pub use values::foo) beside its mod foo
 		// cannot be a module too: it is a value
 		for name := range f.Imports {
-			rootValues[strings.TrimPrefix(name, "r#")] = true
+			if !strings.HasPrefix(name, "*") {
+				rootValues[strings.TrimPrefix(name, "r#")] = true
+			}
+		}
+		for name, path := range f.TopImports {
+			if strings.HasPrefix(name, "*") {
+				globs = append(globs, path)
+				continue
+			}
+			rootImports[strings.TrimPrefix(name, "r#")] = path
+		}
+		for _, m := range f.InlineModules {
+			inline[strings.TrimPrefix(m, "r#")] = true
 		}
 		for _, r := range f.References {
 			if r.Alias != "" && (tests || !r.Test) {
@@ -901,7 +974,10 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 			}
 		}
 	}
-	facts := codemap.CrateFacts{Modules: modules, RootValues: rootValues, SelfAliases: selfAliases}
+	slices.Sort(globs)
+	facts := codemap.CrateFacts{Modules: modules, RootValues: rootValues, SelfAliases: selfAliases, RootImports: rootImports,
+		RootItems: rootItems, RootGlobs: globs, InlineModules: inline, ModuleItems: moduleItems, ModuleReexports: moduleReexports,
+		ModuleGlobs: moduleGlobs}
 	var deps []codemap.Dependency
 	for _, f := range files {
 		if generated[f.Path] || codemap.Crate(f.Path, crates) != name || !inLibrary(f.Path, crates, libraries) {
@@ -918,6 +994,30 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 		}
 	}
 	return deps
+}
+
+// ownPath reads a bare re-export path as the module writing it does: a
+// first segment naming a module the file declares (pub mod inner; pub use
+// inner::X) is self::, and one naming a name the file's top-level uses
+// bring in (use crate::foo; pub use foo::X) is that use's path, followed
+// through further such names once each. Any other bare path is left as
+// it is: another crate's.
+func ownPath(path string, declared map[string]bool, imports map[string]string) string {
+	seen := map[string]bool{}
+	for {
+		first, rest, more := strings.Cut(path, "::")
+		if declared[first] {
+			return "self::" + path
+		}
+		target, ok := imports[first]
+		if !ok || seen[first] || first == "crate" || first == "self" || first == "super" {
+			return path
+		}
+		seen[first] = true
+		if path = target; more {
+			path += "::" + rest
+		}
+	}
 }
 
 // libraryCrates returns the crates whose package has a library target
@@ -989,24 +1089,140 @@ func recordHealth(db *index.DB, root string, h report.Health) error {
 }
 
 // wordCounts adds up the words of every indexed file, generated and test
-// files included: a name used only there is still used.
-func wordCounts(files []index.File) map[string]int {
+// code included, and, where TypeScript is analysed, of the files that may
+// import it or name it without being analysed (see tsfile.Importers and
+// tsfile.Configs), files .ddslop.yaml excludes and unreadable ones aside:
+// a .vue component or a serverless.yml naming an export uses it.
+func wordCounts(root string, files []index.File) (map[string]int, error) {
 	words := map[string]int{}
 	for _, f := range files {
 		for w, n := range f.Words {
 			words[w] += n
 		}
 	}
-	return words
+	if !slices.ContainsFunc(files, func(f index.File) bool { return tsfile.IsSource(f.Path) }) {
+		return words, nil
+	}
+	others, err := includedFiles(root, slices.Concat(tsfile.Importers, tsfile.Configs)...)
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range others {
+		src, err := os.ReadFile(filepath.Join(root, path)) //nolint:gosec // a file under the analysed root
+		if err != nil {
+			continue // an unreadable file (a dangling symlink) adds no words
+		}
+		for w, n := range source.Words(src) {
+			words[w] += n
+		}
+	}
+	return words, nil
+}
+
+// singleImpls finds the traits with a single implementation in each
+// language on its own: a Rust trait and a TypeScript interface, or a type
+// of one and a class of the other, never match by their names.
+func singleImpls(traitDecls map[string]unit.Decls, files []index.File, internal func(file string) bool) []simplify.SingleImplTrait {
+	var out []simplify.SingleImplTrait
+	for _, lang := range languages {
+		decls := traitDecls[lang]
+		if lang == "typescript" {
+			decls = withoutImplicitImplementations(decls, files)
+		}
+		out = append(out, simplify.SingleImpl(decls, internal)...)
+	}
+	return out
+}
+
+// withoutImplicitImplementations leaves out the TypeScript interfaces
+// with an implementation no implements clause states: one a test file
+// names, as a test's fake of it is one (const fake: IClock = {...}), and
+// one a class matches by shape (see shapeImplemented).
+func withoutImplicitImplementations(decls unit.Decls, files []index.File) unit.Decls {
+	shaped := shapeImplemented(files)
+	named := map[string]bool{}
+	for _, f := range files {
+		if tsfile.IsSource(f.Path) && typescript.IsTestPath(f.Path) {
+			for w := range f.Words {
+				named[w] = true
+			}
+		}
+	}
+	decls.Traits = slices.DeleteFunc(slices.Clone(decls.Traits), func(t unit.Trait) bool {
+		return named[t.Name] || shaped[t.File+"#"+t.Name]
+	})
+	return decls
+}
+
+// shapeImplemented returns the TypeScript interfaces, as "file#name",
+// that a class of the non-test code implements without saying so: it
+// declares every method of the interface, and TypeScript checks
+// interfaces by shape.
+func shapeImplemented(files []index.File) map[string]bool {
+	classes := map[string]map[string]bool{} // "file#Class" -> its methods
+	stated := map[string]bool{}             // "file#Class#Interface"
+	for _, f := range files {
+		if !tsfile.IsSource(f.Path) {
+			continue
+		}
+		for _, u := range f.Units {
+			if class, method, ok := strings.Cut(u.Name, "."); ok && !u.Test {
+				key := f.Path + "#" + class
+				if classes[key] == nil {
+					classes[key] = map[string]bool{}
+				}
+				classes[key][method] = true
+			}
+		}
+		for _, im := range f.Decls.Impls {
+			stated[im.File+"#"+im.Type+"#"+im.Trait] = true
+		}
+	}
+	out := map[string]bool{}
+	for _, f := range files {
+		if !tsfile.IsSource(f.Path) {
+			continue
+		}
+		for _, t := range f.Decls.Traits {
+			for class, methods := range classes {
+				if !stated[class+"#"+t.Name] && !slices.ContainsFunc(t.Methods, func(m string) bool { return !methods[m] }) {
+					out[t.File+"#"+t.Name] = true
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+// wholeImported reports the TypeScript files another file imports whole
+// (import * as schema, import("./routes")), by a relative path, a
+// workspace package's name (see tsfile.ModuleFiles) or a path alias (see
+// tsfile.AliasMayBe): they may use any of its exports without naming it.
+func wholeImported(root string, files []index.File) map[string]bool {
+	packages := tsPackageNames(root, files)
+	out := map[string]bool{}
+	for _, importer := range files {
+		for _, module := range importer.Decls.WholeImports {
+			names := tsfile.ModuleFiles(importer.Path, module, packages)
+			for _, f := range files {
+				if tsfile.IsSource(f.Path) && (names(f.Path) || tsfile.AliasMayBe(module, f.Path)) {
+					out[f.Path] = true
+				}
+			}
+		}
+	}
+	return out
 }
 
 // internalCrates reports, for a file, whether its crate or package serves
 // only the analysed code (see rust.Unpublished and golang.Internal). The
-// Rust workspace manifest is the one at root. TypeScript code is never
-// known to be internal: calls through package imports, such as another
-// workspace package's, are not followed.
+// Rust workspace manifest is the one at root. A TypeScript package is
+// internal when its package.json, the nearest above the file, is private,
+// which keeps the package from being published (see tsfile.Manifest).
 func internalCrates(root string, files []index.File) func(file string) bool {
 	workspace := manifest(root, ".")
+	ts := tsManifests(root, files)
 	libraries := packages(root, files).Libraries
 	internal := map[string]bool{}
 	for _, f := range files {
@@ -1026,7 +1242,10 @@ func internalCrates(root string, files []index.File) func(file string) bool {
 		}
 	}
 	return func(file string) bool {
-		return languageOf(file) != "typescript" && internal[libraries.CrateOf(file)]
+		if languageOf(file) == "typescript" {
+			return ts[tsfile.PackageDir(file, ts)].Private
+		}
+		return internal[libraries.CrateOf(file)]
 	}
 }
 
@@ -1191,7 +1410,7 @@ func loadFiles(root string, db *index.DB) ([]index.File, error) {
 		if !test {
 			continue
 		}
-		files[i].Imports = nil
+		files[i].Imports, files[i].TopImports, files[i].TopReexports, files[i].TopExports = nil, nil, nil, nil
 		markTest(&files[i])
 	}
 	return files, nil
@@ -1287,7 +1506,14 @@ func parseSource(file syntax.Source) (index.Parsed, error) {
 		case "rust":
 			entries = rust.Traits(src)
 		}
-		return index.Parsed{Generated: true, Traits: entries, Words: source.Words(src)}, nil
+		parsed := index.Parsed{Generated: true, Traits: entries, Words: source.Words(src)}
+		if language == "rust" {
+			// A generated module's names still resolve paths through it.
+			parsed.TopNames, parsed.TopExports, parsed.TopReexports = rust.TopNames(src), rust.TopExports(src), rust.TopReexports(src)
+			parsed.Modules, parsed.InlineModules = rust.DeclaredModules(src), rust.InlineModules(src)
+			_, parsed.TopImports = rust.Imports(src)
+		}
+		return parsed, nil
 	}
 	var parsed index.Parsed
 	var err error
@@ -1322,13 +1548,14 @@ func languageOf(path string) string {
 func parseRust(file syntax.Source) (index.Parsed, error) {
 	units, decls, err := rust.ParseAs(file)
 	parsed := index.Parsed{Units: units, Decls: decls, TestModules: rust.TestModules(file.Src),
-		Modules: rust.DeclaredModules(file.Src), References: rust.ReferencesAs(file)}
+		Modules: rust.DeclaredModules(file.Src), InlineModules: rust.InlineModules(file.Src), References: rust.ReferencesAs(file),
+		TopNames: rust.TopNames(file.Src), TopReexports: rust.TopReexports(file.Src), TopExports: rust.TopExports(file.Src)}
 	for _, t := range decls.Traits {
 		parsed.Traits = append(parsed.Traits, t.Name)
 	}
 	if !file.Test {
 		// Test files' imports are not dependencies of the code.
-		parsed.Imports = rust.Imports(file.Src)
+		parsed.Imports, parsed.TopImports = rust.Imports(file.Src)
 	}
 	return parsed, err
 }
