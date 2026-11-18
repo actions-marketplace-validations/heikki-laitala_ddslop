@@ -340,22 +340,33 @@ dictated signature, so none remain.
 Feature flows work for Go too. A generated file's interfaces give the
 entry points: Go implements interfaces implicitly, so a method named like
 one of a generated interface's methods (an OpenAPI server's
-`GetDocument`) is an entry point, where a Rust impl names its trait. Like
-Rust's list of standard-library method names, `goStdMethods` keeps Go
-calls such as `w.Header()` on an `http.ResponseWriter` from being pinned
-on the code's one `Header` method; on the Go service that dropped 72 of
-795 name-resolved calls that had pointed at the wrong function. That
+`GetDocument`) is an entry point, where a Rust impl names its trait. In
+place of Rust's list of standard-library method names, `goStdMethods`
+keeps Go calls such as `w.Header()` on an `http.ResponseWriter` from
+being pinned on the code's one `Header` method; on the Go service that
+dropped 72 of 795 name-resolved calls that had pointed at the wrong
+function. Rust's names (`take`, `len`, `first`) would be unexported in
+Go, so a Go method of such a name is its own package's and is guessed
+like any other: that resolved one more call on the service (897) and
+two on ddslop (1,469). That
 service has 37 entry points and no parallel flows: its handlers are thin
 and delegate to different services.
 
 Go method calls resolve by type where the code states it. The adapter
 records the type of a method call's operand (`unit.Call.Type`) when it
-is a parameter or named result, a `var x T`, or a variable set from a composite literal
-(`x := T{}`, `&T{}`, `var x = T{}`), qualified by the file's imports
-(`example.com/app/store.DB`), and the field for a call on a receiver's
-field (`s.store.Save()`, `unit.Call.Field`), whose type comes from the
+is a parameter or named result, a `var x T`, a variable set from a composite literal
+(`x := T{}`, `&T{}`, `var x = T{}`), or an element of a variable so
+declared as a slice or array (`for _, u := range units`, `units[i]`,
+with `units []T`, `[4]*T` or `...T`), qualified by the file's imports
+(`example.com/app/store.DB`), and the fields a call follows from the
+receiver, a typed variable or a call's result (`s.cfg.store.Save()`,
+`in.Libraries.CrateOf()`, `r.Summary.Health.Limit()` after `r, err :=
+check()`, or a variable holding such a chain: `libraries :=
+load().Libraries`; `unit.Call.Field`). Each field's type comes from its
 struct's declaration (`Decls.FieldTypes`), qualified by its own file's
-imports; a test file's fields are left out. Variables keep to their
+imports and read in that struct's package; a test file's fields are left
+out, and a chain through a field of unknown type, or a struct of another
+module, types nothing. Variables keep to their
 lexical scope: a block, statement or function literal that declares one
 restores the outer one when it ends, an outer variable assigned in a
 nested scope is unknown after it (the scope may not have run), though
@@ -393,7 +404,13 @@ so a method on its result is still guessed. An import binds the name Go's tools 
 its package (`github.com/redis/go-redis/v9` is `redis`, `gopkg.in/yaml.v3`
 is `yaml`), so a field of type `*redis.Client` is that outside type. On
 the Go service this removed three wrong edges into the repository's own
-`Ping` methods, and changed no finding.
+`Ping` methods, and changed no finding. Following field chains past the
+receiver's own fields resolved 7 more calls on ddslop's own code (1,454
+to 1,461 of 5,143) and turned 11 guesses by name into calls by type; on
+the Go service it changed nothing, and no finding changed on either.
+Typing the elements of typed slices resolved 3 more there (1,464), and
+telling a Go local by its scope (see below) 3 more (1,467), each time
+changing nothing on the service.
 
 On the Go service this resolved 882 of 2820 calls (723 before, some of
 them guesses): the store package, which handlers and the dashboard reach
@@ -1165,7 +1182,12 @@ that crosses it.
   function value, `let unsigned = |v| ...`) is not a function call,
   except the caller's own name: `walk()` in `walk` recurses, and
   `CrateOf()` in the method `Libraries.CrateOf` calls the function of
-  that name, unless a local of the name shadows it. Otherwise it
+  that name, unless a local of the name shadows it. In Go, which the
+  Go adapter tells by the scopes open at the call (`unit.Call.Local`),
+  a name is local only where a variable of it is in scope: one declared
+  in an inner block (`if params := params(n); ...`), or by the call's own
+  statement (`manifest := manifest(root, dir)`), leaves the package's
+  function callable elsewhere. Otherwise it
   prefers the caller's file, then a unique function in its crate. It
   leaves the crate only through a `use` import, and only into a
   workspace crate (aliases followed); an import from an outside crate

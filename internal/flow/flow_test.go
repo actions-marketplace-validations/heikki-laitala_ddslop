@@ -195,16 +195,39 @@ func TestBareCallsByTheCallersOwnNameAreNotLocal(t *testing.T) {
 		return u
 	}
 	g := Build(Inputs{}, []unit.Unit{
-		ownName("tree/walk.go", "walk"),
-		ownName("flow/flow.go", "Libraries.CrateOf"),
-		fn("flow/crate.go", "CrateOf"),
-		// visit := func() { ... }; visit()
-		ownName("tree/visit.go", "visit", "visit"),
+		ownName("a/src/walk.rs", "walk"),
+		ownName("a/src/flow.rs", "Libraries::crate_of"),
+		fn("a/src/krate.rs", "crate_of"),
+		// let visit = || { ... }; visit()
+		ownName("a/src/visit.rs", "visit", "visit"),
 	})
 
-	wantCallees(t, g, "tree/walk.go walk", "[tree/walk.go walk]")
-	wantCallees(t, g, "flow/flow.go Libraries.CrateOf", "[flow/crate.go CrateOf]")
-	wantCallees(t, g, "tree/visit.go visit", "[]")
+	wantCallees(t, g, "a/src/walk.rs walk", "[a/src/walk.rs walk]")
+	wantCallees(t, g, "a/src/flow.rs Libraries::crate_of", "[a/src/krate.rs crate_of]")
+	wantCallees(t, g, "a/src/visit.rs visit", "[]")
+}
+
+// A Go bare call is local only where a variable of its name is in scope,
+// which the adapter tells (unit.Call.Local): a local declared in an inner
+// block (if params := params(n); ...) leaves the package's function
+// callable elsewhere in the function, and a call by the caller's own
+// name recurses unless a variable of the name is in scope.
+func TestGoBareCallsAreLocalOnlyWhereTheirVariableIsInScope(t *testing.T) {
+	inScope := func(name string) unit.Call {
+		c := free(name)
+		c.Local = true
+		return c
+	}
+	g := Build(Inputs{}, []unit.Unit{
+		local("api/run.go", "run", "params", free("params"), inScope("params")),
+		fn("api/params.go", "params"),
+		local("api/walk.go", "walk", "walk", free("walk")),
+		local("api/visit.go", "visit", "visit", inScope("visit")),
+	})
+
+	wantCallees(t, g, "api/run.go run", "[api/params.go params]")
+	wantCallees(t, g, "api/walk.go walk", "[api/walk.go walk]")
+	wantCallees(t, g, "api/visit.go visit", "[]")
 }
 
 func TestBareCallsLeaveTheCrateOnlyThroughImports(t *testing.T) {
@@ -321,17 +344,20 @@ func TestEntriesIncludeGoMethodsNamedInGeneratedInterfaces(t *testing.T) {
 }
 
 // w.Header() on an http.ResponseWriter is the standard library's, even
-// when the code defines a single Header method; other names still resolve.
+// when the code defines a single Header method; other names still resolve,
+// Rust's standard method names too: an unexported Go method (b.take()) is
+// its own package's.
 func TestGoStandardLibraryMethodsAreNotGuessed(t *testing.T) {
 	units := []unit.Unit{
 		fn("api/auth.go", "writeError", method("", "Header")),
 		fn("api/writer.go", "bufferingWriter.Header"),
-		fn("api/cache.go", "lookup", method("", "fetchCached")),
+		fn("api/cache.go", "lookup", method("", "fetchCached"), method("", "take")),
 		fn("api/store.go", "cache.fetchCached"),
+		fn("api/limit.go", "bucket.take"),
 	}
 	g := Build(Inputs{}, units)
 	wantCallees(t, g, "api/auth.go writeError", "[]")
-	wantCallees(t, g, "api/cache.go lookup", "[api/store.go cache.fetchCached]")
+	wantCallees(t, g, "api/cache.go lookup", "[api/store.go cache.fetchCached api/limit.go bucket.take]")
 }
 
 func TestCalleesFoundOnlyByMethodNameAreMarked(t *testing.T) {
@@ -498,6 +524,34 @@ func TestGoMethodCallsOnACallsResultResolveByItsResultType(t *testing.T) {
 	if got, want := fmt.Sprint(g.ByName[0]), "[false false false true]"; got != want {
 		t.Errorf("ByName = %s, want %s: only the call on an unresolved result is a guess", got, want)
 	}
+}
+
+// A field chain is followed through the structs' declarations from where
+// it starts, each field's type read in its struct's package: the
+// receiver (s.cfg.store.Save()), a typed variable (in.Libraries.CrateOf())
+// or a call's result (r.Summary.Health.Limit() after r := check()). The
+// caller's package's own methods of those names are not the ones called.
+func TestGoMethodCallsResolveThroughFieldChains(t *testing.T) {
+	g := Build(Inputs{Modules: map[string]string{".": "example.com/app"},
+		Fields: map[string]map[string]FieldType{
+			"api":    {"Server.cfg": {Type: "Config"}, "Config.store": {Type: "example.com/app/internal/store.Store"}},
+			"flow":   {"Inputs.Libraries": {Type: "Libraries"}},
+			"report": {"Report.Summary": {Type: "Summary"}, "Summary.Health": {Type: "Health"}},
+		}}, []unit.Unit{
+		fn("api/server.go", "Server.Get",
+			unit.Call{Kind: unit.MethodCall, Field: "cfg.store", Name: "Save"},
+			unit.Call{Kind: unit.MethodCall, Type: "example.com/app/flow.Inputs", Field: "Libraries", Name: "CrateOf"},
+			free("check"),
+			unit.Call{Kind: unit.MethodCall, From: 3, Field: "Summary.Health", Name: "Limit"}),
+		{File: "api/check.go", Name: "check", Results: []string{"example.com/app/report.Report"}},
+		fn("internal/store/store.go", "Store.Save"),
+		fn("flow/flow.go", "Libraries.CrateOf"),
+		fn("report/report.go", "Health.Limit"),
+		fn("api/local.go", "local.Save"),
+		fn("api/local.go", "local.CrateOf"),
+		fn("api/local.go", "local.Limit"),
+	})
+	wantCallees(t, g, "api/server.go Server.Get", "[internal/store/store.go Store.Save flow/flow.go Libraries.CrateOf api/check.go check report/report.go Health.Limit]")
 }
 
 // A method called on the result of an outside package's constructor

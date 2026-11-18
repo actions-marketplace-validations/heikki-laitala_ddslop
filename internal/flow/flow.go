@@ -325,16 +325,20 @@ func (r *callResolver) resolveCall(c unit.Call) (int, bool, bool) {
 		}
 		if callee >= 0 && !guessed && c.Result < len(r.units[callee].Results) {
 			producer := r.units[callee]
-			typ, home := producer.Results[c.Result], producer
-			if c.Field != "" && strings.HasSuffix(producer.File, ".rs") {
+			typ, home, dir := producer.Results[c.Result], producer, r.ix.libraries.CrateOf(producer.File)
+			switch {
+			case c.Field == "":
+			case strings.HasSuffix(producer.File, ".rs"):
 				typ, home = r.ix.followFields(typ, home, c.Field) // make().inner.run()
+			default:
+				typ, dir = r.ix.followGoFields(typ, dir, c.Field) // open().store.Save()
 			}
 			if typ != "" {
 				resolve := func() (int, bool) {
 					if strings.HasSuffix(producer.File, ".rs") {
 						return r.ix.resolveRust(r.units, r.caller, home, typ, c.Name)
 					}
-					return r.ix.resolveTyped(r.units, r.ix.libraries.CrateOf(producer.File), typ, c.Name)
+					return r.ix.resolveTyped(r.units, dir, typ, c.Name)
 				}
 				if u, known := resolve(); known {
 					return u, false, isTrait(typ)
@@ -388,18 +392,18 @@ func (ix index) resolve(units []unit.Unit, caller unit.Unit, owner string, c uni
 	if c.Kind != unit.MethodCall || c.Qualifier == "self" {
 		return ix.resolveNamed(units, caller, owner, c), false, false
 	}
-	typ, home := c.Type, caller
+	typ, home, dir := c.Type, caller, ix.libraries.CrateOf(caller.File)
+	if c.Field != "" && typ == "" {
+		typ = owner // self.ctx.db, s.cfg.store
+	}
 	switch {
 	case c.Field == "":
-	case strings.HasSuffix(caller.File, ".rs") && c.From > 0:
+	case c.From > 0:
 		typ = "" // a field of a call's result: followed in resolveCall, or not at all
 	case strings.HasSuffix(caller.File, ".rs"):
-		if typ == "" {
-			typ = owner // self.ctx.db
-		}
 		typ, home = ix.followFields(typ, home, c.Field)
 	default:
-		typ = ix.fields[ix.libraries.CrateOf(caller.File)][owner+"."+c.Field].Type
+		typ, dir = ix.followGoFields(typ, dir, c.Field)
 	}
 	switch {
 	case typ == "":
@@ -408,11 +412,15 @@ func (ix index) resolve(units []unit.Unit, caller unit.Unit, owner string, c uni
 			return u, false, isTrait(typ)
 		}
 	default:
-		if u, known := ix.resolveTyped(units, ix.libraries.CrateOf(caller.File), typ, c.Name); known {
+		if u, known := ix.resolveTyped(units, dir, typ, c.Name); known {
 			return u, false, false
 		}
 	}
-	if stdMethods[c.Name] || (strings.HasSuffix(caller.File, ".go") && goStdMethods[c.Name]) {
+	std := stdMethods
+	if strings.HasSuffix(caller.File, ".go") {
+		std = goStdMethods // an unexported Go method is its own package's
+	}
+	if std[c.Name] {
 		return -1, false, false // most likely a standard-library method
 	}
 	return ix.pick(units, caller, ix.methods[c.Name]), true, false
@@ -734,6 +742,29 @@ func (ix index) resolveTyped(units []unit.Unit, home, typ, method string) (int, 
 	return u, u >= 0
 }
 
+// followGoFields follows a Go field path (cfg.store) from a type written
+// as unit.Call.Type, unqualified for a type of the package in directory
+// dir, through the struct declarations: each field's declared type, read
+// in its struct's package. It returns the last field's type and that
+// package's directory, or "" when a field's type is not known, as for a
+// struct of another module.
+func (ix index) followGoFields(typ, dir, path string) (string, string) {
+	for _, field := range strings.Split(path, ".") {
+		name := typ
+		if i := strings.LastIndex(typ, "."); i >= 0 {
+			var inRepo bool
+			if dir, inRepo = ix.packageDir(typ[:i]); !inRepo {
+				return "", dir
+			}
+			name = typ[i+1:]
+		}
+		if typ = ix.fields[dir][name+"."+field].Type; typ == "" {
+			return "", dir
+		}
+	}
+	return typ, dir
+}
+
 // packageDir returns the directory of the repository's Go package with
 // the import path, under the go.mod whose module path is the longest to
 // start it, and whether one does.
@@ -755,7 +786,7 @@ func (ix index) packageDir(importPath string) (string, bool) {
 func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, c unit.Call) int {
 	switch c.Kind {
 	case unit.FreeCall:
-		return ix.resolveFree(units, caller, c.Name)
+		return ix.resolveFree(units, caller, c)
 	case unit.PathCall:
 		typ := unit.SimpleName(c.Qualifier)
 		if strings.HasSuffix(caller.File, ".rs") && strings.Contains(c.Qualifier, "::") && !isModule(typ) && typ != "Self" {
@@ -816,23 +847,16 @@ func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, 
 	return -1
 }
 
-// resolveFree resolves a bare call foo(). A name the caller declares itself
-// is a closure or function value, not a function, except its own name: a
-// call by it recurses, or from a method calls the function of that name.
+// resolveFree resolves a bare call foo(). A name the caller declares
+// itself is a closure or function value, not a function (see callsLocal).
 // Otherwise the caller's file and crate come first; a function of another
 // crate is reachable only through a use import, and only a workspace
 // crate's is resolved.
-func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) int {
-	_, own := split(caller.Name)
-	for _, l := range caller.Leaves {
-		if l.Declares && l.Text == name {
-			if l.Text == own {
-				own = "" // its own name, declared once
-				continue
-			}
-			return -1
-		}
+func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, c unit.Call) int {
+	if callsLocal(caller, c) {
+		return -1
 	}
+	name := c.Name
 	if u := ix.libraries.pickLocal(units, caller, ix.free[name]); u >= 0 {
 		return u
 	}
@@ -848,6 +872,28 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 		return ix.libraries.pickLocal(units, caller, ix.free[target])
 	}
 	return ix.imported(units, path)
+}
+
+// callsLocal reports whether a bare call is to a closure or function
+// value the caller declares, not to a function. In Go, it is where a
+// variable of its name is in scope (unit.Call.Local). Elsewhere, it is
+// wherever the caller declares the name, except its own name: a call by
+// it recurses, or from a method calls the function of that name.
+func callsLocal(caller unit.Unit, c unit.Call) bool {
+	if strings.HasSuffix(caller.File, ".go") {
+		return c.Local
+	}
+	_, own := split(caller.Name)
+	for _, l := range caller.Leaves {
+		if l.Declares && l.Text == c.Name {
+			if l.Text == own {
+				own = "" // its own name, declared once
+				continue
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // imported returns the function a path rooted at a crate's name reaches:

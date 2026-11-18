@@ -510,8 +510,48 @@ func run(db *DB, items []Item) {
 				`12 Save qualifier="" type="DB" field=""`,
 				`14 Save qualifier="" type="Remote" field=""`,
 				`16 Save qualifier="" type="DB" field=""`,
-				`18 Save qualifier="" type="" field=""`,
+				`18 Save qualifier="" type="Item" field=""`,
 				`20 Save qualifier="" type="DB" field=""`,
+			},
+		},
+		"elements of a typed slice or array take their type": {
+			src: `package api
+
+import st "example.com/app/internal/store"
+
+func run(units []st.Unit, rows [4]*Row, byName map[string]Unit, grid [][]Unit, rest ...Item) {
+	for _, u := range units {
+		u.ViaInterface()
+	}
+	for i := range units {
+		i.Next()
+	}
+	units[0].ViaInterface()
+	rows[1].Load()
+	rest[0].Fill()
+	byName["x"].Fill()
+	grid[0][1].Fill()
+	r := rows[2]
+	r.Load()
+	units[0].Store.Save()
+	var more []Item
+	for _, m := range more {
+		m.Fill()
+	}
+}
+`,
+			line: methodType,
+			want: []string{
+				`7 ViaInterface qualifier="" type="example.com/app/internal/store.Unit" field=""`,
+				`10 Next qualifier="" type="" field=""`,
+				`12 ViaInterface qualifier="" type="example.com/app/internal/store.Unit" field=""`,
+				`13 Load qualifier="" type="Row" field=""`,
+				`14 Fill qualifier="" type="Item" field=""`,
+				`15 Fill qualifier="" type="" field=""`,
+				`16 Fill qualifier="" type="" field=""`,
+				`18 Load qualifier="" type="Row" field=""`,
+				`19 Save qualifier="" type="example.com/app/internal/store.Unit" field="Store"`,
+				`22 Fill qualifier="" type="Item" field=""`,
 			},
 		},
 		"an assignment's right side sees the type before it": {
@@ -631,11 +671,79 @@ func (s *Server) Run() {
 			want: []string{
 				`4 Save qualifier="" type="" field="store"`,
 				`5 Flush qualifier="self" type="" field=""`,
-				`8 Save qualifier="" type="" field=""`,
+				`8 Save qualifier="" type="Other" field="store"`,
 				`9 Flush qualifier="" type="Other" field=""`,
 				`12 Flush qualifier="" type="Remote" field=""`,
 				`14 Flush qualifier="self" type="" field=""`,
 				`16 Load qualifier="" type="DB" field=""`,
+			},
+		},
+		"field chains start from the receiver or a typed variable": {
+			src: `package api
+
+import "example.com/app/flow"
+
+func (s *Server) Get(in flow.Inputs) {
+	s.cfg.store.Save()
+	in.Libraries.CrateOf()
+	db := s.store
+	db.Save()
+	libraries := in.Libraries
+	libraries.Locate()
+	unknown.Libraries.Locate()
+	flow.Default.Locate()
+}
+`,
+			line: methodType,
+			want: []string{
+				`6 Save qualifier="" type="" field="cfg.store"`,
+				`7 CrateOf qualifier="" type="example.com/app/flow.Inputs" field="Libraries"`,
+				`9 Save qualifier="" type="" field="store"`,
+				`11 Locate qualifier="" type="example.com/app/flow.Inputs" field="Libraries"`,
+				`12 Locate qualifier="" type="" field=""`,
+				`13 Locate qualifier="" type="" field=""`,
+			},
+		},
+		"bare calls by a variable's name in scope are local": {
+			src: `package api
+
+func run(n *Node, src []byte, check func() bool) {
+	if params := params(n, src); len(params) > 0 {
+		params(n, src)
+	}
+	params(n, src)
+	for _, x := range n.Items {
+		shared := shared(x)
+		shared(x)
+	}
+	shared(n)
+	check()
+	walk := func() { helper() }
+	walk()
+	var visit func()
+	visit = func() { visit() }
+	run(n, src, check)
+}
+`,
+			line: func(c unit.Call) string {
+				if c.Kind != unit.FreeCall {
+					return ""
+				}
+				return fmt.Sprintf("%d %s local=%v", c.Line, c.Name, c.Local)
+			},
+			want: []string{
+				`4 params local=false`,
+				`4 len local=false`,
+				`5 params local=true`,
+				`7 params local=false`,
+				`9 shared local=false`,
+				`10 shared local=true`,
+				`12 shared local=false`,
+				`13 check local=true`,
+				`14 helper local=false`,
+				`15 walk local=true`,
+				`17 visit local=true`,
+				`18 run local=false`,
 			},
 		},
 		"variables shadow imports and named results are typed": {
@@ -889,24 +997,35 @@ func run(s *Server) {
 	c.Fill()
 	var d = one()
 	d.Fill()
+	r, _ := check()
+	r.Summary.Health.Limit()
+	libraries := load().Libraries
+	libraries.Locate()
+	load().Libraries.Locate()
 }
 `
 	units, _ := testutil.Parse(t, Parse, "api/run.go", src)
 	calls := units[0].Calls
 	got := testutil.Format(calls, func(c unit.Call) string {
-		return fmt.Sprintf("%d %s from=%s", c.Line, c.Name, testutil.Producer(calls, c))
+		return fmt.Sprintf("%d %s from=%s field=%q", c.Line, c.Name, testutil.Producer(calls, c), c.Field)
 	})
 	want := []string{
-		"4 open from=-",
-		"5 Save from=open#0",
-		"6 Error from=open#1",
-		"7 one from=-",
-		"8 Fill from=one#0",
-		"9 Save from=Store#0",
-		"9 Store from=-",
-		"11 Fill from=-",
-		"12 one from=-",
-		"13 Fill from=one#0",
+		`4 open from=- field=""`,
+		`5 Save from=open#0 field=""`,
+		`6 Error from=open#1 field=""`,
+		`7 one from=- field=""`,
+		`8 Fill from=one#0 field=""`,
+		`9 Save from=Store#0 field=""`,
+		`9 Store from=- field=""`,
+		`11 Fill from=- field=""`,
+		`12 one from=- field=""`,
+		`13 Fill from=one#0 field=""`,
+		`14 check from=- field=""`,
+		`15 Limit from=check#0 field="Summary.Health"`,
+		`16 load from=- field=""`,
+		`17 Locate from=load#0 field="Libraries"`,
+		`18 Locate from=load#0 field="Libraries"`,
+		`18 load from=- field=""`,
 	}
 	testutil.Lines(t, "calls", got, want)
 }

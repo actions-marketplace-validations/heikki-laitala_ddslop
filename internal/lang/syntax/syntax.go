@@ -267,10 +267,13 @@ func PassesOn(args *sitter.Node, names []string, src []byte, borrow func(n *sitt
 // Operand is what the code states about a variable, as a language
 // adapter tracks it through a function: its type, written as
 // unit.Call.Type, or the call whose result it holds (unit.Call.From and
-// Result). The zero Operand is unknown.
+// Result), and the fields followed from there (unit.Call.Field): x :=
+// cfg.Store holds cfg's Store, and in Go, a Field alone the receiver's.
+// Elem is, for a slice or array, its elements' type. The zero Operand is
+// unknown.
 type Operand struct {
-	Type         string
-	From, Result int
+	Type, Field, Elem string
+	From, Result      int
 }
 
 // Scope opens a lexical scope over an adapter's variables: the bindings

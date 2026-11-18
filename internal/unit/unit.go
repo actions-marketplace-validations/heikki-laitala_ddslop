@@ -201,9 +201,9 @@ type Call struct {
 	Type string
 	// Field is the field a method is called on, followed from the
 	// operand: the receiver's (store in s.store.Save(), Go's and Rust's
-	// self.store.get()) or, in Rust, a dotted path from the receiver, a
-	// typed variable (Type) or a call's result (From): ctx.db in
-	// self.ctx.db.query(), store in req.store.get(); or, in TypeScript,
+	// self.store.get()) or, in Go and Rust, a dotted path from the
+	// receiver, a typed variable (Type) or a call's result (From): ctx.db
+	// in self.ctx.db.query(), store in req.store.get(); or, in TypeScript,
 	// this.store.get() and a typed variable's: repo in deps.repo.find().
 	Field string
 	// From is 1 + the index, among its unit's calls, of the call whose
@@ -216,6 +216,12 @@ type Call struct {
 	// it takes it out as ? does. A library's is looked through to the
 	// call it adapts; one the repository defines is a call like any other.
 	Adapts int
+	// Local is true for a Go free call by the name of a variable in scope
+	// at the call (a closure or function value), which is no function.
+	// Go's other free calls are not local, whatever the function declares
+	// elsewhere; other languages leave it unset, and the graph reads the
+	// unit's own declarations (Leaf.Declares) instead.
+	Local bool
 	// Ignored is true when a ddslop:ignore comment marks the call's line.
 	Ignored bool
 }

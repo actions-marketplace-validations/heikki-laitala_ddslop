@@ -52,7 +52,8 @@ type grammar struct {
 	vars map[string]syntax.Operand
 	// calls maps a call's syntax node (its byte range) to its index among
 	// the unit's calls, and chains a method call's index to the call its
-	// operand is (s.Store().Save()), which is recorded after it.
+	// operand is or starts from (s.Store().Save(), open().store.Save()),
+	// which is recorded after it.
 	calls  map[[2]uint]int
 	chains map[int][2]uint
 	// scopes are the open lexical scopes, innermost last.
@@ -96,8 +97,8 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 		if c, ok := g.call(n, s.Src); ok {
 			g.calls[syntax.Span(n)] = len(s.Calls)
 			if fn := n.ChildByFieldName("function"); c.Kind == unit.MethodCall && fn != nil {
-				if operand := fn.ChildByFieldName("operand"); operand != nil && operand.Kind() == "call_expression" {
-					g.chains[len(s.Calls)] = syntax.Span(operand)
+				if base, _ := fieldChain(fn.ChildByFieldName("operand"), s.Src); base != nil && base.Kind() == "call_expression" {
+					g.chains[len(s.Calls)] = syntax.Span(base) // s.Store().Save(), open().store.Save()
 				}
 			}
 			s.Calls = append(s.Calls, c)
@@ -118,7 +119,7 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 			for i, name := range names {
 				op := g.valueOf(values, uint(i), uint(len(names)), s.Src) // var x = T{}, var x = f()
 				if t != nil {
-					op = syntax.Operand{Type: g.typeOf(syntax.Compact(t.Utf8Text(s.Src)))}
+					op = operandOf(syntax.Compact(t.Utf8Text(s.Src)), g.packages, g.generic)
 				}
 				g.declare(name.Utf8Text(s.Src), op, true)
 			}
@@ -147,7 +148,7 @@ func (g grammar) Visit(s *syntax.Shaper, n *sitter.Node) func() {
 	case "func_literal":
 		s.Closures++
 		restore := g.scope(false)
-		eachOwn(n, s.Src, func(name, typ string) { g.declare(name, syntax.Operand{Type: g.typeOf(typ)}, true) })
+		eachOwn(n, s.Src, func(name, typ string) { g.declare(name, operandOf(typ, g.packages, g.generic), true) })
 		return func() { s.Closures--; restore() }
 	case "block":
 		// An if's body or else is a branch; other blocks run in sequence.
@@ -244,34 +245,88 @@ func (g grammar) call(n *sitter.Node, src []byte) (unit.Call, bool) {
 		return c, false
 	case fn.Kind() == "identifier":
 		c.Kind, c.Name = unit.FreeCall, fn.Utf8Text(src)
+		c.Local = g.isVariable(c.Name) // walk := func() {..}; walk()
 	case fn.Kind() == "selector_expression":
 		operand, field := fn.ChildByFieldName("operand"), fn.ChildByFieldName("field")
 		if operand == nil || field == nil {
 			return c, false
 		}
 		c.Kind, c.Name = unit.MethodCall, field.Utf8Text(src)
-		switch operand.Kind() {
-		case "identifier":
-			switch name := operand.Utf8Text(src); {
+		base, fields := fieldChain(operand, src)
+		if base != nil && base.Kind() == "identifier" && len(fields) == 0 {
+			switch name := base.Utf8Text(src); {
 			case g.isReceiver(name):
 				c.Qualifier = "self"
+				return c, true
 			case g.packages[name] != "" && !g.isVariable(name):
 				c.Kind, c.Qualifier = unit.PathCall, name
-			default:
-				op := g.vars[name]
-				c.Type, c.From, c.Result = op.Type, op.From, op.Result
+				return c, true
 			}
-		case "selector_expression":
-			// s.store.Save(): a method of the receiver's field.
-			if v, f := operand.ChildByFieldName("operand"), operand.ChildByFieldName("field"); v != nil && f != nil &&
-				v.Kind() == "identifier" && g.isReceiver(v.Utf8Text(src)) {
-				c.Field = f.Utf8Text(src)
-			}
+		}
+		// s.cfg.store.Save(), in.Libraries.CrateOf(), open().store.Save()
+		if op, ok := g.chained(base, fields, src); ok {
+			c.Type, c.Field, c.From, c.Result = op.Type, op.Field, op.From, op.Result
 		}
 	default:
 		return c, false // function values, conversions
 	}
 	return c, true
+}
+
+// element returns what an element of a slice or array variable holds
+// (units in units[i], or ranged over), or the zero Operand.
+func (g grammar) element(n *sitter.Node, src []byte) syntax.Operand {
+	if n == nil || n.Kind() != "identifier" {
+		return syntax.Operand{}
+	}
+	return syntax.Operand{Type: g.vars[n.Utf8Text(src)].Elem}
+}
+
+// fieldChain returns where a selector chain starts and the fields it
+// follows from there: s and [cfg store] for s.cfg.store, x and none for
+// x. The start is nil for a selector without its field.
+func fieldChain(n *sitter.Node, src []byte) (*sitter.Node, []string) {
+	var fields []string
+	for n != nil && n.Kind() == "selector_expression" {
+		f := n.ChildByFieldName("field")
+		if f == nil {
+			return nil, nil
+		}
+		fields = append([]string{f.Utf8Text(src)}, fields...)
+		n = n.ChildByFieldName("operand")
+	}
+	return n, fields
+}
+
+// chained returns what a selector chain holds, by where it starts (see
+// fieldChain): the receiver's fields, or a variable's of known type or
+// value, a typed slice's element (units[i]), or a call's result's,
+// followed by the chain's fields. ok is
+// false for any other start, such as a package or an untyped variable. A
+// call not yet visited, as a method call's operand is not, has its From
+// set later (see grammar.chains).
+func (g grammar) chained(base *sitter.Node, fields []string, src []byte) (syntax.Operand, bool) {
+	var op syntax.Operand
+	switch {
+	case base == nil:
+		return op, false
+	case base.Kind() == "call_expression":
+		if k, ok := g.calls[syntax.Span(base)]; ok {
+			op.From = k + 1
+		}
+	case base.Kind() == "index_expression":
+		if op = g.element(base.ChildByFieldName("operand"), src); op == (syntax.Operand{}) {
+			return op, false // m[k], a map's or an untyped slice's
+		}
+	case base.Kind() != "identifier":
+		return op, false
+	case !g.isReceiver(base.Utf8Text(src)):
+		if op = g.vars[base.Utf8Text(src)]; op == (syntax.Operand{}) {
+			return op, false
+		}
+	}
+	op.Field = strings.Trim(op.Field+"."+strings.Join(fields, "."), ".")
+	return op, true
 }
 
 // IdiomaticForms names the idiomatic form of each concern the adapter
@@ -332,8 +387,8 @@ func (g grammar) declare(name string, op syntax.Operand, declared bool) {
 
 // assign updates the variables an assignment, short declaration, range
 // clause or receive sets: one set from a composite literal (T{}, &T{})
-// takes its type, one set from a call holds its result (see valueOf), and
-// any other is forgotten.
+// takes its type, one set from a call or a field chain holds its result or
+// value (see valueOf), and any other is forgotten.
 func (g grammar) assign(n *sitter.Node, src []byte) {
 	left, right := n.ChildByFieldName("left"), n.ChildByFieldName("right")
 	if left == nil {
@@ -350,16 +405,20 @@ func (g grammar) assign(n *sitter.Node, src []byte) {
 			continue
 		}
 		var op syntax.Operand
-		if n.Kind() != "range_clause" {
+		switch {
+		case n.Kind() != "range_clause":
 			op = g.valueOf(right, i, left.NamedChildCount(), src)
+		case i == 1:
+			op = g.element(right, src) // for _, u := range units
 		}
 		g.declare(name.Utf8Text(src), op, declares)
 	}
 }
 
 // valueOf returns what the i-th of names variables set from values
-// holds: a composite literal's type, or a call's result, the i-th when
-// one call gives them all (db, err := open()).
+// holds: a composite literal's type, a call's result, the i-th when one
+// call gives them all (db, err := open()), or a field chain's value (x :=
+// cfg.Store, see chained).
 func (g grammar) valueOf(values *sitter.Node, i, names uint, src []byte) syntax.Operand {
 	if values == nil {
 		return syntax.Operand{}
@@ -379,6 +438,10 @@ func (g grammar) valueOf(values *sitter.Node, i, names uint, src []byte) syntax.
 	if result > 0 {
 		return syntax.Operand{}
 	}
+	if base, fields := fieldChain(value, src); len(fields) > 0 || base.Kind() == "index_expression" {
+		op, _ := g.chained(base, fields, src) // x := cfg.Store, x := units[i]
+		return op
+	}
 	return syntax.Operand{Type: g.literalType(value, src)}
 }
 
@@ -392,6 +455,20 @@ func (g grammar) literalType(value *sitter.Node, src []byte) string {
 		return g.typeOf(syntax.Compact(t.Utf8Text(src)))
 	}
 	return ""
+}
+
+// operandOf returns what a variable of a declared type holds: a value of
+// that type (see typeOf), or, for a slice or array ([]T, [4]*T, a
+// variadic ...T), elements of that type.
+func operandOf(typ string, packages map[string]string, generic map[string]bool) syntax.Operand {
+	if elem, ok := strings.CutPrefix(typ, "..."); ok {
+		return syntax.Operand{Elem: typeOf(elem, packages, generic)}
+	}
+	if rest, ok := strings.CutPrefix(typ, "["); ok {
+		_, elem, _ := strings.Cut(rest, "]")
+		return syntax.Operand{Elem: typeOf(elem, packages, generic)}
+	}
+	return syntax.Operand{Type: typeOf(typ, packages, generic)}
 }
 
 // typeOf returns a type as typeOf writes it, with the function's type
@@ -609,8 +686,8 @@ func function(n *sitter.Node, path string, src []byte, test bool, packages map[s
 	vars, own, generic := map[string]syntax.Operand{}, map[string]bool{}, typeParams(n, src)
 	eachOwn(n, src, func(name, typ string) {
 		own[name] = true
-		if t := typeOf(typ, packages, generic); t != "" {
-			vars[name] = syntax.Operand{Type: t}
+		if op := operandOf(typ, packages, generic); op != (syntax.Operand{}) {
+			vars[name] = op
 		}
 	})
 	g := grammar{receiver: receiverName(n, src), packages: packages, vars: vars,
@@ -620,6 +697,8 @@ func function(n *sitter.Node, path string, src []byte, test bool, packages map[s
 	for k, inner := range g.chains {
 		if j, ok := g.calls[inner]; ok {
 			s.Calls[k].From, s.Calls[k].Result = j+1, 0
+		} else {
+			s.Calls[k].Field = "" // f()().store.Save(): fields of nothing known
 		}
 	}
 	return unit.Unit{
