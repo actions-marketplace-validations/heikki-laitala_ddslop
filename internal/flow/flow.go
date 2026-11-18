@@ -8,6 +8,7 @@ package flow
 
 import (
 	"cmp"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -56,6 +57,9 @@ type index struct {
 	rustModules  map[string]map[string]bool      // Rust crate directory -> its modules' paths (foo::bar), from its files' paths
 	crates       map[string]string               // workspace crate name -> crate directory
 	imports      map[string]map[string]string    // file -> imported name -> path
+	modImports   map[string]map[string]string    // Rust "crate directory#module" -> its own scope's imported name -> path, lib.rs's before main.rs's
+	topImports   map[string]map[string]string    // Rust file -> its own scope's imported name -> path
+	selfAliases  map[string]map[string]bool      // Rust crate directory -> the names it gives itself (extern crate self as name)
 	deps         map[string]map[string]bool      // crate directory -> workspace crates it imports from
 	fields       map[string]map[string]FieldType // package or crate directory -> "Struct.field" -> its type
 	modules      map[string]string               // go.mod directory -> module path
@@ -78,6 +82,15 @@ type FieldType struct {
 type Inputs struct {
 	// Imports maps a file to the names it imports and their paths.
 	Imports map[string]map[string]string
+	// TopImports maps a Rust file to the imports of its own scope (see
+	// rust.Imports): what a path through its module reaches.
+	TopImports map[string]map[string]string
+	// InlineModules maps a Rust file to the modules it declares inline
+	// at its top level (mod facade { ... }).
+	InlineModules map[string][]string
+	// SelfAliases maps each name a Rust crate gives itself (extern crate
+	// self as name) to the root file declaring it.
+	SelfAliases map[string]string
 	// Crates maps a crate directory to the name code uses for the crate.
 	// A directory missing here is named after itself, dashes as
 	// underscores.
@@ -116,7 +129,7 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 		if langs[ext] == nil {
 			langs[ext] = &index{free: map[string][]int{}, methods: map[string][]int{}, owned: map[string][]int{}, owners: map[string]bool{},
 				impls: map[string][]string{}, rustModules: map[string]map[string]bool{},
-				crates: map[string]string{}, imports: in.Imports, deps: map[string]map[string]bool{},
+				crates: map[string]string{}, imports: in.Imports, modImports: map[string]map[string]string{}, topImports: in.TopImports, selfAliases: map[string]map[string]bool{}, deps: map[string]map[string]bool{},
 				fields: in.Fields, modules: in.Modules, tsPackages: in.TSPackages, tsFields: map[string][]FieldType{}, tsImpls: map[string][]unit.Impl{}, tsInterfaces: in.TSInterfaces,
 				libraries: in.Libraries}
 		}
@@ -151,6 +164,13 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 			}
 		}
 	}
+	for alias, file := range in.SelfAliases {
+		ix, crate := indexOf(file), in.Libraries.CrateOf(file)
+		if ix.selfAliases[crate] == nil {
+			ix.selfAliases[crate] = map[string]bool{}
+		}
+		ix.selfAliases[crate][alias] = true
+	}
 	for _, im := range in.Impls {
 		if tsfile.IsSource(im.File) {
 			ix := indexOf(im.File)
@@ -170,8 +190,25 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 		}
 	}
 	for _, file := range in.RustFiles {
-		if m, ok := in.Libraries.ModuleOf(file); ok {
+		if m, ok := in.Libraries.rootOrModule(file); ok {
 			indexOf(file).addModules(m, in.Libraries.CrateOf(file))
+			for _, inline := range in.InlineModules[file] {
+				indexOf(file).addModules(joinModule(m, inline), in.Libraries.CrateOf(file))
+			}
+		}
+	}
+	// Sorted, so that a crate root's names are lib.rs's before main.rs's.
+	for _, file := range slices.Sorted(maps.Keys(in.TopImports)) {
+		if m, ok := in.Libraries.ModuleOf(file); ok && strings.HasSuffix(file, ".rs") {
+			ix, key := indexOf(file), in.Libraries.CrateOf(file)+"#"+m
+			if ix.modImports[key] == nil {
+				ix.modImports[key] = map[string]string{}
+			}
+			for name, path := range in.TopImports[file] {
+				if _, seen := ix.modImports[key][name]; !seen {
+					ix.modImports[key][name] = path
+				}
+			}
 		}
 	}
 	for file, imported := range in.Imports {
@@ -711,22 +748,22 @@ func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, 
 		dir, ok := ix.crates[root]
 		switch {
 		case ok && dir != ix.libraries.CrateOf(caller.File):
-			// acme_auth::tokens::verify: the module after the crate's name.
-			_, module, _ := strings.Cut(c.Qualifier, "::")
-			if u := ix.libraries.inModule(units, ix.free[c.Name], dir, module); u >= 0 {
-				return u
-			}
-			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
+			return ix.imported(units, c.Qualifier+"::"+c.Name)
 		case strings.HasSuffix(caller.File, ".go"):
 			return -1 // Go qualifies only with package names: an outside package
 		case ok, pathKeyword(root), ix.isChildModule(caller, root):
 			// The path names a module of the caller's crate: its function,
-			// else (a re-export, say) the crate's only one of that name,
-			// never the caller's own file's by preference.
-			if u := ix.libraries.inModule(units, ix.free[c.Name], ix.libraries.CrateOf(caller.File), ix.libraries.modulePath(c.Qualifier, caller)); u >= 0 {
+			// else what the module imports by that name from another crate
+			// (pub use lns_tls::provider), else (a re-export within the
+			// crate) the crate's only one of that name, never the caller's
+			// own file's by preference.
+			crate, module := ix.libraries.CrateOf(caller.File), ix.libraries.modulePath(c.Qualifier, caller)
+			if u := ix.libraries.inModule(units, ix.free[c.Name], crate, module); u >= 0 {
 				return u
 			}
-			crate := ix.libraries.CrateOf(caller.File)
+			if path, ok := ix.moduleImport(caller.File, crate, module, c.Name); ok && ix.fromOtherCrate(crate, module, path) {
+				return ix.imported(units, path)
+			}
 			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == crate })
 		}
 		return -1
@@ -759,15 +796,75 @@ func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) in
 	if i := strings.LastIndex(path, "::"); i >= 0 {
 		target = path[i+2:] // the imported name, before any alias
 	}
-	root := firstSegment(path)
-	if pathKeyword(root) {
+	if pathKeyword(firstSegment(path)) {
 		return ix.libraries.pickLocal(units, caller, ix.free[target])
 	}
+	return ix.imported(units, path)
+}
+
+// imported returns the function a path rooted at a crate's name reaches:
+// in a workspace crate, the one in the module after the crate's name
+// (acme_auth::tokens::verify), else the crate's only one of its name; -1
+// for an outside crate's, such as tokio's.
+func (ix index) imported(units []unit.Unit, path string) int {
+	root, rest, _ := strings.Cut(strings.TrimPrefix(path, "::"), "::")
 	dir, ok := ix.crates[root]
 	if !ok {
-		return -1 // an outside crate, such as tokio
+		return -1
 	}
-	return only(units, ix.free[target], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
+	module, name := "", rest
+	if i := strings.LastIndex(rest, "::"); i >= 0 {
+		module, name = rest[:i], rest[i+2:]
+	}
+	if u := ix.libraries.inModule(units, ix.free[name], dir, module); u >= 0 {
+		return u
+	}
+	return only(units, ix.free[name], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == dir })
+}
+
+// fromOtherCrate reports whether a use path written in a module of a
+// crate leaves the crate: its root is another crate's name, not crate,
+// self, super, the crate's own name or one it gives itself (extern crate
+// self as name), or a child module's.
+func (ix index) fromOtherCrate(crate, module, path string) bool {
+	root := firstSegment(strings.TrimPrefix(path, "::"))
+	if ix.selfAliases[crate][root] {
+		return false
+	}
+	if dir, ok := ix.crates[root]; ok {
+		return dir != crate
+	}
+	return !pathKeyword(root) && !ix.rustModules[crate][joinModule(module, root)]
+}
+
+// moduleImport returns the path a module of a crate imports a name by
+// (use, or pub use re-exporting it), and whether its file imports it.
+// A root the module imports itself (use lns_tls as tls; pub use
+// tls::provider, or an item alias: pub use lns_tls::seal as s; pub use s
+// as check) is read through that import, and through the import of its
+// root in turn, so the path's root is a crate's name, crate, self, super
+// or a child module's name. The crate root a call in a root file names
+// (lib.rs, main.rs, a target's a manifest places) is its own file's:
+// each roots its own crate.
+func (ix index) moduleImport(from, crate, module, name string) (string, bool) {
+	imported := ix.modImports[crate+"#"+module]
+	if m, ok := ix.libraries.rootOrModule(from); module == "" && ok && m == "" {
+		imported = ix.topImports[from]
+	}
+	path, ok := imported[name]
+	for seen := map[string]bool{name: true}; ok; {
+		root, rest, more := strings.Cut(path, "::")
+		full, alias := imported[root]
+		if !alias || seen[root] {
+			break
+		}
+		seen[root] = true
+		path = full
+		if more {
+			path += "::" + rest
+		}
+	}
+	return path, ok && strings.Contains(path, "::")
 }
 
 // resolveTypeScript resolves a TypeScript call. A name the file does not
@@ -1023,6 +1120,15 @@ func (l Libraries) ModuleOf(file string) (string, bool) {
 		return "", true
 	}
 	return modulePathOf(rel), true
+}
+
+// rootOrModule is ModuleOf, with the root file of a target a manifest
+// places (see Targets) its own crate's root.
+func (l Libraries) rootOrModule(file string) (string, bool) {
+	if l.Targets[file] == file {
+		return "", true
+	}
+	return l.ModuleOf(file)
 }
 
 // owns reports whether a file under the directory of a moved library's
