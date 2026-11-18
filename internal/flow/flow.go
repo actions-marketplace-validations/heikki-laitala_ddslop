@@ -63,7 +63,7 @@ type index struct {
 	deps         map[string]map[string]bool      // crate directory -> workspace crates it imports from
 	fields       map[string]map[string]FieldType // package or crate directory -> "Struct.field" -> its type
 	modules      map[string]string               // go.mod directory -> module path
-	tsPackages   map[string]string               // TypeScript package.json directory -> package name
+	tsModules    tsfile.Modules                  // what resolves TypeScript module paths
 	tsFields     map[string][]FieldType          // TypeScript "Type.field" -> the field's type in each type of that name, one per file
 	tsImpls      map[string][]unit.Impl          // TypeScript "declaring file#interface" -> the classes implementing it
 	tsInterfaces map[string][]string             // TypeScript interface name -> the files declaring one of that name
@@ -100,9 +100,8 @@ type Inputs struct {
 	Fields map[string]map[string]FieldType
 	// Modules maps the directory of each go.mod to its module path.
 	Modules map[string]string
-	// TSPackages maps the directory of each TypeScript package.json to
-	// the package's name (@acme/db).
-	TSPackages map[string]string
+	// TSModules resolves the module paths TypeScript files import.
+	TSModules tsfile.Modules
 	// TSInterfaces maps the name of each TypeScript interface declaring
 	// methods to the files declaring one of that name.
 	TSInterfaces map[string][]string
@@ -130,7 +129,7 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 			langs[ext] = &index{free: map[string][]int{}, methods: map[string][]int{}, owned: map[string][]int{}, owners: map[string]bool{},
 				impls: map[string][]string{}, rustModules: map[string]map[string]bool{},
 				crates: map[string]string{}, imports: in.Imports, modImports: map[string]map[string]string{}, topImports: in.TopImports, selfAliases: map[string]map[string]bool{}, deps: map[string]map[string]bool{},
-				fields: in.Fields, modules: in.Modules, tsPackages: in.TSPackages, tsFields: map[string][]FieldType{}, tsImpls: map[string][]unit.Impl{}, tsInterfaces: in.TSInterfaces,
+				fields: in.Fields, modules: in.Modules, tsModules: in.TSModules, tsFields: map[string][]FieldType{}, tsImpls: map[string][]unit.Impl{}, tsInterfaces: in.TSInterfaces,
 				libraries: in.Libraries}
 		}
 		return langs[ext]
@@ -767,8 +766,8 @@ func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, 
 			if u := ix.libraries.inModule(units, ix.free[c.Name], crate, module); u >= 0 {
 				return u
 			}
-			if path, ok := ix.moduleImport(caller.File, crate, module, c.Name); ok && ix.fromOtherCrate(crate, module, path) {
-				return ix.imported(units, path)
+			if u, ok := ix.reexported(units, caller.File, crate, module, c.Name); ok {
+				return u
 			}
 			return only(units, ix.free[c.Name], func(u unit.Unit) bool { return ix.libraries.CrateOf(u.File) == crate })
 		}
@@ -782,12 +781,19 @@ func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, 
 }
 
 // resolveFree resolves a bare call foo(). A name the caller declares itself
-// is a closure or function value, not a function. Otherwise the caller's
-// file and crate come first; a function of another crate is reachable only
-// through a use import, and only a workspace crate's is resolved.
+// is a closure or function value, not a function, except its own name: a
+// call by it recurses, or from a method calls the function of that name.
+// Otherwise the caller's file and crate come first; a function of another
+// crate is reachable only through a use import, and only a workspace
+// crate's is resolved.
 func (ix index) resolveFree(units []unit.Unit, caller unit.Unit, name string) int {
+	_, own := split(caller.Name)
 	for _, l := range caller.Leaves {
 		if l.Declares && l.Text == name {
+			if l.Text == own {
+				own = "" // its own name, declared once
+				continue
+			}
 			return -1
 		}
 	}
@@ -843,8 +849,70 @@ func (ix index) fromOtherCrate(crate, module, path string) bool {
 	return !pathKeyword(root) && !ix.rustModules[crate][joinModule(module, root)]
 }
 
+// reexported resolves a call to name in a module of a crate that defines
+// no function of the name, through what the module's own scope imports
+// from another crate: the name itself (pub use lns_tls::provider), or a
+// module the path goes through (pub use lns_tls::inner, called as
+// tls::inner::provider) when no module of the crate has that name, by
+// name or else by a glob (see globbed); see imported for which function
+// the path then reaches. ok is false when the module imports neither from
+// another crate: the name is the crate's own, re-exported from elsewhere
+// in it.
+func (ix index) reexported(units []unit.Unit, from, crate, module, name string) (int, bool) {
+	segments := []string{name}
+	if module != "" {
+		segments = append(strings.Split(module, "::"), name)
+	}
+	for i := len(segments) - 1; i >= 0; i-- {
+		scope, rest := strings.Join(segments[:i], "::"), strings.Join(segments[i+1:], "::")
+		if rest != "" && ix.rustModules[crate][joinModule(scope, segments[i])] {
+			break // a module of the crate, whose imports were read already
+		}
+		// a name imported from another crate, or a crate's root the path
+		// goes on through (pub use lns_tls as inner; tls::inner::provider)
+		if path, ok := ix.moduleImport(from, crate, scope, segments[i]); ok && (rest != "" || strings.Contains(path, "::")) {
+			if !ix.fromOtherCrate(crate, scope, path) {
+				break
+			}
+			return ix.imported(units, joinModule(path, rest)), true
+		}
+		if u, ok := ix.globbed(units, from, crate, scope, joinModule(segments[i], rest)); ok {
+			return u, true
+		}
+	}
+	return -1, false
+}
+
+// globbed resolves a path (a name and what follows it) through the globs
+// of a module's own scope (pub use lns_tls::*), each read through the
+// module's aliases: when every glob leaves the crate, the first to reach a
+// workspace crate's function (see imported), else none. ok is false when
+// the module has no glob, or one within the crate, which may supply the
+// name as well.
+func (ix index) globbed(units []unit.Unit, from, crate, module, path string) (int, bool) {
+	imported := ix.moduleScope(from, crate, module)
+	var globs []string
+	for _, key := range slices.Sorted(maps.Keys(imported)) {
+		if !strings.HasPrefix(key, "*") {
+			continue
+		}
+		glob := throughAliases(imported, imported[key], key)
+		if !ix.fromOtherCrate(crate, module, glob) {
+			return -1, false
+		}
+		globs = append(globs, glob)
+	}
+	for _, glob := range globs {
+		if u := ix.imported(units, glob+"::"+path); u >= 0 {
+			return u, true
+		}
+	}
+	return -1, len(globs) > 0
+}
+
 // moduleImport returns the path a module of a crate imports a name by
-// (use, or pub use re-exporting it), and whether its file imports it.
+// (use, or pub use re-exporting it), and whether its file imports it: a
+// path, or a crate's root alone (pub use lns_tls as inner).
 // A root the module imports itself (use lns_tls as tls; pub use
 // tls::provider, or an item alias: pub use lns_tls::seal as s; pub use s
 // as check) is read through that import, and through the import of its
@@ -853,16 +921,29 @@ func (ix index) fromOtherCrate(crate, module, path string) bool {
 // (lib.rs, main.rs, a target's a manifest places) is its own file's:
 // each roots its own crate.
 func (ix index) moduleImport(from, crate, module, name string) (string, bool) {
-	imported := ix.modImports[crate+"#"+module]
-	if m, ok := ix.libraries.rootOrModule(from); module == "" && ok && m == "" {
-		imported = ix.topImports[from]
-	}
+	imported := ix.moduleScope(from, crate, module)
 	path, ok := imported[name]
-	for seen := map[string]bool{name: true}; ok; {
+	return throughAliases(imported, path, name), ok
+}
+
+// moduleScope returns the imports of a module's own scope by imported
+// name, for a call written in from (see moduleImport).
+func (ix index) moduleScope(from, crate, module string) map[string]string {
+	if m, ok := ix.libraries.rootOrModule(from); module == "" && ok && m == "" {
+		return ix.topImports[from]
+	}
+	return ix.modImports[crate+"#"+module]
+}
+
+// throughAliases reads a path a scope imports name by through the scope's
+// own import of its root, and of that one's root in turn, until the root
+// is none of them or one followed already.
+func throughAliases(imported map[string]string, path, name string) string {
+	for seen := map[string]bool{name: true}; ; {
 		root, rest, more := strings.Cut(path, "::")
 		full, alias := imported[root]
 		if !alias || seen[root] {
-			break
+			return path
 		}
 		seen[root] = true
 		path = full
@@ -870,17 +951,16 @@ func (ix index) moduleImport(from, crate, module, name string) (string, bool) {
 			path += "::" + rest
 		}
 	}
-	return path, ok && strings.Contains(path, "::")
 }
 
 // resolveTypeScript resolves a TypeScript call. A name the file does not
 // import is its own function's, or a global's, unless the caller declares
 // it (a parameter), its own name aside (a recursive call); an imported one
 // (a path call qualified by its module) is the exported function of that
-// name in the module a relative path names (see tsfile.ModuleIs), or
+// name in the module a relative path names (see tsfile.ModulePath), or
 // anywhere in the workspace package a package path names (@acme/db,
 // @acme/db/query) outside the packages nested in it, never an outside
-// package's (see tsfile.ModuleFiles); a call on this is the caller's
+// package's (see tsfile.Modules.Files); a call on this is the caller's
 // class's method; one on a value whose type the code states (a typed
 // parameter, a field of this or of a typed variable) is the method of that
 // type's class (see resolveTSMethod, tsFieldType). Without a type, the
@@ -894,7 +974,7 @@ func (ix index) resolveTypeScript(units []unit.Unit, caller unit.Unit, owner str
 		}
 		return only(units, ix.free[c.Name], sameFile), false
 	case c.Kind == unit.PathCall:
-		inModule := tsfile.ModuleFiles(caller.File, c.Qualifier, ix.tsPackages)
+		inModule := ix.tsModules.Files(caller.File, c.Qualifier)
 		return only(units, ix.free[c.Name], func(u unit.Unit) bool { return u.Public && inModule(u.File) }), false
 	case c.Qualifier == "self" && owner != "":
 		return only(units, ix.owned[owner+"::"+c.Name], sameFile), false
@@ -942,11 +1022,11 @@ func (ix index) resolveTSMethod(units []unit.Unit, home, typ, method string) (in
 
 // tsDeclares reports, for a file, whether it is where the TypeScript type
 // typ, as unit.Call.Type writes it read in home, is declared: in the
-// module it is imported from (see tsfile.ModuleFiles), or home itself for
+// module it is imported from (see tsfile.Modules.Files), or home itself for
 // a local type.
 func (ix index) tsDeclares(home, typ string) func(file string) bool {
 	if i := strings.LastIndex(typ, "."); i >= 0 {
-		return tsfile.ModuleFiles(home, typ[:i], ix.tsPackages)
+		return ix.tsModules.Files(home, typ[:i])
 	}
 	return func(file string) bool { return file == home }
 }

@@ -262,6 +262,17 @@ func TestCheckReportsATypeScriptCycleThroughAnImport(t *testing.T) {
 	wantSites(t, r, "src/api/routes.ts:serve:6 src/db/client.ts:import:2")
 }
 
+// An import through a tsconfig path alias is a dependency as a relative
+// one is.
+func TestCheckReportsATypeScriptCycleThroughAPathAlias(t *testing.T) {
+	r := wantCycleBetween(t, "src/api -> src/db, src/db -> src/api", repo(t, map[string]string{
+		"tsconfig.json":     `{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}`,
+		"src/api/routes.ts": "import { TABLE } from \"@/db/schema\";\n\nexport const LIMIT = TABLE.length;\n",
+		"src/db/schema.ts":  "import { LIMIT } from \"@/api/routes\";\n\nexport const TABLE = \"rows\";\nexport const MAX = LIMIT;\n",
+	}))
+	wantSites(t, r, "src/api/routes.ts:import:1 src/db/schema.ts:import:1")
+}
+
 // What closes no TypeScript cycle: files of one directory, a barrel
 // re-exporting a directory below it, a dynamic import (loaded later, as
 // code breaking a cycle does), an import of types only (compiled away), a
@@ -281,5 +292,95 @@ func TestCheckReportsNoTypeScriptCycleWithoutOne(t *testing.T) {
 		"src/model/user.ts":     "import type { Db } from \"../store/db\";\nimport { type Conn, type Pool } from \"../store/pool\";\n\nexport function makeUser(db: Db, c: Conn, p: Pool) {\n  return { db, c, p };\n}\n",
 		"src/store/db.ts":       "import { makeUser } from \"../model/user\";\n\nexport interface Db {\n  id: string;\n}\n\nexport function load(db: Db) {\n  return makeUser(db, 1, 2);\n}\n",
 		"src/store/pool.ts":     "export type Conn = number;\nexport type Pool = number;\n",
+	}))
+}
+
+// A directory and directories below it that depend on each other with
+// no file loop joining them are one candidate, for the upper directory:
+// its aggregator imports them, and they import back a file of it that
+// belongs below them (move-shared-down), each such file named, every way
+// back an occurrence. Sibling
+// directories with no file loop are none.
+func TestCheckReportsADirectoryItsSubdirectoriesImportBackOnce(t *testing.T) {
+	r := wantCycles(t, 1, "one candidate for src/lib", repo(t, map[string]string{
+		"src/lib/library.ts":             "import { accordion } from \"./accordion/accordion\";\nimport { card } from \"./card/card\";\n\nexport function library() {\n  return [accordion(), card()];\n}\n",
+		"src/lib/rules.ts":               "export function rules() {\n  return 1;\n}\n",
+		"src/lib/helpers.ts":             "export function helper() {\n  return 2;\n}\n",
+		"src/lib/accordion/accordion.ts": "import { rules } from \"../rules\";\n\nexport function accordion() {\n  return rules();\n}\n",
+		"src/lib/card/card.ts":           "import { helper } from \"../helpers\";\nimport { rules } from \"../rules\";\n\nexport function card() {\n  return helper() + rules();\n}\n",
+		"src/x/one.ts":                   "import { two } from \"../y/two\";\n\nexport function one() {\n  return two();\n}\n\nexport function three() {\n  return 3;\n}\n",
+		"src/y/two.ts":                   "export function two() {\n  return 2;\n}\n",
+		"src/y/four.ts":                  "import { three } from \"../x/one\";\n\nexport function four() {\n  return three();\n}\n",
+	}))
+	c := r.Candidates[0]
+	if c.Suggestion.Action != "move-shared-down" {
+		t.Errorf("action = %s, want move-shared-down", c.Suggestion.Action)
+	}
+	want := "src/lib -> src/lib/accordion, src/lib/accordion -> src/lib/rules.ts, src/lib -> src/lib/card, src/lib/card -> src/lib/helpers.ts, src/lib/card -> src/lib/rules.ts"
+	if got := strings.Join(c.Values, ", "); got != want {
+		t.Errorf("values = %s, want %s", got, want)
+	}
+	wantSites(t, r, "src/lib/accordion/accordion.ts:accordion:4 src/lib/card/card.ts:card:5 src/lib/card/card.ts:card:5")
+}
+
+// A directory and one below it joined by a loop of files are a cycle to
+// break, as any pair is.
+func TestCheckReportsADirectoryAndOneBelowItInAFileLoopAsACycle(t *testing.T) {
+	r := wantCycleBetween(t, "src/lib -> src/lib/accordion, src/lib/accordion -> src/lib", repo(t, map[string]string{
+		"src/lib/rules.ts":               "import { accordion } from \"./accordion/accordion\";\n\nexport function rules(n: number): number {\n  return n > 0 ? accordion(n - 1) : 0;\n}\n",
+		"src/lib/accordion/accordion.ts": "import { rules } from \"../rules\";\n\nexport function accordion(n: number): number {\n  return rules(n);\n}\n",
+	}))
+	if a := r.Candidates[0].Suggestion.Action; a != "break-cycle" {
+		t.Errorf("action = %s, want break-cycle", a)
+	}
+}
+
+// A file loop through several files of a directory closes a cycle of
+// the directories: one.ts calls two.ts, which calls three.ts, which calls
+// one.ts back.
+func TestCheckReportsATypeScriptCycleThroughAFileLoop(t *testing.T) {
+	wantCycleBetween(t, "src/a -> src/b, src/b -> src/a", repo(t, map[string]string{
+		"src/a/one.ts":   "import { two } from \"../b/two\";\n\nexport function one(n: number): number {\n  return n > 0 ? two(n - 1) : 0;\n}\n",
+		"src/b/two.ts":   "import { three } from \"../a/three\";\n\nexport function two(n: number): number {\n  return three(n);\n}\n",
+		"src/a/three.ts": "import { one } from \"./one\";\n\nexport function three(n: number): number {\n  return one(n);\n}\n",
+	}))
+}
+
+// Two loops of files joining the same two directories, one of them
+// through a third directory too, are one cycle of the two: a pair is
+// reported once.
+func TestCheckReportsTwoFileLoopsOfTheSameDirectoriesOnce(t *testing.T) {
+	r := wantCycles(t, 1, "one pair", repo(t, map[string]string{
+		"src/a/one.ts":   "import { two } from \"../b/two\";\n\nexport function one(n: number): number {\n  return two(n);\n}\n",
+		"src/b/two.ts":   "import { one } from \"../a/one\";\n\nexport function two(n: number): number {\n  return n > 0 ? one(n - 1) : 0;\n}\n",
+		"src/a/three.ts": "import { four } from \"../b/four\";\n\nexport function three(n: number): number {\n  return four(n);\n}\n",
+		"src/b/four.ts":  "import { three } from \"../a/three\";\nimport { five } from \"../c/five\";\n\nexport function four(n: number): number {\n  return n > 0 ? three(n - 1) : five();\n}\n",
+		"src/c/five.ts":  "import { three } from \"../a/three\";\n\nexport function five(): number {\n  return three(0);\n}\n",
+	}))
+	if got := strings.Join(r.Candidates[0].Values, ", "); got != "src/a -> src/b, src/b -> src/a" {
+		t.Fatalf("values = %s, want the pair", got)
+	}
+}
+
+// The root directory is above every other: its aggregator and a file the
+// directories below it import back are one candidate too.
+func TestCheckReportsTheRootDirectoryItsSubdirectoriesImportBack(t *testing.T) {
+	r := wantCycles(t, 1, "one candidate for the root", repo(t, map[string]string{
+		"library.ts":   "import { card } from \"./card/card\";\n\nexport function library() {\n  return [card()];\n}\n",
+		"helpers.ts":   "export function helper() {\n  return 2;\n}\n",
+		"card/card.ts": "import { helper } from \"../helpers\";\n\nexport function card() {\n  return helper();\n}\n",
+	}))
+	if got := strings.Join(r.Candidates[0].Values, ", "); got != ". -> card, card -> helpers.ts" {
+		t.Errorf("values = %s, want the root and card", got)
+	}
+}
+
+// An import ending in a slash names the directory's index file, not a
+// file of the same path: tsc loads b/index.ts for "../b/" beside b.ts.
+func TestCheckReportsATypeScriptCycleThroughADirectoryImport(t *testing.T) {
+	wantCycleBetween(t, "src/a -> src/b, src/b -> src/a", repo(t, map[string]string{
+		"src/a/x.ts":     "import { y } from \"../b/\";\n\nexport const X = 1;\n\nexport function x() {\n  return y;\n}\n",
+		"src/b/index.ts": "import { X } from \"../a/x\";\n\nexport const y = X + 1;\n",
+		"src/b.ts":       "export const y = 2;\n",
 	}))
 }

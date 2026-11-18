@@ -206,6 +206,29 @@ func tsPackageNames(root string, files []index.File) map[string]string {
 	return names
 }
 
+// tsModules gathers what resolves the module paths TypeScript files
+// import: the names of the workspace packages, the tsconfig.json of every
+// directory holding a TypeScript file or above one, and the stems of the
+// TypeScript files.
+func tsModules(root string, files []index.File) tsfile.Modules {
+	m := tsfile.Modules{Packages: tsPackageNames(root, files), Configs: map[string]tsfile.Config{}, Stems: map[string]bool{}}
+	read := func(file string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(root, filepath.FromSlash(file))) //nolint:gosec // a tsconfig the analysed one extends
+	}
+	raw := manifests(root, files, tsfile.IsSource, "tsconfig.json", func(data []byte) ([]byte, bool) { return data, true })
+	for dir, data := range raw {
+		if c, ok := tsfile.ReadConfig(dir, data, read); ok {
+			m.Configs[dir] = c
+		}
+	}
+	for _, f := range files {
+		if tsfile.IsSource(f.Path) {
+			m.Stems[tsfile.Stem(f.Path)] = true
+		}
+	}
+	return m
+}
+
 // graphInputs collects what call resolution needs: each file's imports,
 // each crate's name from its Cargo.toml under root, the types of Go
 // struct fields, the module path of each go.mod above a Go file, the
@@ -218,9 +241,8 @@ func graphInputs(root string, tests bool, files []index.File) flow.Inputs {
 		path := golang.ModulePath(data)
 		return path, path != ""
 	})
-	tsPackages := tsPackageNames(root, files)
 	in := flow.Inputs{Imports: map[string]map[string]string{}, TopImports: map[string]map[string]string{}, InlineModules: map[string][]string{}, SelfAliases: map[string]string{}, Crates: map[string]string{},
-		Fields: map[string]map[string]flow.FieldType{}, Modules: modules, TSPackages: tsPackages, TSInterfaces: map[string][]string{},
+		Fields: map[string]map[string]flow.FieldType{}, Modules: modules, TSModules: tsModules(root, files), TSInterfaces: map[string][]string{},
 		Libraries: packages(root, files).Libraries}
 	// an interface a class matches by shape may run that class too, so no
 	// call resolves through it; with --tests, test classes are not counted

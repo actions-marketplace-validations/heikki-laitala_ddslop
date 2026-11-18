@@ -451,7 +451,9 @@ types the code states (below): a free call to the caller's file's
 function (a name a file does not import is its own, or a global, unless
 the caller declares the name, as a parameter does), a relative import to
 the exported function of that name in the file it names, extension or
-not, or in its `index` file (a default import is taken under its local
+not, else, with no such file, in its `index` file, as tsc takes `db.ts`
+over `db/index.ts` and `./db/`, ending in a slash, as the directory's
+`index` alone (a default import is taken under its local
 name, which a private function of the module may share), and a self call
 to the class's method. A method call on a value whose type the code
 states resolves to that class's method: a typed parameter
@@ -472,9 +474,30 @@ package, by its `package.json` name or a subpath of it (`@acme/db`,
 anywhere in the package's directory outside the packages nested in it,
 when exactly one is there: its `main` and `exports` often name build
 output (`dist/`), and its entry file re-exports the rest, so the
-directory is what the name stands for, as a Go package's is. An outside
-package's import (`node:fs`, `lodash`) resolves to nothing, and nor does
-a method call on a value of no stated type: JavaScript's own method
+directory is what the name stands for, as a Go package's is. An import
+through a path alias (`@/lib/db`) resolves as tsc resolves it, before
+the workspace packages: by the `compilerOptions.paths` of the nearest
+`tsconfig.json` above the importing file, the exact pattern, else the
+wildcard one of the longest prefix (the first declared of two alike), to
+the first of its targets that is a file of ours, or a workspace
+package's directory, which stands for the package as its name does, or,
+with no pattern matching, under its `baseUrl`. Targets are read from the effective
+`baseUrl`, else from the directory of the file declaring the paths, so
+inherited paths follow a child's own `baseUrl`. The file is JSON with
+comments, trailing commas, perhaps a byte order mark and Windows
+separators read as slashes, and a relative
+`extends`, or each of an array of them in turn, gives what it does not
+say itself (a `null` `paths` or `baseUrl` clears what it inherits),
+each read with all it extends, through a chain of any
+length that ends where a file would extend itself; a package's `extends`
+(`@tsconfig/node20`), project references and `rootDirs` are not read. A
+relative import, a path alias and a package name resolve through one
+`tsfile.Modules`, for calls, whole imports and directory cycles alike.
+On a 630-file TypeScript monorepo whose apps import through `@/`, this
+resolved 502 more calls (14% of them, from 9%), and its directories'
+imports closed two cycles, both real. An outside package's import
+(`node:fs`, `lodash`) resolves to nothing, and nor does a method call
+on a value of no stated type: JavaScript's own method
 names (`map`, `get`, `then`) are too many to tell from the code's.
 Wrappers work as in Go, but a function giving a parameter a default
 value (`opts = {}`) or taking an optional one (`id?: string`) is no
@@ -484,7 +507,7 @@ an iterator, not the call's value; class members are left out, as they
 may implement an interface, which TypeScript checks by shape. All
 TypeScript extensions share one call index, so a `.tsx` component calls
 a `.ts` helper. What the call graph needs to know of TypeScript files by
-name (which are source, which file a relative import names) lives in
+name (which are source, which file an import names) lives in
 `internal/lang/tsfile`, which holds no parser, so `flow` links no
 grammar. A TypeScript package serves only the analysed code when its
 `package.json`, the nearest above a file, is `"private": true`, which
@@ -514,8 +537,9 @@ website), a first measure without these rules gave 15 unused exports,
 among them a drizzle schema's relations and a page's `getStaticPaths`;
 with them, 6, all named nowhere else (`useMenuState`, `highlightCode`);
 none on Excalidraw and Hono, and the wrappers stayed the same. Calls
-through path aliases (`@/lib/x`) are not followed, nor method calls on a
-value of no stated type or of an interface several classes implement. A
+through an alias only a bundler's configuration declares (Vite's
+`resolve.alias`) are not followed, nor method calls on a value of no
+stated type or of an interface several classes implement. A
 name bound again inside a function (a nested function's parameter, a
 `for`-`of` loop's, a `catch` clause's, a destructuring) loses the outer
 one's type, and a name a nested function or block binds is that scope's:
@@ -1126,9 +1150,12 @@ than linking to every candidate, because a wrong edge pollutes every slice
 that crosses it.
 
 - A bare call `foo()` to a name the caller declares itself (a closure or
-  function value, `let unsigned = |v| ...`) is not a function call.
-  Otherwise it prefers the caller's file, then a unique function in its
-  crate. It leaves the crate only through a `use` import, and only into a
+  function value, `let unsigned = |v| ...`) is not a function call,
+  except the caller's own name: `walk()` in `walk` recurses, and
+  `CrateOf()` in the method `Libraries.CrateOf` calls the function of
+  that name, unless a local of the name shadows it. Otherwise it
+  prefers the caller's file, then a unique function in its crate. It
+  leaves the crate only through a `use` import, and only into a
   workspace crate (aliases followed); an import from an outside crate
   such as `tokio` is never resolved to a repository function.
 - `Type::f` matches methods of `Type` (generics ignored), `Self::f` the
@@ -1156,14 +1183,22 @@ that crosses it.
   a root or item alias the module imports read through its imports)
   is that crate's, in the module the path names
   (`lns_tls::api::provider`) first, or none for an outside crate's,
-  and one re-exported from elsewhere in the crate (an inline module
-  counts as the crate's) falls back to
+  and so is one in a module the path goes through that the module
+  imports from another crate rather than declares (`pub use
+  lns_tls::inner` in `tls.rs`, called as `crate::tls::inner::provider()`,
+  is `lns_tls::inner::provider`, and `pub use lns_tls as inner` the
+  crate's root `provider`). A name the module's own scope
+  imports by neither comes from its globs (`pub use lns_tls::*`, read
+  through its aliases) when all of them leave the crate: the first to
+  reach a workspace crate's function, as a named import does, else none
+  (`pub use rustls::*`). One re-exported from elsewhere in the crate,
+  by name or by a glob of the module's (an inline module
+  counts as the crate's), falls back to
   the crate's only one of that name. Without the import, a
   `crate::tls::provider()` call reached an unrelated `provider` of the
-  caller's crate and reported a false cycle. A module re-exported from
-  another crate (`pub use lns_tls::inner`), a glob of one, and an
-  inline module's re-export (`mod tls { pub use lns_tls::provider; }`)
-  still fall back. Before, a name several modules
+  caller's crate and reported a false cycle. An inline module's
+  re-export (`mod tls { pub use lns_tls::provider; }`) still falls
+  back: the adapter keeps only each file's own scope's imports. Before, a name several modules
   define (`plan`, `resolve`, `new`) stayed unresolved, or went to the
   caller's own file's: on the 739k-line workspace, naming the module
   resolved 362 more calls and found 4 more real cycles. On a
@@ -1813,8 +1848,9 @@ Only Rust modules within a crate, and TypeScript directories, can form
 one: Go's compiler forbids import cycles between packages, and Cargo
 cycles between crates. A TypeScript directory, the module `map`
 describes, depends on another it calls or imports from by a relative
-path. An import of types only is none, as it uses no value of the
-module: `import type { A }`, which compiling removes, or
+path or a tsconfig path alias. An import of types only is none, as it
+uses no value of the module: `import type { A }`, which compiling
+removes, or
 `import { type A }`, which `verbatimModuleSyntax` keeps as an empty
 import that still loads the module, so a cycle through it is missed.
 Nor is a re-export (`export * from`, a barrel's) or a dynamic
@@ -1826,6 +1862,30 @@ logger, the configuration), so moving that module down a level breaks
 them all. Taking the files directly in `src/` as modules of their own,
 as Rust's are, was measured and dropped: Excalidraw's cycles went from
 37 to 54, between single files.
+
+A pair of directories is a cycle only when their files loop: a
+directory's dependency on another counts when it joins two files of
+one loop of files (`codemap.Graph.Loops`, the strongly connected sets of the
+file graph of the same calls and imports), each loop grouped by
+directory on its own so that edges of different loops close nothing.
+The rest were one finding read many times. Sibling directories
+depending on each other with no loop of files were mostly a directory
+mixing layers: NestJS module directories hold both a controller using
+the shared guards and a service those guards use. And a directory with
+the directories below it was reported once per directory below, though
+one move fixes them all: on a 1,600-file TypeScript monorepo, one
+directory's aggregator imported 37 component directories, which
+imported back its shared `rules.ts`, `unions.ts` and `helpers.ts`,
+16 candidates. Such a directory is now one candidate for the upper
+directory, action `move-shared-down`, keyed by it alone so it keeps its
+fingerprint as directories below come and go: its values pair each
+directory below with every file of the upper one it reaches back, so
+moving them all clears it, each occurrence that way back's first call,
+else import, not marked `ddslop:ignore`. Sibling directories without
+a loop of files are no candidate. Measured: on that monorepo, 42
+candidates became 14 for upper directories and no cycle; on a
+1,700-file one, 69 became 22 cycles of real loops (entities importing
+each other, mostly) and 10 for upper directories.
 
 The map does not say which side of a pair is wrong. A weighted greedy
 feedback arc set (Eades, Lin and Smyth) was measured for that: it broke

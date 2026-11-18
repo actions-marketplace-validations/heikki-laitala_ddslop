@@ -322,9 +322,23 @@ func TestCheckFollowsTypeScriptWorkspacePackages(t *testing.T) {
 	})
 }
 
+// A call through a tsconfig path alias (@/lib/db) finds the function the
+// file the alias maps to exports, so a wrapper around it is one.
+func TestCheckFollowsTypeScriptPathAliases(t *testing.T) {
+	r := oneCandidate[jsonReport](t, repo(t, map[string]string{
+		"apps/web/tsconfig.json":      "{\n  // the app's aliases\n  \"compilerOptions\": {\"paths\": {\"@/*\": [\"./src/*\"],},},\n}\n",
+		"apps/web/src/lib/db.ts":      "export function query(sql: string) {\n  const trimmed = sql.trim();\n  return trimmed.length;\n}\n",
+		"apps/web/src/api/handler.ts": "import { query } from \"@/lib/db\";\n\nexport function select(sql: string) {\n  return query(sql);\n}\n",
+	}))
+
+	testutil.Lines(t, "wrappers", candidateLines(r), []string{"typescript pass-through [apps/web/src/api/handler.ts select]"})
+}
+
 // A private package's exports serve only the analysed code: one nothing
 // names is unused. A default export, a framework's function and the
-// exports of a module imported whole are called without their names.
+// exports of a module imported whole are called without their names; a
+// whole import through an alias is of the one file it resolves to
+// (store.ts, not store/index.ts beside it).
 func TestCheckReportsUnusedExportsOfPrivateTypeScriptPackages(t *testing.T) {
 	root := repo(t, map[string]string{
 		"apps/web/package.json":        `{"name": "web", "private": true}`,
@@ -334,6 +348,10 @@ func TestCheckReportsUnusedExportsOfPrivateTypeScriptPackages(t *testing.T) {
 		"apps/web/src/db/client.ts":    "import * as schema from \"./schema\";\n\nexport const db = { schema };\n",
 		"apps/web/src/auth/schema.ts":  "export function sessionRelations() {\n  return [];\n}\n",
 		"apps/web/src/auth/client.ts":  "import * as schema from \"@/auth/schema\";\n\nexport const auth = { schema };\n",
+		"apps/web/tsconfig.json":       `{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}}`,
+		"apps/web/src/store.ts":        "export function storeRows() {\n  return [];\n}\n",
+		"apps/web/src/store/index.ts":  "export function staleIndex() {\n  return [];\n}\n",
+		"apps/web/src/app.ts":          "import * as store from \"@/store\";\n\nexport const app = { store };\n",
 		"apps/web/src/util.test.ts":    "export function fixtureOnly() {\n  return 1;\n}\n",
 		"packages/lib/package.json":    `{"name": "@acme/lib"}`,
 		"packages/lib/src/index.ts":    "export function publishedApi() {\n  return 1;\n}\n",
@@ -343,6 +361,7 @@ func TestCheckReportsUnusedExportsOfPrivateTypeScriptPackages(t *testing.T) {
 
 	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), []string{
 		"typescript dead-code [apps/web/src/util.ts forgottenHelper]",
+		"typescript dead-code [apps/web/src/store/index.ts staleIndex]",
 	})
 }
 
