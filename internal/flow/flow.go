@@ -756,8 +756,14 @@ func (ix index) resolveNamed(units []unit.Unit, caller unit.Unit, owner string, 
 			// else what the module imports by that name from another crate
 			// (pub use lns_tls::provider), else (a re-export within the
 			// crate) the crate's only one of that name, never the caller's
-			// own file's by preference.
+			// own file's by preference. The crate's own name roots the path
+			// at the crate, as crate:: does (lns_ledger::mock from its
+			// binary is its mock module), unless a child module of the
+			// caller's has that name: Rust reads the path through it.
 			crate, module := ix.libraries.CrateOf(caller.File), ix.libraries.modulePath(c.Qualifier, caller)
+			if ok && !ix.isChildModule(caller, root) {
+				_, module, _ = strings.Cut(c.Qualifier, "::")
+			}
 			if u := ix.libraries.inModule(units, ix.free[c.Name], crate, module); u >= 0 {
 				return u
 			}
