@@ -80,7 +80,8 @@ type FieldType struct {
 
 // Inputs are what call resolution needs besides the units.
 type Inputs struct {
-	// Imports maps a file to the names it imports and their paths.
+	// Imports maps a file to the names it imports and their paths: a Rust
+	// use's, or a Go import's.
 	Imports map[string]map[string]string
 	// TopImports maps a Rust file to the imports of its own scope (see
 	// rust.Imports): what a path through its module reaches.
@@ -211,6 +212,9 @@ func Build(in Inputs, units []unit.Unit) *Graph {
 		}
 	}
 	for file, imported := range in.Imports {
+		if !strings.HasSuffix(file, ".rs") {
+			continue // a Go import path names a package, not a crate
+		}
 		ix, crate := indexOf(file), in.Libraries.CrateOf(file)
 		for _, path := range imported {
 			if dir, ok := ix.crates[firstSegment(path)]; ok && dir != crate {
@@ -337,8 +341,40 @@ func (r *callResolver) resolveCall(c unit.Call) (int, bool, bool) {
 				}
 			}
 		}
+		if producer := r.caller.Calls[c.From-1]; callee < 0 && constructor(producer.Name) && r.ix.outsidePackage(r.caller.File, producer) {
+			return -1, false, false // pgxpool.New()'s value: none of ours
+		}
 	}
 	return r.ix.resolve(r.units, r.caller, r.owner, c)
+}
+
+// constructor reports whether a Go function's name is a constructor's, by
+// Go's convention (New, NewClient, Open, Dial, Connect...): what it
+// returns is its own package's value, as a generic helper's (cmp.Or,
+// slices.Max) need not be.
+func constructor(name string) bool {
+	for _, prefix := range []string{"New", "Open", "Dial", "Connect"} {
+		if rest, ok := strings.CutPrefix(name, prefix); ok && (rest == "" || unicode.IsUpper(rune(rest[0]))) {
+			return true
+		}
+	}
+	return false
+}
+
+// outsidePackage reports whether a Go call is a function of a package
+// outside the repository's modules (pgxpool.New), through the import of
+// the file it is written in: a value it returns is that package's, whose
+// methods are none of ours.
+func (ix index) outsidePackage(file string, c unit.Call) bool {
+	if c.Kind != unit.PathCall || !strings.HasSuffix(file, ".go") || len(ix.modules) == 0 {
+		return false
+	}
+	path, ok := ix.imports[file][c.Qualifier]
+	if !ok {
+		return false
+	}
+	_, inRepo := ix.packageDir(path)
+	return !inRepo
 }
 
 // resolve returns the unit a call refers to, or -1, whether it was found

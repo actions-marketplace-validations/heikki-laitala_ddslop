@@ -746,9 +746,17 @@ func embeddedName(typ string) string {
 	return typ
 }
 
-// imports returns the names a file's imports bind: an alias, or the
-// path's last element ("encoding/json" is json; a major version suffix
-// such as /v3 is skipped).
+// Imports maps each name a Go file's imports bind to the import's path
+// (see imports): call resolution reads a package call's qualifier
+// through it.
+func Imports(src []byte) map[string]string {
+	var out map[string]string
+	_ = syntax.Parse(language, src, func(root *sitter.Node) { out = imports(root, src) })
+	return out
+}
+
+// imports returns the names a file's imports bind: an alias, or the name
+// its package is assumed to have (see assumedName).
 func imports(root *sitter.Node, src []byte) map[string]string {
 	names := map[string]string{}
 	var walk func(n *sitter.Node)
@@ -762,12 +770,7 @@ func imports(root *sitter.Node, src []byte) map[string]string {
 			if alias := n.ChildByFieldName("name"); alias != nil {
 				names[alias.Utf8Text(src)] = imported
 			} else {
-				parts := strings.Split(imported, "/")
-				last := parts[len(parts)-1]
-				if len(parts) > 1 && len(last) > 1 && last[0] == 'v' && strings.Trim(last[1:], "0123456789") == "" {
-					last = parts[len(parts)-2]
-				}
-				names[last] = imported
+				names[assumedName(imported)] = imported
 			}
 			return
 		}
@@ -781,6 +784,24 @@ func imports(root *sitter.Node, src []byte) map[string]string {
 		}
 	}
 	return names
+}
+
+// assumedName returns the name Go's tools assume an imported package
+// has, its source unread: the path's last element ("encoding/json" is
+// json), a major version suffix such as /v3 skipped, without a go-
+// prefix, up to its first character no identifier has (go-redis/v9 is
+// redis, yaml.v3 is yaml, go-sqlite3 is sqlite3).
+func assumedName(importPath string) string {
+	parts := strings.Split(importPath, "/")
+	last := parts[len(parts)-1]
+	if len(parts) > 1 && len(last) > 1 && last[0] == 'v' && strings.Trim(last[1:], "0123456789") == "" {
+		last = parts[len(parts)-2]
+	}
+	last = strings.TrimPrefix(last, "go-")
+	if i := strings.IndexFunc(last, func(r rune) bool { return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) }); i >= 0 {
+		last = last[:i]
+	}
+	return last
 }
 
 // receiverName returns a method's receiver variable (s in (s *Store)), or

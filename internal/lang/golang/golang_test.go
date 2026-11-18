@@ -738,16 +738,27 @@ func variadic(a int, rest ...string) {}
 	}
 }
 
+// A struct field's type is qualified by the import of its package: by its
+// alias, or the name Go's tools assume for it (go-redis/v9 is redis,
+// yaml.v3 is yaml, go-sqlite3 is sqlite3).
 func TestStructFieldTypesAreQualifiedByTheFileImports(t *testing.T) {
 	src := `package api
 
-import st "example.com/app/internal/store"
+import (
+	st "example.com/app/internal/store"
+	"github.com/redis/go-redis/v9"
+	"gopkg.in/yaml.v3"
+	"github.com/mattn/go-sqlite3"
+)
 
 type Server struct {
 	store *st.Store
 	cache Cache
 	names []string
 	st.Logger
+	rdb  *redis.Client
+	conf yaml.Node
+	conn sqlite3.SQLiteConn
 }
 `
 	_, decls := testutil.Parse(t, Parse, "api/server.go", src)
@@ -758,6 +769,9 @@ type Server struct {
 		"Server.store example.com/app/internal/store.Store",
 		"Server.cache Cache",
 		"Server.Logger example.com/app/internal/store.Logger",
+		"Server.rdb github.com/redis/go-redis/v9.Client",
+		"Server.conf gopkg.in/yaml.v3.Node",
+		"Server.conn github.com/mattn/go-sqlite3.SQLiteConn",
 	}
 	testutil.Lines(t, "field types", got, want)
 }
@@ -918,4 +932,21 @@ func Testé() {}
 		"Testify case=false",
 		"Testé case=false",
 	})
+}
+
+// Imports maps each name a file's imports bind to the import's path: an
+// alias, or the package's assumed name.
+func TestImportsMapNamesToPaths(t *testing.T) {
+	got := Imports([]byte(`package db
+
+import (
+	"fmt"
+	pg "github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+)
+`))
+	want := map[string]string{"fmt": "fmt", "pg": "github.com/jackc/pgx/v5/pgxpool", "redis": "github.com/redis/go-redis/v9"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("Imports = %v, want %v", got, want)
+	}
 }
