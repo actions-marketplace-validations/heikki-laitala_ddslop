@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"path"
+	"slices"
 	"strings"
+
+	"github.com/heikki-laitala/ddslop/internal/config"
 )
 
 // Config is what a tsconfig.json says of the module paths its files
@@ -20,6 +23,14 @@ type Config struct {
 	Paths    []Pattern
 	PathsDir string
 	baseSet  bool // the file or one it extends sets baseUrl, null included
+	// Projects are the configs a solution tsconfig.json references (Vite's
+	// tsconfig.app.json and tsconfig.node.json): a file reads the first
+	// whose include covers it (see project), else this one.
+	Projects []Config
+	// include, exclude and files are the globs and files the config's
+	// include, exclude and files name, from the analysed root (see
+	// covers); none of include and files covers all.
+	include, exclude, files []string
 }
 
 // Pattern is one entry of a tsconfig's paths: the pattern and its
@@ -34,22 +45,144 @@ type Pattern struct {
 // relative extends ("../../tsconfig.base.json"), or each of an array of
 // them in turn, gives, read with read, what the file does not say itself,
 // through a chain of any length that ends where a file would extend
-// itself; a package's (@tsconfig/node20) is not read. Paths resolve from the baseUrl, the file's own or inherited,
-// else from the directory of the file declaring them.
+// itself; a package's (@tsconfig/node20) is not read. Paths resolve from
+// the baseUrl, the file's own or inherited, else from the directory of
+// the file declaring them. Each config its references name (a file, or a
+// directory's tsconfig.json) is read as a project of its own (see
+// Config.Projects).
 func ReadConfig(dir string, data []byte, read func(file string) ([]byte, error)) (Config, bool) {
-	return readConfig(dir, data, read, map[string]bool{})
+	c, ok := readConfig(dir, data, read, map[string]bool{})
+	if ok {
+		c.Projects = projects(dir, data, read, map[string]bool{})
+	}
+	return c, ok
+}
+
+// projects returns the configs a tsconfig written in dir references, read
+// as ReadConfig reads them, each after the ones it references in turn, as
+// a solution referencing solutions has them: the more specific first.
+// loaded holds the files read so far: each is read once, and a loop of
+// references ends.
+func projects(dir string, data []byte, read func(file string) ([]byte, error), loaded map[string]bool) []Config {
+	var raw struct {
+		References []struct {
+			Path string `json:"path"`
+		} `json:"references"`
+	}
+	if !decode(data, &raw) {
+		return nil
+	}
+	var out []Config
+	for _, ref := range raw.References {
+		file := path.Join(dir, slashed(ref.Path))
+		if !strings.HasSuffix(file, ".json") {
+			file = path.Join(file, "tsconfig.json")
+		}
+		data, err := read(file)
+		if err != nil || loaded[file] {
+			continue
+		}
+		loaded[file] = true
+		p, ok := readConfig(path.Dir(file), data, read, map[string]bool{file: true})
+		if !ok {
+			continue
+		}
+		if p.include == nil && p.files == nil {
+			p.include = []string{path.Join(path.Dir(file), "**/*")} // tsc's default: all of its directory
+		}
+		out = append(append(out, projects(path.Dir(file), data, read, loaded)...), p)
+	}
+	return out
+}
+
+// decode reads a tsconfig into v: JSON with comments and trailing commas,
+// perhaps after a byte order mark.
+func decode(data []byte, v any) bool {
+	return json.Unmarshal(stripJSONC(bytes.TrimPrefix(data, []byte("\ufeff"))), v) == nil
+}
+
+// fromDir returns the paths or globs a config written in dir names, from
+// the analysed root.
+func fromDir(dir string, patterns []string) []string {
+	out := []string{}
+	for _, p := range patterns {
+		out = append(out, path.Join(dir, slashed(p)))
+	}
+	return out
+}
+
+// project returns the config a file reads: the first of the projects
+// whose include covers it (see Projects), else c itself.
+func (c Config) project(file string) Config {
+	for _, p := range c.Projects {
+		if p.covers(file) {
+			return p
+		}
+	}
+	return c
+}
+
+// covers reports whether a config covers a file, as tsc decides it: its
+// files list it, or an include pattern matches it, unless the pattern's
+// wildcards reach into a hidden directory (.storybook), and no exclude
+// pattern matches it or a directory above it; a config with no include
+// and no files covers all.
+func (c Config) covers(file string) bool {
+	if c.include == nil && c.files == nil {
+		return true
+	}
+	included := func(p string) bool { return matchGlob(p, file) && !hiddenFrom(p, file) }
+	excluded := func(p string) bool {
+		for dir := file; dir != "."; dir = path.Dir(dir) {
+			if matchGlob(p, dir) {
+				return true
+			}
+		}
+		return false
+	}
+	return slices.Contains(c.files, file) || slices.ContainsFunc(c.include, included) && !slices.ContainsFunc(c.exclude, excluded)
+}
+
+// hiddenFrom reports whether a file is hidden, or under a hidden
+// directory (a name starting with a dot), that a pattern does not name
+// itself: tsc's wildcards, and a directory pattern's, reach no such one.
+func hiddenFrom(pattern, file string) bool {
+	named := strings.Split(pattern, "/")
+	for _, segment := range strings.Split(file, "/") {
+		if strings.HasPrefix(segment, ".") && segment != "." && !slices.Contains(named, segment) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchGlob reports whether a tsconfig include or exclude pattern
+// matches a file: * and ? within a segment, ** for any number of
+// directories, and a pattern with no wildcard the file itself or a
+// directory holding it.
+func matchGlob(pattern, file string) bool {
+	if pattern == "." {
+		return true
+	}
+	if !strings.ContainsAny(pattern, "*?") {
+		return file == pattern || strings.HasPrefix(file, pattern+"/")
+	}
+	// brackets name themselves in a tsconfig (src/pages/[id]), not a set
+	return config.MatchGlob(strings.NewReplacer("[", `\[`, "]", `\]`).Replace(pattern), file)
 }
 
 func readConfig(dir string, data []byte, read func(file string) ([]byte, error), seen map[string]bool) (Config, bool) {
 	var raw struct {
-		Extends         any `json:"extends"`
+		Extends         any      `json:"extends"`
+		Include         []string `json:"include"`
+		Exclude         []string `json:"exclude"`
+		Files           []string `json:"files"`
 		CompilerOptions struct {
 			BaseURL json.RawMessage `json:"baseUrl"`
 			Paths   json.RawMessage `json:"paths"`
 		} `json:"compilerOptions"`
 	}
-	data = stripJSONC(bytes.TrimPrefix(data, []byte("\ufeff")))
-	if json.Unmarshal(data, &raw) != nil {
+	if !decode(data, &raw) {
 		return Config{}, false
 	}
 	paths, ok := orderedPaths(raw.CompilerOptions.Paths)
@@ -91,6 +224,15 @@ func readConfig(dir string, data []byte, read func(file string) ([]byte, error),
 	if paths != nil {
 		c.Paths, c.PathsDir = paths, dir
 	}
+	if raw.Include != nil {
+		c.include = fromDir(dir, raw.Include)
+	}
+	if raw.Exclude != nil {
+		c.exclude = fromDir(dir, raw.Exclude)
+	}
+	if raw.Files != nil {
+		c.files = fromDir(dir, raw.Files)
+	}
 	return c, true
 }
 
@@ -124,6 +266,15 @@ func (c Config) over(base Config) Config {
 	}
 	if c.Paths != nil {
 		base.Paths, base.PathsDir = c.Paths, c.PathsDir
+	}
+	if c.include != nil {
+		base.include = c.include
+	}
+	if c.exclude != nil {
+		base.exclude = c.exclude
+	}
+	if c.files != nil {
+		base.files = c.files
 	}
 	return base
 }
