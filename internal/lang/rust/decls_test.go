@@ -102,6 +102,29 @@ mod inner {
 	testutil.Lines(t, "constants", got, want)
 }
 
+func TestParseRecordsConstantVisibilityAndExternalReaders(t *testing.T) {
+	src := `pub const API: u32 = 1;
+pub(crate) const INTERNAL: u32 = 2;
+const PRIVATE: u32 = 3;
+
+#[allow(dead_code)]
+pub static SHARED: u32 = 4;
+
+#[no_mangle]
+pub static EXPORTED: u32 = 5;
+`
+	got := testutil.Format(mustDecls(t, src).Consts, func(c unit.Const) string {
+		return fmt.Sprintf("%s public=%v external=%v", c.Name, c.Public, c.External)
+	})
+	testutil.Lines(t, "constants", got, []string{
+		"API public=true external=false",
+		"INTERNAL public=false external=false",
+		"PRIVATE public=false external=false",
+		"SHARED public=true external=false",
+		"EXPORTED public=true external=true",
+	})
+}
+
 func TestUnitsRecordVisibilityAndExternalCallers(t *testing.T) {
 	src := `pub fn api() {}
 pub(crate) fn internal() {}
@@ -128,6 +151,11 @@ pub struct S;
 impl S {
     pub fn method(&self) {}
 }
+
+#[wasm_bindgen]
+impl Counter {
+    pub fn tick(&mut self) {}
+}
 `
 	units := mustUnits(t, src)
 	got := testutil.Format(units, func(u unit.Unit) string {
@@ -142,6 +170,7 @@ impl S {
 		"main public=false external=true",
 		"health public=true external=true",
 		"S::method public=true external=false",
+		"Counter::tick public=true external=true",
 	}
 	testutil.Lines(t, "units", got, want)
 }

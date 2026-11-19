@@ -309,6 +309,32 @@ type Decls struct {
 	// TypeScript class's, interface's or object type's fields, written as
 	// Call.Type; fields of other types (slices, maps) are left out.
 	FieldTypes []FieldType
+	Reach      Reach // Rust only
+}
+
+// Reach is how far a Rust file's words reach beyond the code every build
+// of its library compiles.
+type Reach struct {
+	// Exported counts the words of the code that code outside the crate
+	// compiles or reaches through the file: its doc tests, its
+	// #[macro_export] macros and its pub uses.
+	Exported map[string]int
+	// Optional counts the words outside the code every build compiles:
+	// in comments, test functions and items under a #[cfg]. AllOptional
+	// says all of the file is (a test file, or one under a #![cfg]).
+	Optional    map[string]int
+	AllOptional bool
+	// DocFiles are the files the file's #[doc = include_str!(...)]
+	// attributes include, as written, relative to the file's directory:
+	// their code blocks are doc tests too.
+	DocFiles []string
+	// PackageDocFiles are those included relative to the package's
+	// directory (concat!(env!("CARGO_MANIFEST_DIR"), "/GUIDE.md")).
+	PackageDocFiles []string
+	// CfgModules are the modules the file declares out of line under a
+	// #[cfg] or a #[cfg_attr(..., path = ...)], as index.File.Modules
+	// names them: their files are compiled in some builds only.
+	CfgModules []string
 }
 
 // FieldType is the type of one struct field: Server.store is a
@@ -376,7 +402,11 @@ type Const struct {
 	// Macro is true when the value is a macro call, such as include_str!,
 	// whose meaning can depend on where it is written.
 	Macro bool
-	Test  bool
+	// Public and External are as for Unit: whether the constant is
+	// public, and whether an attribute may make code outside the source
+	// read it (#[no_mangle]). Rust only.
+	Public, External bool
+	Test             bool
 	// Ignored is true when a ddslop:ignore comment marks the constant.
 	Ignored bool
 }

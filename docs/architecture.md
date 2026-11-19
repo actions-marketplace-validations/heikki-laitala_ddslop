@@ -931,6 +931,8 @@ flowchart TB
 - `extract-common`: no occurrence is canonical. Extract a new shared function
   from the template.
 - `delete-dead`: a public function nothing uses (see below). Delete it.
+- `restrict-visibility`: a public function or constant only its own
+  library uses (see below). Make it `pub(crate)`.
 - `extract-pipeline`: produced by the flow layer (see below).
 - `inline-wrapper`: a function that only forwards its parameters; call
   its target directly.
@@ -1071,6 +1073,36 @@ flattened, the other half of cleaning up generated code:
   (`ServeHTTP`, `Error`); the unit model calls both "via interface". `main`
   and `init` are called by the runtime. On a 100-file Go service, the one
   exported function nobody mentioned was in a generated file, so none.
+- **Too public** (`too-public`, `restrict-visibility`): a `pub` function,
+  constant or static of an unpublished crate's library that only the
+  library names, which can be `pub(crate)`. It is counted with the same
+  words as dead code: the name appears more than once in the library's
+  files (once is dead code) and nowhere else, so no other crate, test,
+  benchmark, example or binary names it. The library's files are its root
+  file's module tree, so the modules a binary declares (from
+  `src/main.rs`, or a `[[bin]]` path under `src/`) are outside it, and
+  each library counts on its own, even when two have the same name. Code
+  outside the library also reaches it from the library's own files:
+  through its doc tests and its `#[macro_export]` macros, which other
+  crates compile, and through a `pub use`, which re-exports it; their
+  words count as outside, in generated files too. Doc tests are the code
+  blocks, fenced or indented, of `///` and `//!` lines, of `/** */` and
+  `/*! */` comments, of `#[doc = "..."]` attributes and of the files a
+  `#[doc = include_str!(...)]` attribute includes, such as a README. Of
+  the library's words, at least one must use the name in code every build
+  compiles: not in a comment, a string literal, a test, an item under a
+  `#[cfg]`, a file under a `#![cfg]` or the file of a module declared
+  under a `#[cfg]` or a `#[cfg_attr(..., path = ...)]` (`unit.Reach`);
+  otherwise `pub(crate)` would make the compiler report the item unused in
+  some builds, as `pub` does not. A declaration is no use either: two
+  modules may each declare a constant of the name, or two types a method.
+  A module the walk cannot place, such as one declared in an inline
+  module, counts as outside. Trait methods and functions called from
+  outside the source are left out as for dead code (an impl block's
+  attributes count too: `#[wasm_bindgen] impl`), and so are crates without
+  a library (a binary's `pub` items are never seen outside it). Associated
+  constants are left out. Rust only, and no types: a type must stay `pub`
+  while a `pub` signature names it.
 - **Pass-through wrappers** (`pass-through`, `inline-wrapper`): a function
   whose body is one call, possibly awaited, passing its parameters on in
   order, as is or borrowed. Constructors (`Self(x)`), delegation to a field
@@ -2307,7 +2339,8 @@ Every JSON candidate is self-contained:
   larger functions; occurrence lines are the run's lines, and the
   suggestion is always `extract-common`), `parallel-flow`,
   `duplicate-type`, `duplicate-constant`, `inlined-constant` (the
-  constant, then each inline use), `dead-code`, `pass-through` or
+  constant, then each inline use), `dead-code`, `too-public`,
+  `pass-through` or
   `single-impl-trait` (the trait, then its impl block). See the
   additional and simplification detectors above.
 - `target`, when present, is existing code to use instead: the constant

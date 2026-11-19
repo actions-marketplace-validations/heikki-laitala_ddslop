@@ -752,6 +752,7 @@ func ParseAs(file syntax.Source) ([]unit.Unit, unit.Decls, error) {
 		e := extractor{path: path, src: src, uses: map[[2]uint]map[string]string{}}
 		e.walk(root, scope{}, file.Test, nil)
 		units, decls = e.units, e.decls
+		decls.Reach = reachOf(root, file)
 		marked = syntax.MarkIgnored(root, src, units, &decls)
 	})
 	if isBinaryPath(path) {
@@ -958,6 +959,9 @@ type scope struct {
 	owner, trait string
 	// module is the inline module path within the file (outer::inner).
 	module string
+	// external is set inside an impl block whose attributes may make its
+	// methods called from outside the source (#[wasm_bindgen]).
+	external bool
 }
 
 func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
@@ -978,7 +982,7 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 		return
 	case "const_item", "static_item":
 		if sc.owner == "" {
-			e.addConst(n, test)
+			e.addConst(n, test, own)
 		}
 		return
 	case "impl_item":
@@ -990,6 +994,7 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 			sc.trait = unit.SimpleName(t.Utf8Text(e.src))
 			e.addImpl(n, sc, test)
 		}
+		sc.external = slices.ContainsFunc(own, isExternalAttr)
 	case "trait_item":
 		if t := n.ChildByFieldName("name"); t != nil {
 			sc.owner = t.Utf8Text(e.src)
@@ -1124,7 +1129,7 @@ func (e *extractor) addFunction(n *sitter.Node, sc scope, test bool, attrs []str
 		Calls:     s.Calls,
 		Results:   results,
 		Public:    isPublic(n, e.src),
-		External:  (owner == "" && name == "main") || slices.ContainsFunc(attrs, isExternalAttr),
+		External:  (owner == "" && name == "main") || sc.external || slices.ContainsFunc(attrs, isExternalAttr),
 		Forwards:  forwards(n, e.src),
 		Scope:     scopeOf(n, e.src),
 
@@ -1374,7 +1379,7 @@ func isPublic(n *sitter.Node, src []byte) bool {
 	return false
 }
 
-// internalAttrs are attributes that never make a function callable from
+// internalAttrs are attributes that never make an item reachable from
 // outside the source: lints, inlining, documentation, conditional
 // compilation and tracing.
 var internalAttrs = map[string]bool{
@@ -1384,7 +1389,7 @@ var internalAttrs = map[string]bool{
 	"instrument": true, "skip": true, // tracing::instrument, rustfmt::skip
 }
 
-// isExternalAttr reports whether an attribute may make a function called
+// isExternalAttr reports whether an attribute may make an item reachable
 // from outside the source (#[no_mangle], #[tokio::main], route macros):
 // anything but test attributes and internalAttrs.
 func isExternalAttr(attr string) bool {
@@ -1577,7 +1582,7 @@ func enclosingImpl(fn *sitter.Node) *sitter.Node {
 }
 
 // addConst records a constant or static item.
-func (e *extractor) addConst(n *sitter.Node, test bool) {
+func (e *extractor) addConst(n *sitter.Node, test bool, attrs []string) {
 	name, value := n.ChildByFieldName("name"), n.ChildByFieldName("value")
 	if name == nil || value == nil || n.HasError() {
 		return
@@ -1588,14 +1593,16 @@ func (e *extractor) addConst(n *sitter.Node, test bool) {
 		text = syntax.Compact(text)
 	}
 	e.decls.Consts = append(e.decls.Consts, unit.Const{
-		File:    e.path,
-		Name:    name.Utf8Text(e.src),
-		Value:   text,
-		Line:    syntax.Line(n.StartPosition()),
-		Nodes:   syntax.CountNodes(value),
-		Literal: literal,
-		Macro:   value.Kind() == "macro_invocation",
-		Test:    test,
+		File:     e.path,
+		Name:     name.Utf8Text(e.src),
+		Value:    text,
+		Line:     syntax.Line(n.StartPosition()),
+		Nodes:    syntax.CountNodes(value),
+		Literal:  literal,
+		Macro:    value.Kind() == "macro_invocation",
+		Public:   isPublic(n, e.src),
+		External: slices.ContainsFunc(attrs, isExternalAttr),
+		Test:     test,
 	})
 }
 
@@ -1847,14 +1854,18 @@ func manifestValues(cargoToml []byte, key string, sections ...string) []string {
 // name;), at its top level, in source order: each one's name, or the file
 // a #[path] attribute places it in, ending in .rs.
 func DeclaredModules(src []byte) []string {
-	return topModules(src, false, func(name string, attrs []string) string {
-		for _, attr := range attrs {
-			if file, ok := pathAttribute(attr); ok {
-				return file
-			}
+	return topModules(src, false, moduleEntry)
+}
+
+// moduleEntry is how DeclaredModules names a module: the file a #[path]
+// attribute places it in, else its name.
+func moduleEntry(name string, attrs []string) string {
+	for _, attr := range attrs {
+		if file, ok := pathAttribute(attr); ok {
+			return file
 		}
-		return name
-	})
+	}
+	return name
 }
 
 // pathAttribute returns the file a #[path = "..."] attribute names.
@@ -1917,19 +1928,10 @@ func topItems(src []byte, keep func(item *sitter.Node, attrs []string) bool, ent
 // file and the attributes written above it.
 func topLevel(src []byte, visit func(item *sitter.Node, attrs []string)) {
 	_ = syntax.Parse(language, src, func(root *sitter.Node) {
-		var attrs []string
-		for i := uint(0); i < root.ChildCount(); i++ {
-			child := root.Child(i)
-			switch {
-			case child.Kind() == "attribute_item":
-				attrs = append(attrs, child.Utf8Text(src))
-				continue
-			case child.IsExtra():
-				continue
-			}
-			visit(child, attrs)
-			attrs = nil
-		}
+		eachItem(root, src, func(item *sitter.Node, attrs []string) bool {
+			visit(item, attrs)
+			return false
+		})
 	})
 }
 
