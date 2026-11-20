@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/heikki-laitala/ddslop/internal/integrate"
 	"github.com/heikki-laitala/ddslop/internal/testutil"
 )
 
@@ -100,6 +101,73 @@ func TestInitSelectedAgentsStatusAndUninstall(t *testing.T) {
 	}
 }
 
+// A skill an earlier ddslop installed is out of date: status says so and
+// how to update it, and check warns on stderr, leaving its JSON alone,
+// until init brings it up to date.
+func TestStatusAndCheckSayASkillIsOutOfDate(t *testing.T) {
+	root := repo(t, map[string]string{"a.rs": users})
+	if code, _, stderr := run("init", "--claude", root); code != 0 {
+		t.Fatalf("init: exit %d, stderr %s", code, stderr)
+	}
+	if _, stderr := runCode(t, 0, "check", "--format", "json", root); strings.Contains(stderr, "out of date") {
+		t.Errorf("check warns about a current skill:\n%s", stderr)
+	}
+
+	testutil.WriteFiles(t, root, map[string]string{".claude/skills/ddslop/SKILL.md": "an earlier ddslop's skill\n"})
+	_, stdout, _ := run("status", root)
+	wantContains(t, stdout, "claude: skill (out of date), instructions", "ddslop init --claude "+root)
+	stdout, stderr := runCode(t, 0, "check", "--format", "json", root)
+	wantContains(t, stderr, "out of date", "ddslop init --claude "+root)
+	decodeJSON[targetReport](t, stdout)
+
+	run("init", "--claude", root)
+	if _, stderr := runCode(t, 0, "check", "--format", "json", root); strings.Contains(stderr, "out of date") {
+		t.Errorf("check still warns after init:\n%s", stderr)
+	}
+}
+
+// An old section in instructions two agents share (CLAUDE.md linking to
+// AGENTS.md) updates through the agent whose skill is installed: the
+// hint does not install another's.
+func TestStatusUpdatesSharedInstructionsThroughTheInstalledAgent(t *testing.T) {
+	root := repo(t, map[string]string{"a.rs": users, "AGENTS.md": "# Project\n"})
+	if err := os.Symlink("AGENTS.md", filepath.Join(root, "CLAUDE.md")); err != nil {
+		t.Fatal(err)
+	}
+	run("init", "--claude", root)
+	old, err := os.ReadFile("../integrate/templates/former/1.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFiles(t, root, map[string]string{"AGENTS.md": "# Project\n\n" + string(old)})
+
+	_, stdout, _ := run("status", root)
+	wantContains(t, stdout, "run `ddslop init --claude "+root+"`")
+	if strings.Contains(stdout, "--codex") {
+		t.Errorf("status suggests installing Codex, whose skill is not installed:\n%s", stdout)
+	}
+}
+
+// Instructions files of their own each get updated, through an agent
+// without a skill when no other updates the file; a path the shell would
+// split is quoted.
+func TestStatusUpdatesEveryStaleInstructionsFile(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "my repo")
+	testutil.WriteFiles(t, root, map[string]string{"a.rs": users})
+	run("init", "--claude", root)
+	old, err := os.ReadFile("../integrate/templates/former/1.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFiles(t, root, map[string]string{
+		".claude/skills/ddslop/SKILL.md": "an earlier ddslop's skill\n",
+		"AGENTS.md":                      "# Project\n\n" + string(old),
+	})
+
+	_, stdout, _ := run("status", root)
+	wantContains(t, stdout, "run `ddslop init --claude --codex '"+root+"'`")
+}
+
 func TestStatsDescribesTheIndexWithoutSyncing(t *testing.T) {
 	root := repo(t, map[string]string{
 		"a.rs":     users,
@@ -113,4 +181,20 @@ func TestStatsDescribesTheIndexWithoutSyncing(t *testing.T) {
 	testutil.WriteFiles(t, root, map[string]string{"new.rs": orders})
 	stdout, _ := runCode(t, 0, "stats", root)
 	wantContains(t, stdout, "files: 3 (1 generated)", "functions: 2 (1 test)", indexPath)
+}
+
+// The hint passes the project's path as init reads it back: none for the
+// current directory, quoted for the shell, and never as a flag.
+func TestStaleHintSpellsThePathAsAnArgument(t *testing.T) {
+	stale := integrate.Status{Agents: map[integrate.Agent]integrate.AgentStatus{integrate.Claude: {Skill: true, SkillStale: true}}}
+	for root, want := range map[string]string{
+		".":       "`ddslop init --claude`",
+		"repo":    "`ddslop init --claude repo`",
+		"my repo": "`ddslop init --claude 'my repo'`",
+		"-repo":   "`ddslop init --claude ./-repo`",
+	} {
+		if got := staleHintOf(root, stale); !strings.Contains(got, want) {
+			t.Errorf("staleHintOf(%q) = %q, want %s", root, got, want)
+		}
+	}
 }

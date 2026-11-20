@@ -138,9 +138,33 @@ pub fn named() -> &'static str { "string_word" }
 	}
 }
 
-func TestReachListsOutOfLineModulesUnderAnyCfg(t *testing.T) {
+// The out-of-line modules a file declares under any #[cfg], and those it
+// declares inside inline modules, by their path from the file's module,
+// but one under a #[cfg] (its own or an enclosing module's) or a #[path],
+// and one in a block.
+func TestReachListsOutOfLineModulesUnderAnyCfgOrInsideInlineModules(t *testing.T) {
 	src := `#[cfg(test)]
 mod fixture;
+
+mod a {
+    mod b;
+    #[cfg(test)]
+    mod c;
+    #[path = "x.rs"]
+    mod d;
+    mod e {
+        mod f;
+    }
+}
+
+#[cfg(test)]
+mod t {
+    mod u;
+}
+
+fn g() {
+    mod h;
+}
 
 #[cfg(target_os = "macos")]
 mod real;
@@ -160,7 +184,56 @@ mod always;
 
 mod production;
 `
-	if got := fmt.Sprint(reach(t, "src/lib.rs", []byte(src)).CfgModules); got != "[fixture real other.rs imp]" {
+	r := reach(t, "src/lib.rs", []byte(src))
+	if got := fmt.Sprint(r.CfgModules); got != "[fixture real other.rs imp]" {
 		t.Errorf("Reach.CfgModules = %s, want [fixture real other.rs imp]", got)
+	}
+	if got := fmt.Sprint(r.NestedModules); got != "[a::b a::e::f]" {
+		t.Errorf("Reach.NestedModules = %s, want [a::b a::e::f]", got)
+	}
+}
+
+// A pub glob's path is kept as read from the file's own module, whatever
+// inline module declares it, an imported name as its path, through
+// further such names (after self:: too), and each path a name some
+// builds import; a block's, which nothing outside sees, and a
+// private one are left out.
+func TestReachListsPubGlobsFromTheFilesModule(t *testing.T) {
+	src := `pub use shapes::*;
+pub use crate::a::{b::*, c::*};
+use private::*;
+
+pub mod facade {
+    pub use super::super::up::*;
+    pub use self::inner::*;
+
+    use super::shapes as aliased;
+    pub use aliased::*;
+    use crate::chained as first;
+    use first as second;
+    pub use second::*;
+    #[cfg(unix)]
+    use crate::unix_shapes as platform;
+    #[cfg(windows)]
+    use crate::windows_shapes as platform;
+    pub use platform::*;
+    use platform as selected;
+    pub use selected::*;
+    use crate::rooted as rooted_alias;
+    pub use self::rooted_alias::*;
+
+    pub mod deep {
+        pub use super::side::*;
+        pub use crate::far::*;
+    }
+}
+
+fn f() {
+    pub use hidden::*;
+}
+`
+	want := "[shapes crate::a::b crate::a::c super::up self::facade::inner self::shapes crate::chained crate::unix_shapes crate::windows_shapes crate::unix_shapes crate::windows_shapes crate::rooted self::facade::side crate::far]"
+	if got := fmt.Sprint(reach(t, "src/lib.rs", []byte(src)).Globs); got != want {
+		t.Errorf("Reach.Globs = %s, want %s", got, want)
 	}
 }

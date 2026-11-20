@@ -15,20 +15,18 @@ import (
 // declarations and in macro arguments. A visibility such as
 // pub(in crate::a) is no dependency, and is left out.
 func References(path string, src []byte) []unit.Reference {
-	return ReferencesAs(syntax.Source{Path: path, Src: src, Test: IsTestPath(path)})
+	var refs []unit.Reference
+	_ = WithSyntax(syntax.Source{Path: path, Src: src, Test: IsTestPath(path)}, func(s Syntax) { refs = s.References() })
+	return refs
 }
 
-// ReferencesAs is References with whether the file is test code by its
-// place given (see ParseAs).
-func ReferencesAs(file syntax.Source) []unit.Reference {
-	var refs []unit.Reference
-	_ = syntax.Parse(language, file.Src, func(root *sitter.Node) {
-		ignored, _ := syntax.Ignored(root, file.Src)
-		r := referrer{src: file.Src, ignored: ignored, aliases: aliasesIn(root, file.Src)}
-		r.walk(root, at{test: file.Test})
-		refs = r.refs
-	})
-	return refs
+// References returns the paths the file writes that name a module of its
+// crate (see References).
+func (s Syntax) References() []unit.Reference {
+	ignored, _ := syntax.Ignored(s.root, s.file.Src)
+	r := referrer{src: s.file.Src, ignored: ignored, aliases: aliasesIn(s.root, s.file.Src)}
+	r.walk(s.root, at{test: s.file.Test})
+	return r.refs
 }
 
 type referrer struct {
@@ -341,12 +339,10 @@ type alias struct {
 // block, module body or file declaring it.
 func aliasesIn(root *sitter.Node, src []byte) []alias {
 	var out []alias
-	var walk func(n *sitter.Node, module string)
-	walk = func(n *sitter.Node, module string) {
-		scope := n.Parent()
-		for scope != nil && scope.Kind() != "block" && scope.Kind() != "declaration_list" && scope.Kind() != "source_file" {
-			scope = scope.Parent()
-		}
+	// scope is the innermost block, module body or file around n, and
+	// parent n's parent: carried down, as Node.Parent searches from the root.
+	var walk func(n, scope, parent *sitter.Node, module string)
+	walk = func(n, scope, parent *sitter.Node, module string) {
 		bind := func(name string, segments []string) {
 			if scope != nil {
 				out = append(out, alias{name: name, module: module, segments: segments, start: scope.StartByte(), end: scope.EndByte()})
@@ -368,7 +364,7 @@ func aliasesIn(root *sitter.Node, src []byte) []alias {
 			}
 		case "type_parameters":
 			// a generic parameter hides an alias of its name in its item
-			if item := n.Parent(); item != nil {
+			if item := parent; item != nil {
 				for i := uint(0); i < n.NamedChildCount(); i++ {
 					p := n.NamedChild(i)
 					if name := p.ChildByFieldName("name"); name != nil && (p.Kind() == "type_parameter" || p.Kind() == "const_parameter") {
@@ -396,11 +392,16 @@ func aliasesIn(root *sitter.Node, src []byte) []alias {
 			}
 			return
 		}
+		inner := scope
+		switch n.Kind() {
+		case "block", "declaration_list", "source_file":
+			inner = n
+		}
 		for i := uint(0); i < n.NamedChildCount(); i++ {
-			walk(n.NamedChild(i), module)
+			walk(n.NamedChild(i), inner, n, module)
 		}
 	}
-	walk(root, "")
+	walk(root, nil, nil, "")
 	return out
 }
 

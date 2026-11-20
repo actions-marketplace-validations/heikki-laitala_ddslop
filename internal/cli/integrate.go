@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/heikki-laitala/ddslop/internal/index"
@@ -57,7 +58,9 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 const statusUsage = `usage: ddslop status [path]
 
 Shows what ddslop has installed in the project at path (default "."):
-the .gitignore entry, the index and each agent's skill and instructions.
+the .gitignore entry, the index and each agent's skill and instructions,
+and which skills and instructions an earlier ddslop wrote, with the
+ddslop init command that updates them.
 
 Flags:
 `
@@ -78,17 +81,86 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		a := s.Agents[agent]
 		var parts []string
 		if a.Skill {
-			parts = append(parts, "skill")
+			parts = append(parts, "skill"+outOfDate(a.SkillStale))
 		}
 		if a.Instructions {
-			parts = append(parts, "instructions")
+			parts = append(parts, "instructions"+outOfDate(a.InstructionsStale))
 		}
 		if len(parts) == 0 {
 			parts = []string{"not installed"}
 		}
 		fmt.Fprintf(stdout, "%s: %s\n", agent, strings.Join(parts, ", "))
 	}
+	if hint := staleHintOf(root, s); hint != "" {
+		fmt.Fprintln(stdout, hint)
+	}
 	return exitClean
+}
+
+func outOfDate(stale bool) string {
+	if stale {
+		return " (out of date)"
+	}
+	return ""
+}
+
+// staleHint says how to update what an earlier ddslop installed in root
+// for agents, or "" when all of it is current or root has none.
+func staleHint(root string) string {
+	s, err := integrate.Check(root)
+	if err != nil {
+		return ""
+	}
+	return staleHintOf(root, s)
+}
+
+// staleHintOf is staleHint for the status of the project at root: the
+// agents whose skill is out of date, and for each out-of-date instructions
+// file, which agents may share through a symlink, one agent updating it,
+// whose skill is installed if any is, as init installs the skill too.
+func staleHintOf(root string, s integrate.Status) string {
+	chosen := map[integrate.Agent]bool{}
+	for _, agent := range integrate.Agents {
+		if s.Agents[agent].SkillStale {
+			chosen[agent] = true
+		}
+	}
+	files := map[string][]integrate.Agent{} // out-of-date instructions, with the agents sharing them
+	for _, agent := range integrate.Agents {
+		if a := s.Agents[agent]; a.InstructionsStale {
+			files[a.InstructionsFile] = append(files[a.InstructionsFile], agent)
+		}
+	}
+	for _, agents := range files {
+		installed := slices.IndexFunc(agents, func(agent integrate.Agent) bool { return s.Agents[agent].Skill })
+		chosen[agents[max(installed, 0)]] = true
+	}
+	var args []string
+	for _, agent := range integrate.Agents {
+		if chosen[agent] {
+			args = append(args, "--"+string(agent))
+		}
+	}
+	if len(args) == 0 {
+		return ""
+	}
+	if root != "." {
+		args = append(args, shellQuote(root)) // run from elsewhere, init would update the wrong project
+	}
+	return "the ddslop skill or instructions an earlier ddslop installed are out of date: run `ddslop init " + strings.Join(args, " ") + "` to update them"
+}
+
+// shellQuote returns a path as a shell reads it back: quoted when it
+// holds anything but letters, digits and /._-, and from ./ when it starts
+// with a dash, which a flag does.
+func shellQuote(arg string) string {
+	if strings.HasPrefix(arg, "-") {
+		arg = "./" + arg
+	}
+	if strings.Trim(arg, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-") == "" {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 func presence(ok bool) string {
@@ -142,7 +214,7 @@ func runStats(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 	path := filepath.Join(root, indexPath)
-	info, err := os.Stat(path)
+	info, err := os.Stat(path) //nolint:gosec // the index under the analysed root
 	if err != nil {
 		return fail(stderr, fmt.Errorf("no index at %s; run ddslop index first", path))
 	}
@@ -203,7 +275,7 @@ func writeTrend(w io.Writer, history []index.HealthEntry) error {
 		if revision == "" {
 			revision = "-"
 		}
-		fmt.Fprintf(&b, "  %s  %-14s %.1f%% duplicated (%d of %d lines); %d unused functions, %d wrappers  %s\n",
+		fmt.Fprintf(&b, "  %s  %-14s %.1f%% duplicated (%d of %d lines); %d unused functions and constants, %d wrappers  %s\n",
 			e.At.Local().Format("2006-01-02 15:04"), revision, h.DuplicationPercent, h.DuplicatedLines, h.AnalysedLines,
 			h.UnusedFunctions, h.Wrappers, e.Version)
 	}

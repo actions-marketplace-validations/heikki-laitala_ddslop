@@ -35,3 +35,18 @@ func isWordByte(b byte) bool {
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// Capitalized reports whether a name starts with an upper-case ASCII
+// letter: an exported Go name, a Rust enum variant or constant in a
+// pattern. Words counts ASCII identifiers only, so a name starting
+// otherwise is never one of them.
+func Capitalized(name string) bool {
+	return name != "" && name[0] >= 'A' && name[0] <= 'Z'
+}
+
+// AddWords adds the words of text to words.
+func AddWords(words map[string]int, text string) {
+	for w, n := range Words([]byte(text)) {
+		words[w] += n
+	}
+}

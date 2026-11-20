@@ -10,10 +10,10 @@ import (
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
 
-// IgnoreMarker starts a comment that leaves code out of the analysis:
+// ignoreMarker starts a comment that leaves code out of the analysis:
 // "// ddslop:ignore <reason>". The reason is required, so suppressions stay
 // reviewable.
-const IgnoreMarker = "ddslop:ignore"
+const ignoreMarker = "ddslop:ignore"
 
 // MarkIgnored marks the units, structs, enums, constants, imports,
 // literal leaves and forms that start on a line a ddslop:ignore comment
@@ -45,7 +45,14 @@ func MarkIgnored(root *sitter.Node, src []byte, units []unit.Unit, decls *unit.D
 func markDecls(decls *unit.Decls, lines map[int]bool) {
 	mark(decls.Structs, lines, func(s *unit.Struct) (int, *bool) { return s.StartLine, &s.Ignored })
 	mark(decls.Enums, lines, func(e *unit.Enum) (int, *bool) { return e.StartLine, &e.Ignored })
-	mark(decls.Consts, lines, func(c *unit.Const) (int, *bool) { return c.Line, &c.Ignored })
+	for i := range decls.Consts {
+		// A marker on any of a constant's lines marks it: its name may sit
+		// below the declaration's first line (export const\n  X = 1).
+		c := &decls.Consts[i]
+		for l := c.Line; l <= max(c.Line, c.EndLine) && !c.Ignored; l++ {
+			c.Ignored = lines[l]
+		}
+	}
 	mark(decls.Imports, lines, func(im *unit.Import) (int, *bool) { return im.Line, &im.Ignored })
 }
 
@@ -65,7 +72,7 @@ func mark[T any](decls []T, lines map[int]bool, at func(*T) (int, *bool)) {
 // applies to nothing). Comments come from the syntax tree, so a marker
 // inside a string is no marker.
 func Ignored(root *sitter.Node, src []byte) (map[int]bool, error) {
-	if !bytes.Contains(src, []byte(IgnoreMarker)) {
+	if !bytes.Contains(src, []byte(ignoreMarker)) {
 		return nil, nil
 	}
 	comments := collectComments(root, src)
@@ -85,7 +92,7 @@ func Ignored(root *sitter.Node, src []byte) (map[int]bool, error) {
 			continue
 		}
 		if reason == "" {
-			return nil, fmt.Errorf("line %d: %s needs a reason (// %s <why the duplication is intended>)", c.start, IgnoreMarker, IgnoreMarker)
+			return nil, fmt.Errorf("line %d: %s needs a reason (// %s <why the duplication is intended>)", c.start, ignoreMarker, ignoreMarker)
 		}
 		if c.trailing {
 			ignored[c.start] = true
@@ -132,7 +139,7 @@ func ignoreReason(text string) (string, bool) {
 	text = strings.TrimSpace(text)
 	text = strings.TrimSuffix(text, "*/")
 	text = strings.TrimLeft(text, "/*!")
-	rest, ok := strings.CutPrefix(strings.TrimSpace(text), IgnoreMarker)
+	rest, ok := strings.CutPrefix(strings.TrimSpace(text), ignoreMarker)
 	if !ok {
 		return "", false
 	}

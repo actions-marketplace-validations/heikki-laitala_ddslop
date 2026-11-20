@@ -14,6 +14,7 @@ import (
 
 	"github.com/heikki-laitala/ddslop/internal/lang/syntax"
 	"github.com/heikki-laitala/ddslop/internal/similarity"
+	"github.com/heikki-laitala/ddslop/internal/source"
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
 
@@ -51,7 +52,7 @@ func (grammar) Declares(parent string, parentDeclares bool, field, child string)
 }
 
 // Binds: in Rust patterns, capitalised names are variants or constants.
-func (grammar) Binds(name string) bool { return !isUpper(name) }
+func (grammar) Binds(name string) bool { return !source.Capitalized(name) }
 
 func (grammar) Statements(kind string) bool { return kind == "block" }
 
@@ -272,7 +273,7 @@ func (g grammar) set(name string, op syntax.Operand) {
 func (g grammar) forget(pattern *sitter.Node, src []byte) {
 	switch pattern.Kind() {
 	case "identifier", "shorthand_field_identifier":
-		if name := pattern.Utf8Text(src); !isUpper(name) {
+		if name := pattern.Utf8Text(src); !source.Capitalized(name) {
 			delete(g.vars, name)
 		}
 		return
@@ -398,7 +399,7 @@ func typePath(t, self string, generic map[string]string, imports map[string]stri
 	switch name := unit.SimpleName(path); {
 	case path == "Self":
 		return self
-	case name == "" || !isUpper(name):
+	case name == "" || !source.Capitalized(name):
 		return ""
 	case !strings.Contains(path, "::") && imports[path] != "":
 		return imports[path]
@@ -666,7 +667,7 @@ func isVariantPath(pattern string) bool {
 		pattern = pattern[:i]
 	}
 	i := strings.LastIndex(pattern, "::")
-	return i >= 0 && isUpper(pattern[i+2:])
+	return i >= 0 && source.Capitalized(pattern[i+2:])
 }
 
 // anyhowContext reports whether a context or with_context call wraps an
@@ -744,29 +745,33 @@ func Parse(path string, src []byte) ([]unit.Unit, unit.Decls, error) {
 // ParseAs is Parse with whether the file is test code by its place (see
 // IsTestPath) given: a library a manifest roots under tests/ is not.
 func ParseAs(file syntax.Source) ([]unit.Unit, unit.Decls, error) {
-	path, src := file.Path, file.Src
 	var units []unit.Unit
 	var decls unit.Decls
 	var marked error
-	err := syntax.Parse(language, src, func(root *sitter.Node) {
-		e := extractor{path: path, src: src, uses: map[[2]uint]map[string]string{}}
-		e.walk(root, scope{}, file.Test, nil)
-		units, decls = e.units, e.decls
-		decls.Reach = reachOf(root, file)
-		marked = syntax.MarkIgnored(root, src, units, &decls)
-	})
+	err := WithSyntax(file, func(s Syntax) { units, decls, marked = s.Units() })
+	return units, decls, errors.Join(err, marked)
+}
+
+// Units returns the file's units and other declarations (see Parse).
+func (s Syntax) Units() ([]unit.Unit, unit.Decls, error) {
+	path, src := s.file.Path, s.file.Src
+	e := extractor{path: path, src: src, uses: map[[2]uint]map[string]string{}}
+	e.walk(s.root, scope{}, s.file.Test, nil)
+	units, decls := e.units, e.decls
+	decls.Reach = reachOf(s.root, s.file)
+	marked := syntax.MarkIgnored(s.root, src, units, &decls)
 	if isBinaryPath(path) {
 		for i := range units {
 			units[i].Forms = slices.DeleteFunc(units[i].Forms, func(f unit.Form) bool { return f.Concern == unit.ErrorValues })
 		}
 	}
-	return units, decls, errors.Join(err, marked)
+	return units, decls, marked
 }
 
 // isBinaryPath reports whether a file belongs to a binary by Cargo's
 // layout: src/main.rs, or under src/bin/. A binary's errors are printed
 // rather than matched by callers, so how it makes them is no error-values
-// form: measured, the CLIs of lns-inference-router return usage messages
+// form: measured, the CLIs of a 30-crate workspace return usage messages
 // as strings in a workspace that otherwise makes errors from variants.
 func isBinaryPath(path string) bool {
 	path = filepath.ToSlash(path)
@@ -774,14 +779,64 @@ func isBinaryPath(path string) bool {
 		strings.HasPrefix(path, "src/bin/") || strings.Contains(path, "/src/bin/")
 }
 
-// Traits returns the names of the traits a file declares, in source order.
-func Traits(src []byte) []string {
-	_, decls, _ := Parse("", src)
+// Traits returns the names of the traits the file declares, in source order.
+func (s Syntax) Traits() []string {
+	_, decls, _ := s.Units()
 	var names []string
 	for _, t := range decls.Traits {
 		names = append(names, t.Name)
 	}
 	return names
+}
+
+// OwnPath reads a bare re-export path as the module writing it does: a
+// first segment naming a module the file declares (pub mod inner; pub use
+// inner::X) is self::, and one naming a name the file's top-level uses
+// bring in (use crate::foo; pub use foo::X) is that use's path, followed
+// through further such names once each, after self:: too. Any other
+// bare path is left as it is: another crate's.
+func OwnPath(path string, declared map[string]bool, imports map[string]string) string {
+	return ownPaths(path, declared, func(name string) []string {
+		if target, ok := imports[name]; ok {
+			return []string{target}
+		}
+		return nil
+	})[0]
+}
+
+// ownPaths is OwnPath for names that may import several paths, such as
+// one #[cfg]-gated uses import from different places: one path for each
+// way through them.
+func ownPaths(path string, declared map[string]bool, imports func(name string) []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	var follow func(path string)
+	follow = func(path string) {
+		first, rest, more := strings.Cut(path, "::")
+		if declared[first] {
+			out = append(out, "self::"+path)
+			return
+		}
+		if next, _, _ := strings.Cut(rest, "::"); first == "self" && more && len(imports(next)) > 0 {
+			follow(rest) // self::alias is the module's own imported alias
+			return
+		}
+		targets := imports(first)
+		if len(targets) == 0 || seen[first] || first == "crate" || first == "self" || first == "super" {
+			out = append(out, path)
+			return
+		}
+		seen[first] = true
+		for _, target := range targets {
+			if more {
+				target += "::" + rest
+			}
+			follow(target)
+		}
+		seen[first] = false
+	}
+	follow(path)
+	return out
 }
 
 // Imports maps each name a file brings into scope with use to the path it
@@ -791,12 +846,16 @@ func Traits(src []byte) []string {
 // declarations, not those of an inline module, a function or a block,
 // with each glob (use a::b::*) under "*" and its source.
 func Imports(src []byte) (all, top map[string]string) {
-	_ = syntax.Parse(language, src, func(root *sitter.Node) {
-		all, top = importsOf(root, src), usesIn(root, src)
-		// A glob names no one item: only the root's are followed, through
-		// their source modules' items.
-		maps.DeleteFunc(all, func(name, _ string) bool { return strings.HasPrefix(name, "*") })
-	})
+	_ = WithSyntax(syntax.Source{Src: src}, func(s Syntax) { all, top = s.Imports() })
+	return all, top
+}
+
+// Imports returns the file's imports (see Imports).
+func (s Syntax) Imports() (all, top map[string]string) {
+	all, top = importsOf(s.root, s.file.Src), usesIn(s.root, s.file.Src)
+	// A glob names no one item: only the root's are followed, through
+	// their source modules' items.
+	maps.DeleteFunc(all, func(name, _ string) bool { return strings.HasPrefix(name, "*") })
 	return all, top
 }
 
@@ -852,7 +911,13 @@ func collectUse(n *sitter.Node, prefix string, src []byte, out map[string]string
 	case "use_as_clause":
 		path, alias := n.ChildByFieldName("path"), n.ChildByFieldName("alias")
 		if path != nil && alias != nil {
-			out[alias.Utf8Text(src)] = join(path.Utf8Text(src))
+			target := join(path.Utf8Text(src))
+			if path.Kind() == "self" {
+				target = prefix // use a::b::{self as c} imports b as c
+			}
+			if target != "" {
+				out[alias.Utf8Text(src)] = target
+			}
 		}
 	case "scoped_use_list":
 		inner := prefix
@@ -925,11 +990,27 @@ func (e *extractor) visibleImports(item *sitter.Node) map[string]string {
 
 // usesIn returns the imports of the use declarations directly in a
 // module's item list or a block, as Imports gives them, but those marked
-// #[cfg(test)], which are test code's.
+// #[cfg(test)], which are test code's. A name several declare (under
+// different #[cfg]s) has the last one's path; useTargets has them all.
+func usesIn(container *sitter.Node, src []byte) map[string]string {
+	return lastTargets(useTargets(container, src))
+}
+
+// lastTargets returns, for each name useTargets lists, its last path.
+func lastTargets(targets map[string][]string) map[string]string {
+	out := map[string]string{}
+	for name, paths := range targets {
+		out[name] = paths[len(paths)-1]
+	}
+	return out
+}
+
+// useTargets returns, for each name the use declarations directly in a
+// container import (see usesIn), the paths it imports, in order.
 //
 // ddslop:ignore Rust's use walk; TypeScript's import walk reads another grammar
-func usesIn(container *sitter.Node, src []byte) map[string]string {
-	out := map[string]string{}
+func useTargets(container *sitter.Node, src []byte) map[string][]string {
+	out := map[string][]string{}
 	test := false
 	for i := uint(0); i < container.NamedChildCount(); i++ {
 		n := container.NamedChild(i)
@@ -942,7 +1023,11 @@ func usesIn(container *sitter.Node, src []byte) map[string]string {
 		}
 		if n.Kind() == "use_declaration" && !test {
 			if arg := n.ChildByFieldName("argument"); arg != nil {
-				collectUse(arg, "", src, out)
+				one := map[string]string{}
+				collectUse(arg, "", src, one)
+				for name, path := range one {
+					out[name] = append(out[name], path)
+				}
 			}
 		}
 		test = false
@@ -982,7 +1067,7 @@ func (e *extractor) walk(n *sitter.Node, sc scope, test bool, own []string) {
 		return
 	case "const_item", "static_item":
 		if sc.owner == "" {
-			e.addConst(n, test, own)
+			e.addConst(n, sc.module, test, own)
 		}
 		return
 	case "impl_item":
@@ -1347,7 +1432,7 @@ func forwards(fn *sitter.Node, src []byte) string {
 	}
 	switch callee.Kind() {
 	case "identifier", "scoped_identifier":
-		if isUpper(lastSegment(callee.Utf8Text(src))) {
+		if source.Capitalized(lastSegment(callee.Utf8Text(src))) {
 			return "" // a constructor
 		}
 	case "field_expression":
@@ -1391,8 +1476,18 @@ var internalAttrs = map[string]bool{
 
 // isExternalAttr reports whether an attribute may make an item reachable
 // from outside the source (#[no_mangle], #[tokio::main], route macros):
-// anything but test attributes and internalAttrs.
+// anything but test attributes and internalAttrs. A #[cfg_attr] is
+// external when an attribute it applies in some builds is
+// (#[cfg_attr(feature = "ffi", unsafe(no_mangle))]).
 func isExternalAttr(attr string) bool {
+	if attrName(attr) == "cfg_attr" {
+		open, end := strings.Index(attr, "("), strings.LastIndex(attr, ")")
+		if open < 0 || end < open {
+			return false
+		}
+		applied := splitTopLevel(attr[open+1:end], ',')[1:] // after the condition
+		return slices.ContainsFunc(applied, func(a string) bool { return isExternalAttr("#[" + strings.TrimSpace(a) + "]") })
+	}
 	return !isTestAttr(attr) && !internalAttrs[attrName(attr)]
 }
 
@@ -1582,7 +1677,7 @@ func enclosingImpl(fn *sitter.Node) *sitter.Node {
 }
 
 // addConst records a constant or static item.
-func (e *extractor) addConst(n *sitter.Node, test bool, attrs []string) {
+func (e *extractor) addConst(n *sitter.Node, module string, test bool, attrs []string) {
 	name, value := n.ChildByFieldName("name"), n.ChildByFieldName("value")
 	if name == nil || value == nil || n.HasError() {
 		return
@@ -1595,8 +1690,10 @@ func (e *extractor) addConst(n *sitter.Node, test bool, attrs []string) {
 	e.decls.Consts = append(e.decls.Consts, unit.Const{
 		File:     e.path,
 		Name:     name.Utf8Text(e.src),
+		Module:   module,
 		Value:    text,
 		Line:     syntax.Line(n.StartPosition()),
+		EndLine:  syntax.Line(n.EndPosition()),
 		Nodes:    syntax.CountNodes(value),
 		Literal:  literal,
 		Macro:    value.Kind() == "macro_invocation",
@@ -1782,12 +1879,6 @@ func childDeclares(parent string, parentDeclares bool, field, child string) bool
 	return parentDeclares
 }
 
-// isUpper reports whether a name starts with an upper-case ASCII letter. In
-// Rust patterns such names are enum variants or constants, not bindings.
-func isUpper(name string) bool {
-	return name != "" && name[0] >= 'A' && name[0] <= 'Z'
-}
-
 // CrateName returns the name Rust code uses for a crate, from its
 // Cargo.toml: the [lib] name if set, otherwise the [package] name, with
 // dashes as underscores. It returns "" when there is no package.
@@ -1850,12 +1941,10 @@ func manifestValues(cargoToml []byte, key string, sections ...string) []string {
 	return out
 }
 
-// DeclaredModules returns the modules a file declares out of line (mod
+// DeclaredModules returns the modules the file declares out of line (mod
 // name;), at its top level, in source order: each one's name, or the file
 // a #[path] attribute places it in, ending in .rs.
-func DeclaredModules(src []byte) []string {
-	return topModules(src, false, moduleEntry)
-}
+func (s Syntax) DeclaredModules() []string { return s.topModules(false, moduleEntry) }
 
 // moduleEntry is how DeclaredModules names a module: the file a #[path]
 // attribute places it in, else its name.
@@ -1878,13 +1967,13 @@ func pathAttribute(attr string) (string, bool) {
 	return tomlString(strings.TrimSpace(value)), true
 }
 
-// TestModules returns the names of the modules a file declares out of
+// TestModules returns the names of the modules the file declares out of
 // line under #[cfg(test)] ("#[cfg(test)] mod name;"): their files hold
 // test code.
 //
 // Only declarations at the top level of the file are considered.
-func TestModules(src []byte) []string {
-	return topModules(src, false, func(name string, attrs []string) string {
+func (s Syntax) TestModules() []string {
+	return s.topModules(false, func(name string, attrs []string) string {
 		if slices.ContainsFunc(attrs, isCfgTest) {
 			return name
 		}
@@ -1892,31 +1981,31 @@ func TestModules(src []byte) []string {
 	})
 }
 
-// InlineModules returns the names of the modules a file declares inline
-// (mod name { ... }) at its top level, in source order.
-func InlineModules(src []byte) []string {
-	return topModules(src, true, func(name string, _ []string) string { return name })
+// InlineModules returns the names of the modules the file declares
+// inline (mod name { ... }) at its top level, in source order.
+func (s Syntax) InlineModules() []string {
+	return s.topModules(true, func(name string, _ []string) string { return name })
 }
 
 // topModules returns, for the modules a file declares at its top level,
 // inline ones or out-of-line ones, what entry makes of each one's name and
 // attributes, "" leaving it out.
-func topModules(src []byte, inline bool, entry func(name string, attrs []string) string) []string {
-	return topItems(src, func(item *sitter.Node, _ []string) bool {
+func (s Syntax) topModules(inline bool, entry func(name string, attrs []string) string) []string {
+	return s.topItems(func(item *sitter.Node, _ []string) bool {
 		return item.Kind() == "mod_item" && (item.ChildByFieldName("body") != nil) == inline
 	}, entry)
 }
 
 // topItems returns, for each item at the top of a file that keep accepts,
 // what entry makes of its name and attributes, "" leaving it out.
-func topItems(src []byte, keep func(item *sitter.Node, attrs []string) bool, entry func(name string, attrs []string) string) []string {
+func (s Syntax) topItems(keep func(item *sitter.Node, attrs []string) bool, entry func(name string, attrs []string) string) []string {
 	var names []string
-	topLevel(src, func(item *sitter.Node, attrs []string) {
+	s.topLevel(func(item *sitter.Node, attrs []string) {
 		if !keep(item, attrs) {
 			return
 		}
 		if name := item.ChildByFieldName("name"); name != nil {
-			if e := entry(name.Utf8Text(src), attrs); e != "" {
+			if e := entry(name.Utf8Text(s.file.Src), attrs); e != "" {
 				names = append(names, e)
 			}
 		}
@@ -1924,14 +2013,12 @@ func topItems(src []byte, keep func(item *sitter.Node, attrs []string) bool, ent
 	return names
 }
 
-// topLevel parses src and calls visit with each item at the top of the
-// file and the attributes written above it.
-func topLevel(src []byte, visit func(item *sitter.Node, attrs []string)) {
-	_ = syntax.Parse(language, src, func(root *sitter.Node) {
-		eachItem(root, src, func(item *sitter.Node, attrs []string) bool {
-			visit(item, attrs)
-			return false
-		})
+// topLevel calls visit with each item at the top of the file and the
+// attributes written above it.
+func (s Syntax) topLevel(visit func(item *sitter.Node, attrs []string)) {
+	eachItem(s.root, s.file.Src, func(item *sitter.Node, attrs []string) bool {
+		visit(item, attrs)
+		return false
 	})
 }
 
@@ -1941,37 +2028,38 @@ var topItemKinds = map[string]bool{
 	"trait_item": true, "const_item": true, "static_item": true, "macro_definition": true,
 }
 
-// TopNames returns the names a file declares in its own scope: its
+// TopNames returns the names the file declares in its own scope: its
 // top-level functions, types, traits, constants, statics and macros, not
 // those of an inline module, nor test code's.
-func TopNames(src []byte) []string {
-	return topItems(src, func(item *sitter.Node, attrs []string) bool {
+func (s Syntax) TopNames() []string {
+	return s.topItems(func(item *sitter.Node, attrs []string) bool {
 		return topItemKinds[item.Kind()] && !slices.ContainsFunc(attrs, isCfgTest)
 	}, func(name string, _ []string) string { return strings.TrimPrefix(name, "r#") })
 }
 
-// TopExports returns the names a file's own scope makes visible outside
-// its module: what a glob of the module supplies of its own. They are
-// TopNames' items with a visibility, and its public modules.
-func TopExports(src []byte) []string {
-	return topItems(src, func(item *sitter.Node, attrs []string) bool {
-		return (topItemKinds[item.Kind()] || item.Kind() == "mod_item") && visible(item, src) &&
+// TopExports returns the names the file's own scope makes visible
+// outside its module: what a glob of the module supplies of its own. They
+// are TopNames' items with a visibility, and its public modules.
+func (s Syntax) TopExports() []string {
+	return s.topItems(func(item *sitter.Node, attrs []string) bool {
+		return (topItemKinds[item.Kind()] || item.Kind() == "mod_item") && visible(item, s.file.Src) &&
 			!slices.ContainsFunc(attrs, isCfgTest)
 	}, func(name string, _ []string) string { return strings.TrimPrefix(name, "r#") })
 }
 
-// TopReexports returns the names a file's top-level use declarations with
-// a visibility (pub, pub(crate)) bring in, each with its path: what a glob
-// of the file's module supplies besides its items. A visible glob (pub use
-// a::*) is kept under "*" and its source. Test code's uses are left out.
-func TopReexports(src []byte) map[string]string {
+// TopReexports returns the names the file's top-level use declarations
+// with a visibility (pub, pub(crate)) bring in, each with its path: what a
+// glob of the file's module supplies besides its items. A visible glob
+// (pub use a::*) is kept under "*" and its source. Test code's uses are
+// left out.
+func (s Syntax) TopReexports() map[string]string {
 	out := map[string]string{}
-	topLevel(src, func(item *sitter.Node, attrs []string) {
-		if item.Kind() != "use_declaration" || slices.ContainsFunc(attrs, isCfgTest) || !visible(item, src) {
+	s.topLevel(func(item *sitter.Node, attrs []string) {
+		if item.Kind() != "use_declaration" || slices.ContainsFunc(attrs, isCfgTest) || !visible(item, s.file.Src) {
 			return
 		}
 		if arg := item.ChildByFieldName("argument"); arg != nil {
-			collectUse(arg, "", src, out)
+			collectUse(arg, "", s.file.Src, out)
 		}
 	})
 	return out

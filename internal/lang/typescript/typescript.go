@@ -13,6 +13,7 @@ import (
 
 	"github.com/heikki-laitala/ddslop/internal/lang/syntax"
 	"github.com/heikki-laitala/ddslop/internal/similarity"
+	"github.com/heikki-laitala/ddslop/internal/source"
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
 
@@ -207,18 +208,24 @@ func Parse(file string, src []byte) ([]unit.Unit, unit.Decls, error) {
 				p.units[j].External = byDefault
 			}
 		}
+		p.decls.Reach.Optional = map[string]int{}
 		p.markExported(root)
+		addNoUses(p.decls.Reach.Optional, root, src)
 		marked = syntax.MarkIgnored(root, src, p.units, &p.decls)
 	})
 	return p.units, p.decls, errors.Join(err, marked)
 }
 
-// markExported makes public the units an export clause (export { load })
-// or a default export of a name (export default save) lists; a clause
-// re-exporting another module's names (export { x } from "./y") lists
-// none of the file's.
+// markExported makes public the units and constants an export clause
+// (export { load }) or a default export of a name (export default save)
+// lists; a clause re-exporting another module's names (export { x } from
+// "./y") lists none of the file's. A default export and a renamed one
+// (export { load as fetch }) are External: other files know the name by
+// another. A clause's words are no use of the names (see unit.Reach).
+// A route option a clause exports is no constant, as when exported
+// directly (see routeOption).
 func (p *parser) markExported(root *sitter.Node) {
-	names, defaults := map[string]bool{}, map[string]bool{}
+	names, external := map[string]bool{}, map[string]bool{}
 	for i := uint(0); i < root.NamedChildCount(); i++ {
 		n := root.NamedChild(i)
 		if n.Kind() != "export_statement" || n.ChildByFieldName("declaration") != nil || n.ChildByFieldName("source") != nil {
@@ -226,7 +233,7 @@ func (p *parser) markExported(root *sitter.Node) {
 		}
 		if v := n.ChildByFieldName("value"); v != nil && v.Kind() == "identifier" {
 			name := v.Utf8Text(p.src)
-			names[name], defaults[name] = true, true
+			names[name], external[name] = true, true
 		}
 		for j := uint(0); j < n.NamedChildCount(); j++ {
 			clause := n.NamedChild(j)
@@ -234,8 +241,16 @@ func (p *parser) markExported(root *sitter.Node) {
 				continue
 			}
 			for k := uint(0); k < clause.NamedChildCount(); k++ {
-				if name := clause.NamedChild(k).ChildByFieldName("name"); name != nil {
+				spec := clause.NamedChild(k)
+				if spec.Kind() != "export_specifier" {
+					continue // a comment, whose words addNoUses adds
+				}
+				source.AddWords(p.decls.Reach.Optional, spec.Utf8Text(p.src))
+				if name := spec.ChildByFieldName("name"); name != nil {
 					names[name.Utf8Text(p.src)] = true
+					if spec.ChildByFieldName("alias") != nil {
+						external[name.Utf8Text(p.src)] = true
+					}
 				}
 			}
 		}
@@ -243,7 +258,38 @@ func (p *parser) markExported(root *sitter.Node) {
 	for i := range p.units {
 		u := &p.units[i]
 		u.Public = u.Public || names[u.Name]
-		u.External = u.External || defaults[u.Name] || (u.Public && frameworkExports[u.Name])
+		u.External = u.External || external[u.Name] || (u.Public && frameworkExports[u.Name])
+	}
+	consts := p.decls.Consts[:0]
+	for _, c := range p.decls.Consts {
+		c.Public = c.Public || names[c.Name]
+		if c.Public && p.routeOption(c.Name) {
+			continue // the route's config, as an export const of it is
+		}
+		c.External = c.External || external[c.Name] || (c.Public && frameworkExports[c.Name])
+		consts = append(consts, c)
+	}
+	p.decls.Consts = consts
+}
+
+// addNoUses adds the words under n that use no name: those of comments
+// and string literals (a template string's text, not its substitutions)
+// and the names of signatures (an overload, an interface's method),
+// which declare one.
+func addNoUses(words map[string]int, n *sitter.Node, src []byte) {
+	for i := uint(0); i < n.ChildCount(); i++ {
+		child := n.Child(i)
+		switch child.Kind() {
+		case "comment", "string", "string_fragment":
+			source.AddWords(words, child.Utf8Text(src))
+			continue
+		case "function_signature", "method_signature", "abstract_method_signature":
+			// a computed name uses its words: [KEY]() uses KEY
+			if name := child.ChildByFieldName("name"); name != nil && strings.HasSuffix(name.Kind(), "identifier") {
+				source.AddWords(words, name.Utf8Text(src))
+			}
+		}
+		addNoUses(words, child, src)
 	}
 }
 
@@ -356,6 +402,7 @@ func (p *parser) declaration(n *sitter.Node, exported bool) {
 	case "lexical_declaration", "variable_declaration":
 		kind := n.ChildByFieldName("kind")
 		constant := kind != nil && kind.Kind() == "const"
+		declarators := syntax.CountKind(n, "variable_declarator")
 		for i := uint(0); i < n.NamedChildCount(); i++ {
 			d := n.NamedChild(i)
 			name, value := d.ChildByFieldName("name"), d.ChildByFieldName("value")
@@ -370,7 +417,7 @@ func (p *parser) declaration(n *sitter.Node, exported bool) {
 					p.typedAs(d, name.Utf8Text(p.src), fn.ChildByFieldName("return_type"))
 				}
 			case constant && isConstant(value) && (!exported || !p.routeOption(name.Utf8Text(p.src))):
-				p.constant(name, value)
+				p.constant(n, name, value, exported, declarators > 1)
 			}
 		}
 	case "class_declaration", "abstract_class_declaration":
@@ -397,9 +444,15 @@ func (p *parser) declaration(n *sitter.Node, exported bool) {
 // exported functions: a page's data functions, a route's handlers, the
 // app router's metadata and static parameters, middleware (proxy since
 // Next.js 16) and instrumentation; and Remix's and SvelteKit's route
-// modules' data functions. Unlike routeOptions, they count in any file:
-// a function of such a name elsewhere is only missed as unused.
+// modules' data functions. They also name the constants frameworks read:
+// Next.js metadata, viewport, config and image metadata (alt, size,
+// contentType), SvelteKit's and Astro's page options (prerender, ssr,
+// csr, trailingSlash) and Remix's handle. Unlike routeOptions, they
+// count in any file: a function or constant of such a name elsewhere is
+// only missed as unused.
 var frameworkExports = map[string]bool{
+	"metadata": true, "viewport": true, "config": true, "alt": true, "size": true, "contentType": true,
+	"prerender": true, "ssr": true, "csr": true, "trailingSlash": true, "handle": true,
 	"getStaticProps": true, "getStaticPaths": true, "getServerSideProps": true,
 	"generateMetadata": true, "generateStaticParams": true, "generateViewport": true,
 	"generateImageMetadata": true, "generateSitemaps": true, "middleware": true, "proxy": true,
@@ -408,8 +461,9 @@ var frameworkExports = map[string]bool{
 	"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true, "HEAD": true, "OPTIONS": true,
 }
 
-// routeOptions are the names under which a Next.js page, layout or route
-// file exports its route's options.
+// routeOptions are the names under which a Next.js page, layout, route
+// or metadata file (opengraph-image, sitemap and the like, special route
+// handlers) exports its route's options.
 var routeOptions = map[string]bool{
 	"dynamic": true, "dynamicParams": true, "revalidate": true, "fetchCache": true,
 	"runtime": true, "preferredRegion": true, "maxDuration": true,
@@ -420,7 +474,7 @@ var routeOptions = map[string]bool{
 func (p *parser) routeOption(name string) bool {
 	base := path.Base(filepath.ToSlash(p.file))
 	switch strings.TrimSuffix(base, path.Ext(base)) {
-	case "page", "layout", "route":
+	case "page", "layout", "route", "opengraph-image", "twitter-image", "icon", "apple-icon", "sitemap", "robots", "manifest":
 		return routeOptions[name]
 	}
 	return false
@@ -497,17 +551,23 @@ func literalsOnly(n *sitter.Node) bool {
 }
 
 // constant records a module-level constant: a string literal as written,
-// any other value without whitespace.
-func (p *parser) constant(name, value *sitter.Node) {
+// any other value without whitespace. It is inseparable when its
+// declaration declares others too (const a = 1, b = 2); otherwise its
+// lines start at the declaration's (export const\n  X = 1).
+func (p *parser) constant(decl, name, value *sitter.Node, exported, inseparable bool) {
 	literal := value.Kind() == "string"
 	text := value.Utf8Text(p.src)
 	if !literal {
 		text = syntax.Compact(text)
 	}
 	p.decls.Consts = append(p.decls.Consts, unit.Const{
-		File: p.file, Name: name.Utf8Text(p.src), Value: text, Line: syntax.Line(name.StartPosition()),
-		Nodes: syntax.CountNodes(value), Literal: literal, Test: p.test,
+		File: p.file, Name: name.Utf8Text(p.src), Value: text, Line: syntax.Line(name.StartPosition()), EndLine: syntax.Line(value.EndPosition()),
+		Nodes: syntax.CountNodes(value), Literal: literal, Public: exported, Inseparable: inseparable,
+		Test: p.test,
 	})
+	if !inseparable {
+		p.decls.Consts[len(p.decls.Consts)-1].Line = syntax.Line(decl.StartPosition())
+	}
 }
 
 // structure records an interface or object type as a struct of its

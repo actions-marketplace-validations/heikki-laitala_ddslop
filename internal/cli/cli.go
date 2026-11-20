@@ -374,6 +374,9 @@ func runCheck(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
+	if hint := staleHint(root); hint != "" {
+		fmt.Fprintln(stderr, "ddslop: "+hint)
+	}
 	if limited {
 		if r.Summary.Health.OverLimit {
 			return exitFound
@@ -738,6 +741,8 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 	flows := parallelFlows(g, traits, opts.minNodes)
 	found, conventions := drifts(units, crates, judged)
 	importedWhole := wholeImported(root, files)
+	// The public items of these files are used by name only, if at all.
+	namedOnly := func(file string) bool { return internal(file) && !importedWhole[file] }
 	words, err := wordCounts(root, files)
 	if err != nil {
 		return report.Report{}, nil, err
@@ -750,10 +755,8 @@ func check(root string, opts options, judged map[string]map[string]codemap.Conve
 		Inlined: byLanguage(consts, func(lang string, c []unit.Const) []clone.InlinedConst {
 			return clone.InlinedConstants(c, inLanguage(lang, units), flow.CrateOf)
 		}),
-		Dead: simplify.Dead(units, words, func(file string) bool {
-			return internal(file) && !importedWhole[file]
-		}),
-		TooPublic: tooPublic(units, consts, words, libraryWords(root, files, crates, internal)),
+		Dead:      dead(units, consts, words, namedOnly),
+		TooPublic: tooPublic(units, consts, words, libraryWords(root, files, crates, namedOnly)),
 		Wrappers:  simplify.PassThrough(g),
 		Traits:    singleImpls(traitDecls, files, internal),
 		Scopes:    byLanguage(units, func(_ string, u []unit.Unit) []pattern.ScopeGroup { return pattern.Scopes(u) }),
@@ -1123,7 +1126,7 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 			declared[strings.TrimPrefix(d, "r#")] = true
 		}
 		for n, path := range f.TopReexports {
-			path = ownPath(path, declared, f.TopImports)
+			path = rust.OwnPath(path, declared, f.TopImports)
 			if strings.HasPrefix(n, "*") {
 				if target, ok := codemap.ReexportPath(f.Path, crates, path); ok {
 					moduleGlobs[m] = append(moduleGlobs[m], target)
@@ -1200,30 +1203,6 @@ func dependencies(files []index.File, crates *codemap.Packages, name string, gen
 	return deps
 }
 
-// ownPath reads a bare re-export path as the module writing it does: a
-// first segment naming a module the file declares (pub mod inner; pub use
-// inner::X) is self::, and one naming a name the file's top-level uses
-// bring in (use crate::foo; pub use foo::X) is that use's path, followed
-// through further such names once each. Any other bare path is left as
-// it is: another crate's.
-func ownPath(path string, declared map[string]bool, imports map[string]string) string {
-	seen := map[string]bool{}
-	for {
-		first, rest, more := strings.Cut(path, "::")
-		if declared[first] {
-			return "self::" + path
-		}
-		target, ok := imports[first]
-		if !ok || seen[first] || first == "crate" || first == "self" || first == "super" {
-			return path
-		}
-		seen[first] = true
-		if path = target; more {
-			path += "::" + rest
-		}
-	}
-}
-
 // libraryCrates returns the crates whose package has a library target
 // (src/lib.rs).
 func libraryCrates(files []index.File, crates *codemap.Packages) map[string]bool {
@@ -1239,54 +1218,210 @@ func libraryCrates(files []index.File, crates *codemap.Packages) map[string]bool
 // tooPublic finds the too public functions and constants (see
 // simplify.TooPublic), judging constants as units.
 func tooPublic(units []unit.Unit, consts []unit.Const, words map[string]int, library func(file string) *simplify.Library) []unit.Unit {
-	asUnits := make([]unit.Unit, 0, len(consts))
+	return append(simplify.TooPublic(constUnits(consts), words, library), simplify.TooPublic(units, words, library)...)
+}
+
+// dead finds the unused public functions and constants (see
+// simplify.Dead), judging constants as units. An inseparable constant
+// is left out: its lines cannot be deleted alone.
+func dead(units []unit.Unit, consts []unit.Const, words map[string]int, internal func(file string) bool) []unit.Unit {
+	deletable := slices.DeleteFunc(slices.Clone(consts), func(c unit.Const) bool { return c.Inseparable })
+	return append(simplify.Dead(units, words, internal), simplify.Dead(constUnits(deletable), words, internal)...)
+}
+
+// constUnits returns constants as units a simplify check judges, each
+// spanning its declaration.
+func constUnits(consts []unit.Const) []unit.Unit {
+	out := make([]unit.Unit, 0, len(consts))
 	for _, c := range consts {
-		asUnits = append(asUnits, unit.Unit{File: c.File, Name: c.Name, StartLine: c.Line, EndLine: c.Line, Nodes: c.Nodes,
+		out = append(out, unit.Unit{File: c.File, Name: c.Name, Module: c.Module, StartLine: c.Line, EndLine: c.EndLine, Nodes: c.Nodes,
 			Public: c.Public, External: c.External, Test: c.Test})
 	}
-	return append(simplify.TooPublic(asUnits, words, library), simplify.TooPublic(units, words, library)...)
+	return out
 }
 
 // libraryWords returns, for a Rust file in the library of an unpublished
-// crate, the words of that library's files (see simplify.Library); for
-// any other file, nil. A library's files are its root file's module tree:
-// a binary's modules beside them are not.
+// crate, a Go file of an internal package (see golang.Internal) but a
+// main one, or a TypeScript file of a private package, the words of that
+// library's files (see simplify.Library); for any other file, nil. A
+// Rust library's files are its root file's module tree: a binary's
+// modules beside them are not. A Go package's are its directory's files
+// but those of its external tests (package text_test), a package of their
+// own. A TypeScript library is the file alone: a module's scope.
 func libraryWords(root string, files []index.File, crates *codemap.Packages, internal func(file string) bool) func(file string) *simplify.Library {
 	byPath := map[string]index.File{}
 	for _, f := range files {
 		byPath[f.Path] = f
 	}
 	type module struct {
-		path     string
-		optional bool
+		path      string
+		segments  []string // its module path
+		optional  bool
+		ancestors []string // the files of the modules it is inside
+		placed    bool     // loaded through #[path]
 	}
 	owner := map[string]*simplify.Library{}
 	for _, f := range files {
 		if _, rel := codemap.CratePath(f.Path, crates); rel != "lib.rs" || languageOf(f.Path) != "rust" || !internal(f.Path) {
 			continue
 		}
-		lib := &simplify.Library{Words: map[string]int{}, Optional: map[string]int{}, Declared: map[string]int{}}
+		lib := &simplify.Library{Words: map[string]int{}, Optional: map[string]int{}, Declared: map[string]int{}, Exposed: map[string]bool{}}
+		tree := map[string][]index.File{} // by module path: #[cfg]-gated #[path]s may give one several
 		for queue := []module{{path: f.Path}}; len(queue) > 0; queue = queue[1:] {
 			m := queue[0]
 			file, ok := byPath[m.path]
-			if !ok || owner[m.path] != nil {
+			if !ok || owner[m.path] != nil && owner[m.path] != lib || slices.Contains(m.ancestors, m.path) {
 				continue
 			}
-			owner[m.path] = lib
+			// A file two #[path]s declare is in the tree under each name,
+			// with the modules inside it, but its words count once.
+			tree[strings.Join(m.segments, "::")] = append(tree[strings.Join(m.segments, "::")], file)
 			optional := m.optional || file.Decls.Reach.AllOptional
-			addLibraryWords(root, lib, file, crates.Libraries.PackageOf(file.Path), optional)
+			if owner[m.path] == nil {
+				owner[m.path] = lib
+				addLibraryWords(root, lib, file, crates.Libraries.PackageOf(file.Path), optional)
+			}
+			ancestors := append(slices.Clone(m.ancestors), m.path)
 			dir := moduleDir(file.Path)
-			if m.path == f.Path {
-				dir = filepath.Dir(f.Path) // a crate root's modules sit beside it, whatever its name
+			if m.path == f.Path || m.placed {
+				// a crate root's modules, and a #[path] file's, sit beside it, whatever its name
+				dir = filepath.Dir(m.path)
 			}
 			for _, name := range file.Modules {
 				for _, path := range moduleFiles(file.Path, dir, name) {
-					queue = append(queue, module{path, optional || slices.Contains(file.Decls.Reach.CfgModules, name)})
+					for _, declared := range declaredNames(file, name) {
+						segments := append(slices.Clone(m.segments), declared)
+						queue = append(queue, module{path, segments, optional || slices.Contains(file.Decls.Reach.CfgModules, name), ancestors,
+							strings.HasSuffix(name, ".rs")})
+					}
+				}
+			}
+			// One declared inside inline modules sits under their names (mod
+			// holder { mod held; } is holder/held.rs).
+			for _, nested := range file.Decls.Reach.NestedModules {
+				parts := strings.Split(nested, "::")
+				inner := filepath.Join(append([]string{dir}, parts[:len(parts)-1]...)...)
+				for _, path := range moduleFiles(file.Path, inner, parts[len(parts)-1]) {
+					queue = append(queue, module{path, append(slices.Clone(m.segments), parts...), optional, ancestors, false})
 				}
 			}
 		}
+		addGlobbed(lib.Exposed, tree)
+	}
+	packageLibs := map[string]*simplify.Library{} // Go package directory -> its library
+	for _, f := range files {
+		if !internal(f.Path) {
+			continue
+		}
+		switch languageOf(f.Path) {
+		case "typescript":
+			owner[f.Path] = newLibrary()
+			addLibraryWords(root, owner[f.Path], f, "", false)
+		case "go":
+			// Any main package may be built as a plugin too, whose host
+			// looks its exported names up.
+			if golang.ExternalTest(f.Path, f.Decls.Package) || f.Decls.Package == "main" {
+				continue
+			}
+			dir := filepath.Dir(f.Path)
+			if packageLibs[dir] == nil {
+				packageLibs[dir] = newLibrary()
+			}
+			owner[f.Path] = packageLibs[dir]
+			addLibraryWords(root, packageLibs[dir], f, "", f.Decls.Reach.AllOptional)
+		}
 	}
 	return func(file string) *simplify.Library { return owner[file] }
+}
+
+func newLibrary() *simplify.Library {
+	return &simplify.Library{Words: map[string]int{}, Optional: map[string]int{}, Declared: map[string]int{}}
+}
+
+// declaredNames returns the names a file declares a module by, in
+// order, given its entry in the file's Modules: those whose #[path]
+// attribute names the entry, or the name itself.
+func declaredNames(file index.File, entry string) []string {
+	var names []string
+	for name, paths := range file.Decls.Reach.PathModules {
+		if slices.Contains(paths, entry) {
+			names = append(names, name)
+		}
+	}
+	if names == nil {
+		return []string{entry}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// addGlobbed adds to exposed the modules a crate's plain pub globs
+// re-export whole (see unit.Reach.Globs): one out of line by its file,
+// and the modules inside it, or an inline one, as "file#module". A glob's
+// path, which rust.Reach reads from the file's module, an imported name
+// as its path, is resolved from the file's module (crate::, self::,
+// super::, or a child's name); a path into an inline module exposes it
+// whole, and one that leaves the crate's modules (another crate, an
+// enum's variants) exposes nothing. tree is the crate's module files, by
+// module path.
+func addGlobbed(exposed map[string]bool, tree map[string][]index.File) {
+	aliases := map[string]bool{} // the crate's own names (extern crate self as mycrate)
+	for _, root := range tree[""] {
+		for _, r := range root.References {
+			if r.Item == "extern crate" && r.Path == "crate" {
+				aliases[r.Alias] = true
+			}
+		}
+	}
+	for here, files := range tree {
+		for _, file := range files {
+			for _, glob := range file.Decls.Reach.Globs {
+				if first, rest, _ := strings.Cut(glob, "::"); aliases[first] {
+					glob = "crate::" + rest
+				}
+				resolved, ok := flow.ResolvePath(glob, here)
+				if !ok {
+					resolved, _ = flow.ResolvePath("self::"+glob, here) // shapes is self::shapes
+				}
+				exposeModule(exposed, tree, resolved)
+			}
+		}
+	}
+}
+
+// exposeModule adds to exposed the module at a module path, with the
+// modules inside it, or nothing if the crate has no such module.
+func exposeModule(exposed map[string]bool, tree map[string][]index.File, module string) {
+	at := ""
+	for _, segment := range strings.Split(module, "::") {
+		if segment == "" {
+			break
+		}
+		child := strings.TrimPrefix(at+"::"+segment, "::")
+		if _, ok := tree[child]; ok {
+			at = child
+			continue
+		}
+		inline := false
+		for _, file := range tree[at] {
+			if slices.Contains(file.InlineModules, segment) {
+				exposed[file.Path+"#"+segment] = true
+				inline = true
+			}
+		}
+		if !inline {
+			return
+		}
+		at = child // and the modules declared out of line inside it
+		break
+	}
+	for path, files := range tree {
+		if path == at || at == "" || strings.HasPrefix(path, at+"::") {
+			for _, file := range files {
+				exposed[file.Path] = true
+			}
+		}
+	}
 }
 
 // addLibraryWords adds a file's words to its library's: all of them
@@ -1574,28 +1709,35 @@ func internalCrates(root string, files []index.File, crates *codemap.Packages) f
 	workspace := manifest(root, ".")
 	ts := tsManifests(root, files)
 	libraries := crates.Libraries
-	internal := map[string]bool{}
+	executables := map[string]bool{} // Go package directories declaring func main
+	for _, f := range files {
+		if languageOf(f.Path) == "go" && slices.ContainsFunc(f.Units, func(u unit.Unit) bool { return u.Name == "main" }) {
+			executables[libraries.CrateOf(f.Path)] = true
+		}
+	}
+	internal := map[[2]string]bool{} // by language and crate or package directory
 	for _, f := range files {
 		dir := libraries.CrateOf(f.Path)
-		if _, done := internal[dir]; done {
-			continue
+		key := [2]string{languageOf(f.Path), dir}
+		if _, done := internal[key]; done || golang.ExternalTest(f.Path, f.Decls.Package) {
+			continue // an external test (package main_test) is no package main
 		}
 		switch languageOf(f.Path) {
 		case "go":
-			internal[dir] = golang.Internal(f.Path, f.Decls.Package)
+			internal[key] = golang.Internal(f.Path, f.Decls.Package, executables[dir])
 		case "rust":
 			pkg := libraries.PackageOf(f.Path) // a placed target's crate is not its package
 			if pkg == "" {
 				pkg = dir
 			}
-			internal[dir] = rust.Unpublished(manifest(root, pkg), workspace)
+			internal[key] = rust.Unpublished(manifest(root, pkg), workspace)
 		}
 	}
 	return func(file string) bool {
 		if languageOf(file) == "typescript" {
 			return ts[tsfile.PackageDir(file, ts)].Private
 		}
-		return internal[libraries.CrateOf(file)]
+		return internal[[2]string{languageOf(file), libraries.CrateOf(file)}]
 	}
 }
 
@@ -1857,21 +1999,23 @@ func parseSource(file syntax.Source) (index.Parsed, error) {
 	path, src := file.Path, file.Src
 	language := languageOf(path)
 	if syntax.IsGenerated(src) {
-		var entries []string
+		parsed := index.Parsed{Generated: true, Words: source.Words(src)}
 		switch language {
 		case "go":
-			entries = golang.InterfaceMethods(src)
+			parsed.Traits = golang.InterfaceMethods(src)
+			// An external test's (package text_test) words are no use from
+			// its package, and a test's or constrained file's not always.
+			parsed.Decls.Package, parsed.Decls.Reach = golang.PackageName(src), golang.Reach(path, src)
 		case "rust":
-			entries = rust.Traits(src)
-		}
-		parsed := index.Parsed{Generated: true, Traits: entries, Words: source.Words(src)}
-		if language == "rust" {
-			// Its pub uses still re-export what they name.
-			parsed.Decls.Reach = rust.Reach(file)
-			// A generated module's names still resolve paths through it.
-			parsed.TopNames, parsed.TopExports, parsed.TopReexports = rust.TopNames(src), rust.TopExports(src), rust.TopReexports(src)
-			parsed.Modules, parsed.InlineModules = rust.DeclaredModules(src), rust.InlineModules(src)
-			_, parsed.TopImports = rust.Imports(src)
+			_ = rust.WithSyntax(file, func(s rust.Syntax) {
+				parsed.Traits = s.Traits()
+				// Its pub uses still re-export what they name.
+				parsed.Decls.Reach = s.Reach()
+				// A generated module's names still resolve paths through it.
+				parsed.TopNames, parsed.TopExports, parsed.TopReexports = s.TopNames(), s.TopExports(), s.TopReexports()
+				parsed.Modules, parsed.InlineModules = s.DeclaredModules(), s.InlineModules()
+				_, parsed.TopImports = s.Imports()
+			})
 		}
 		return parsed, nil
 	}
@@ -1880,6 +2024,7 @@ func parseSource(file syntax.Source) (index.Parsed, error) {
 	switch language {
 	case "go":
 		parsed.Units, parsed.Decls, err = golang.Parse(path, src)
+		parsed.Decls.Reach = golang.Reach(path, src)
 		parsed.Imports = golang.Imports(src)
 	case "typescript":
 		parsed.Units, parsed.Decls, err = typescript.Parse(path, src)
@@ -1907,18 +2052,22 @@ func languageOf(path string) string {
 // parseRust adds what only Rust files have: out-of-line test modules, the
 // traits a file declares, its imports and the paths naming other modules.
 func parseRust(file syntax.Source) (index.Parsed, error) {
-	units, decls, err := rust.ParseAs(file)
-	parsed := index.Parsed{Units: units, Decls: decls, TestModules: rust.TestModules(file.Src),
-		Modules: rust.DeclaredModules(file.Src), InlineModules: rust.InlineModules(file.Src), References: rust.ReferencesAs(file),
-		TopNames: rust.TopNames(file.Src), TopReexports: rust.TopReexports(file.Src), TopExports: rust.TopExports(file.Src)}
-	for _, t := range decls.Traits {
+	var parsed index.Parsed
+	var marked error
+	err := rust.WithSyntax(file, func(s rust.Syntax) {
+		parsed.Units, parsed.Decls, marked = s.Units()
+		parsed.TestModules, parsed.Modules, parsed.InlineModules = s.TestModules(), s.DeclaredModules(), s.InlineModules()
+		parsed.References = s.References()
+		parsed.TopNames, parsed.TopReexports, parsed.TopExports = s.TopNames(), s.TopReexports(), s.TopExports()
+		if !file.Test {
+			// Test files' imports are not dependencies of the code.
+			parsed.Imports, parsed.TopImports = s.Imports()
+		}
+	})
+	for _, t := range parsed.Decls.Traits {
 		parsed.Traits = append(parsed.Traits, t.Name)
 	}
-	if !file.Test {
-		// Test files' imports are not dependencies of the code.
-		parsed.Imports, parsed.TopImports = rust.Imports(file.Src)
-	}
-	return parsed, err
+	return parsed, errors.Join(err, marked)
 }
 
 // extractorVersion identifies the running binary by its content, so any

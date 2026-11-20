@@ -108,6 +108,26 @@ func CompactBlocks(s string) string { return s }
 
 func IsTruthy(s string) bool { return s == "true" }
 
+func Éxport() int { return 1 }
+
+const UnusedMax = 5
+
+const (
+	KindA = iota
+	KindUnused
+	KindC
+)
+
+const (
+	FirstA       = iota
+	MiddleUnused = 100
+	LastC        = iota
+)
+
+const PairUsed, PairUnused = 1, 2
+
+const IotaWord = "iota"
+
 type Store struct{}
 
 func (s *Store) ServeHTTP(w Writer, r *Request) {}
@@ -116,28 +136,20 @@ func (s *Store) ServeHTTP(w Writer, r *Request) {}
 
 import "example.com/app/internal/text"
 
-func main() { println(text.IsTruthy("true")) }
+func main() { println(text.IsTruthy("true"), text.Éxport(), text.KindA, text.KindC, text.FirstA, text.LastC, text.PairUsed) }
 
 func Helper() int { return 1 }
 `,
 		"pkg/api/api.go": "package api\n\nfunc PublicAPI() int { return 1 }\n",
 	})
 
-	_, stdout, stderr := run("check", "--format", "json", root)
-
-	var got []string
-	for _, c := range decode(t, stdout).Candidates {
-		if c.Kind == "dead-code" {
-			got = append(got, filepath.ToSlash(c.Occurrences[0].File)+" "+c.Occurrences[0].Name)
-		}
-	}
-	slices.Sort(got) // ranked by size; compare as a set
 	// Under internal/ and in package main, an exported name nobody mentions
-	// is unused. A method may satisfy an interface (ServeHTTP), main is
-	// called by the runtime, and pkg/ is importable from outside.
-	if want := "cmd/app/main.go Helper\ninternal/text/text.go CompactBlocks"; strings.Join(got, "\n") != want {
-		t.Errorf("dead code:\n%s\nwant:\n%s\nstderr: %s", strings.Join(got, "\n"), want, stderr)
-	}
+	// is unused, a constant's too. A method may satisfy an interface
+	// (ServeHTTP), main is called by the runtime, pkg/ is importable from
+	// outside, and deleting a constant of a group using iota (KindUnused,
+	// MiddleUnused) would shift the values after it, and one declared with
+	// another (PairUnused) shares its line; "iota" in a string is none.
+	wantCandidatesOf(t, root, "dead-code", "cmd/app/main.go Helper", "internal/text/text.go CompactBlocks", "internal/text/text.go IotaWord", "internal/text/text.go UnusedMax")
 }
 
 func TestCheckReportsGoWrappers(t *testing.T) {
@@ -182,5 +194,122 @@ func inNamespace(principal string, tokenID int) bool {
 	}
 	if !found {
 		t.Errorf("want visible reported as a wrapper of inNamespace:\n%s", stdout)
+	}
+}
+
+// An exported name of an internal package (under internal/) that only
+// its own package uses can be unexported. A use from another package
+// keeps it exported, its external tests' (package text_test, generated or
+// not) included; so do a name only some builds use besides (the
+// package's own tests, generated or not, a file with build constraints,
+// after a byte order mark or a block comment too, //go:builder being
+// none, for any architecture Go knows, which a _linux inside its name is
+// not), one only a comment names, a function cgo exports (//export) and a
+// method, which may satisfy an interface. An external test is a _test.go
+// file. An enum-style constant (iota, an implicit value) counts too. pkg/
+// is importable from outside, a package beside an unpublished Rust crate
+// too, and a main package is left out: any may be built as a plugin,
+// whose host looks its exported names up.
+func TestCheckReportsExportedGoNamesOnlyTheirPackageUses(t *testing.T) {
+	root := repo(t, map[string]string{
+		"go.mod": "module example.com/app\n",
+		"internal/text/text.go": `package text
+
+import "C"
+
+const MaxItems = 3
+
+const (
+	KindA = iota
+	KindB
+)
+
+func OnlyInside(s string) string { return s }
+
+func UsedOutside(s string) string { return s }
+
+func TestedOutside(s string) string { return s }
+
+func OnlyInTests(s string) string { return s }
+
+func LinuxOnly(s string) string { return s }
+
+func ArmbeOnly(s string) string { return s }
+
+func BomOnly(s string) string { return s }
+
+func HeaderOnly(s string) string { return s }
+
+func BuilderUse(s string) string { return s }
+
+func BackupOnly(s string) string { return s }
+
+func GeneratedTestUse(s string) string { return s }
+
+func GeneratedTestOnly(s string) string { return s }
+
+// CommentOnly is named here.
+func CommentOnly(s string) string { return s }
+
+//export CgoName
+func CgoName() {}
+
+type Store struct{}
+
+func (s *Store) Reset() {}
+
+func caller(s *Store) string {
+	s.Reset()
+	CgoName()
+	return OnlyInside(s.name()) + UsedOutside("") + TestedOutside("") + GeneratedTestUse("") + string(rune(MaxItems+KindA+KindB))
+}
+`,
+		"internal/text/text_linux.go":         "package text\n\nfunc linux() string { return LinuxOnly(\"\") }\n",
+		"internal/text/text_armbe.go":         "package text\n\nfunc armbe() string { return ArmbeOnly(\"\") }\n",
+		"internal/text/bom.go":                "\ufeff//go:build linux\n\npackage text\n\nfunc bom() string { return BomOnly(\"\") }\n",
+		"internal/text/builder.go":            "//go:builder generated\n\npackage text\n\nfunc builder() string { return BuilderUse(\"\") }\n",
+		"internal/text/header.go":             "/*\npackage fake\n*/\n\n//go:build linux\n\npackage text\n\nfunc header() string { return HeaderOnly(\"\") }\n",
+		"internal/text/cache_linux_backup.go": "package text\n\nfunc backup() string { return BackupOnly(\"\") }\n",
+		"internal/text/gen_test.go":           "// Code generated by mockgen. DO NOT EDIT.\n\npackage\ttext_test; // generated tests\n\nimport \"example.com/app/internal/text\"\n\nvar _ = text.GeneratedTestUse(\"\")\n",
+		"internal/text/gen_internal_test.go":  "// Code generated by mockgen. DO NOT EDIT.\n\npackage text\n\nvar _ = GeneratedTestOnly(\"\")\n",
+		"internal/text/text_internal_test.go": "package text\n\nimport \"testing\"\n\nfunc TestOnly(t *testing.T) { OnlyInTests(\"\") }\n",
+		"internal/text/text_test.go":          "package text_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/app/internal/text\"\n)\n\nfunc TestOutside(t *testing.T) { text.TestedOutside(\"\") }\n",
+		"cmd/app/main.go": `package main
+
+import "example.com/app/internal/text"
+
+func main() { println(text.UsedOutside(""), Helper()) }
+
+func Helper() int { return 1 }
+`,
+		"internal/odd/odd.go":  "package odd_test\n\nfunc OddOnly() int { return 1 }\n",
+		"internal/odd/use.go":  "package odd_test\n\nvar _ = OddOnly()\n",
+		"svc/Cargo.toml":       "[package]\nname = \"svc\"\npublish = false\n",
+		"svc/src/lib.rs":       "pub fn rust_fn() {}\n",
+		"svc/z.go":             "package svc\n\nfunc Shared() int { return shared() }\n\nfunc shared() int { return Shared() }\n",
+		"cmd/plugin/plugin.go": "package main\n\nfunc Symbol() int { return helper() }\n\nfunc helper() int { return Symbol() }\n",
+		"cmd/tool/a_test.go":   "package main_test\n",
+		"cmd/tool/main.go":     "package main\n\nfunc main() { println(ToolHelper()) }\n\nfunc ToolHelper() int { return 1 }\n",
+		"pkg/api/api.go":       "package api\n\nfunc PublicAPI() int { return publicHelper() }\n\nfunc publicHelper() int { return PublicAPI() }\n",
+	})
+
+	wantCandidatesOf(t, root, "too-public", "internal/odd/odd.go OddOnly", "internal/text/text.go BackupOnly", "internal/text/text.go BuilderUse", "internal/text/text.go KindA", "internal/text/text.go KindB", "internal/text/text.go MaxItems", "internal/text/text.go OnlyInside")
+}
+
+// wantCandidatesOf runs check on root and fails the test unless the
+// candidates of one kind are want, each "file name" of its first
+// occurrence, compared as a set: candidates are ranked by size.
+func wantCandidatesOf(t *testing.T, root, kind string, want ...string) {
+	t.Helper()
+	_, stdout, stderr := run("check", "--format", "json", root)
+	var got []string
+	for _, c := range decode(t, stdout).Candidates {
+		if c.Kind == kind {
+			got = append(got, filepath.ToSlash(c.Occurrences[0].File)+" "+c.Occurrences[0].Name)
+		}
+	}
+	slices.Sort(got)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("%s:\n%s\nwant:\n%s\nstderr: %s", kind, strings.Join(got, "\n"), strings.Join(want, "\n"), stderr)
 	}
 }

@@ -309,11 +309,14 @@ type Decls struct {
 	// TypeScript class's, interface's or object type's fields, written as
 	// Call.Type; fields of other types (slices, maps) are left out.
 	FieldTypes []FieldType
-	Reach      Reach // Rust only
+	Reach      Reach // Rust, Go and TypeScript
 }
 
-// Reach is how far a Rust file's words reach beyond the code every build
-// of its library compiles.
+// Reach is how far a file's words reach beyond the code every build of
+// its library compiles. Go sets Optional (its comments' words) or
+// AllOptional (a test file, or one with build constraints). TypeScript
+// sets Optional only: the words of its comments, strings, export clauses
+// and signature names, which use no name.
 type Reach struct {
 	// Exported counts the words of the code that code outside the crate
 	// compiles or reaches through the file: its doc tests, its
@@ -335,6 +338,23 @@ type Reach struct {
 	// #[cfg] or a #[cfg_attr(..., path = ...)], as index.File.Modules
 	// names them: their files are compiled in some builds only.
 	CfgModules []string
+	// Globs are the paths of the modules the file's plain pub uses
+	// re-export whole (shapes for pub use shapes::*, crate::shapes for pub
+	// use crate::{shapes::*}), read from the file's own module: an
+	// imported name as the path it imports, and one an inline module
+	// declares from the file's module (self::facade::shapes). Other
+	// crates reach their items through the file's module.
+	Globs []string
+	// NestedModules are the modules the file declares out of line inside
+	// its inline modules, by their path from the file's module
+	// (mod holder { mod held; } gives holder::held), but those under a
+	// #[cfg] or a #[path], whose files other rules place.
+	NestedModules []string
+	// PathModules are the modules the file declares out of line in a
+	// file a #[path] attribute names, each name with those files (one per
+	// #[cfg]-gated declaration), as index.File.Modules names them (wire.rs
+	// for #[path = "wire.rs"] mod wired;).
+	PathModules map[string][]string
 }
 
 // FieldType is the type of one struct field: Server.store is a
@@ -391,11 +411,16 @@ type Impl struct {
 // function or impl block.
 type Const struct {
 	File, Name string
+	// Module is the inline module the constant is declared in, as
+	// Unit.Module (Rust only).
+	Module string
 	// Value is the initialiser as written: a string literal exactly, any
-	// other value without whitespace.
+	// other value without whitespace; none for one with nothing to compare
+	// (Go's iota and implicit values).
 	Value string
-	Line  int
-	Nodes int
+	// Line and EndLine are the first and last lines of the declaration.
+	Line, EndLine int
+	Nodes         int
 	// Literal is true when the value is one string literal; Value then
 	// holds it with its quotes, as code writes it inline.
 	Literal bool
@@ -407,6 +432,11 @@ type Const struct {
 	// read it (#[no_mangle]). Rust only.
 	Public, External bool
 	Test             bool
+	// Inseparable is true when the constant's lines cannot be deleted
+	// alone: its declaration gives values by position (Go's iota and
+	// implicit values), so deleting it would change the others', or it
+	// declares others too (const a, b = 1, 2).
+	Inseparable bool
 	// Ignored is true when a ddslop:ignore comment marks the constant.
 	Ignored bool
 }

@@ -14,11 +14,7 @@ import (
 
 // Reach is unit.Reach of a file the parser does not analyse, such as a
 // generated one.
-func Reach(file syntax.Source) unit.Reach {
-	var reach unit.Reach
-	_ = syntax.Parse(language, file.Src, func(root *sitter.Node) { reach = reachOf(root, file) })
-	return reach
-}
+func (s Syntax) Reach() unit.Reach { return reachOf(s.root, s.file) }
 
 // reachOf finds how far a file's words reach (see unit.Reach).
 func reachOf(root *sitter.Node, file syntax.Source) unit.Reach {
@@ -30,20 +26,63 @@ func reachOf(root *sitter.Node, file syntax.Source) unit.Reach {
 	}
 	eachItem(root, file.Src, func(item *sitter.Node, attrs []string) bool {
 		cfg := slices.ContainsFunc(attrs, isCfg)
-		if name := item.ChildByFieldName("name"); (cfg || slices.ContainsFunc(attrs, isCfgPath)) && name != nil && item.Kind() == "mod_item" &&
-			item.ChildByFieldName("body") == nil && item.Parent().Kind() == "source_file" {
+		outOfLine := item.Kind() == "mod_item" && item.ChildByFieldName("body") == nil && item.Parent().Kind() == "source_file"
+		if name := item.ChildByFieldName("name"); (cfg || slices.ContainsFunc(attrs, isCfgPath)) && name != nil && outOfLine {
 			reach.CfgModules = append(reach.CfgModules, moduleEntry(name.Utf8Text(file.Src), attrs))
+		}
+		if name := item.ChildByFieldName("name"); name != nil && outOfLine {
+			if entry := moduleEntry(name.Utf8Text(file.Src), attrs); entry != name.Utf8Text(file.Src) {
+				if reach.PathModules == nil {
+					reach.PathModules = map[string][]string{}
+				}
+				reach.PathModules[name.Utf8Text(file.Src)] = append(reach.PathModules[name.Utf8Text(file.Src)], entry)
+			}
 		}
 		if reach.AllOptional {
 			return false
 		}
+		if name := item.ChildByFieldName("name"); name != nil && item.Kind() == "mod_item" && item.ChildByFieldName("body") == nil &&
+			!cfg && !slices.ContainsFunc(attrs, func(a string) bool { return isCfgPath(a) || attrName(a) == "path" }) {
+			if scope, ok := inlineScope(item, file.Src); ok && len(scope) > 0 {
+				reach.NestedModules = append(reach.NestedModules, strings.Join(append(scope, name.Utf8Text(file.Src)), "::"))
+			}
+		}
 		if cfg || item.Kind() == "function_item" && slices.ContainsFunc(attrs, isTestAttr) {
-			addWords(reach.Optional, item.Utf8Text(file.Src))
+			source.AddWords(reach.Optional, item.Utf8Text(file.Src))
 			return false
 		}
 		return true
 	})
 	return reach
+}
+
+// globs returns the paths of the modules a use declaration re-exports
+// whole, under prefix, the path of the use list it is in: shapes for pub
+// use shapes::*, crate::shapes for pub use crate::{shapes::*}.
+func globs(n *sitter.Node, src []byte, prefix string) []string {
+	join := func(a, b string) string {
+		if a == "" || b == "" {
+			return a + b
+		}
+		return a + "::" + b
+	}
+	switch n.Kind() {
+	case "use_wildcard":
+		path := strings.TrimSuffix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(n.Utf8Text(src)), "*")), "::")
+		return []string{join(prefix, strings.Join(strings.Fields(path), ""))}
+	case "scoped_use_list":
+		if path, list := n.ChildByFieldName("path"), n.ChildByFieldName("list"); list != nil {
+			if path != nil {
+				prefix = join(prefix, strings.Join(strings.Fields(path.Utf8Text(src)), ""))
+			}
+			return globs(list, src, prefix)
+		}
+	}
+	var out []string
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		out = append(out, globs(n.NamedChild(i), src, prefix)...)
+	}
+	return out
 }
 
 // addExported sets reach.Exported, the words of the code that code
@@ -64,16 +103,68 @@ func addExported(root *sitter.Node, src []byte, reach *unit.Reach) {
 			} else if file, ok := docIncludeOf(attr, packageDocInclude); ok {
 				reach.PackageDocFiles = append(reach.PackageDocFiles, file)
 			} else if isDocValue(attr) {
-				addWords(words, attr) // its text may hold a doc test
+				source.AddWords(words, attr) // its text may hold a doc test
 			}
 		}
 		exported := item.Kind() == "macro_definition" && slices.ContainsFunc(attrs, func(a string) bool { return attrName(a) == "macro_export" })
 		if exported || item.Kind() == "use_declaration" && isPublic(item, src) {
-			addWords(words, item.Utf8Text(src))
+			source.AddWords(words, item.Utf8Text(src))
+		}
+		if item.Kind() != "use_declaration" || !isPublic(item, src) {
+			return true
+		}
+		paths := globs(item, src, "")
+		if len(paths) == 0 {
+			return true
+		}
+		if scope, ok := inlineScope(item, src); ok { // walking up parents is costly: only for a glob
+			targets := useTargets(item.Parent(), src) // the declaring module's, for a glob through aliases
+			for _, glob := range paths {
+				for _, path := range ownPaths(glob, nil, func(name string) []string { return targets[name] }) {
+					reach.Globs = append(reach.Globs, fromFileModule(path, scope))
+				}
+			}
 		}
 		return true
 	})
 	reach.Exported = words
+}
+
+// inlineScope returns the inline modules an item is declared in,
+// outermost first; ok is false for an item in a block, such as a
+// function body's, which nothing outside it sees.
+func inlineScope(item *sitter.Node, src []byte) (scope []string, ok bool) {
+	for p := item.Parent(); p != nil && p.Kind() != "source_file"; p = p.Parent() {
+		switch p.Kind() {
+		case "declaration_list":
+		case "mod_item":
+			scope = append([]string{p.ChildByFieldName("name").Utf8Text(src)}, scope...)
+		default:
+			return nil, false
+		}
+	}
+	return scope, true
+}
+
+// fromFileModule returns a use path written in the inline modules scope
+// as one read from the file's own module: shapes::x in mod facade is
+// self::facade::shapes::x, and super::x there self::x. A crate:: path
+// reads the same anywhere.
+func fromFileModule(path string, scope []string) string {
+	segments := strings.Split(path, "::")
+	if len(scope) == 0 || segments[0] == "crate" {
+		return path
+	}
+	if segments[0] == "self" {
+		segments = segments[1:]
+	}
+	for len(segments) > 0 && segments[0] == "super" && len(scope) > 0 {
+		scope, segments = scope[:len(scope)-1], segments[1:]
+	}
+	if len(segments) > 0 && segments[0] == "super" {
+		return strings.Join(segments, "::") // above the file's module
+	}
+	return strings.Join(append(append([]string{"self"}, scope...), segments...), "::")
 }
 
 var (
@@ -124,7 +215,7 @@ func addCommentsAndStrings(words map[string]int, n *sitter.Node, src []byte) {
 		child := n.Child(i)
 		switch child.Kind() {
 		case "line_comment", "block_comment", "string_literal", "raw_string_literal":
-			addWords(words, child.Utf8Text(src))
+			source.AddWords(words, child.Utf8Text(src))
 			continue
 		}
 		addCommentsAndStrings(words, child, src)
@@ -215,16 +306,10 @@ func addCodeBlocks(words map[string]int, lines []string) {
 		case strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~"):
 			fenced = !fenced
 		case fenced:
-			addWords(words, line)
+			source.AddWords(words, line)
 		case trimmed != "" && (strings.HasPrefix(line[indent:], "    ") || strings.HasPrefix(line[indent:], "\t")):
-			addWords(words, line)
+			source.AddWords(words, line)
 		}
-	}
-}
-
-func addWords(words map[string]int, text string) {
-	for w, n := range source.Words([]byte(text)) {
-		words[w] += n
 	}
 }
 

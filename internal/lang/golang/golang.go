@@ -3,6 +3,9 @@ package golang
 
 import (
 	"errors"
+	"go/build/constraint"
+	"go/parser"
+	"go/token"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/heikki-laitala/ddslop/internal/lang/syntax"
 	"github.com/heikki-laitala/ddslop/internal/similarity"
+	"github.com/heikki-laitala/ddslop/internal/source"
 	"github.com/heikki-laitala/ddslop/internal/unit"
 )
 
@@ -667,6 +671,12 @@ func Parse(path string, src []byte) ([]unit.Unit, unit.Decls, error) {
 		}
 		marked = syntax.MarkIgnored(root, src, units, &decls)
 	})
+	linked := linkedNames(src)
+	for i, u := range units {
+		if !u.Dispatched && linked[u.Name] {
+			units[i].External = true // //export, //go:linkname: called from outside the Go source
+		}
+	}
 	return units, decls, errors.Join(err, marked)
 }
 
@@ -724,11 +734,101 @@ func function(n *sitter.Node, path string, src []byte, test bool, packages map[s
 		StringMatches: s.Matches,
 		// Exported names are public; methods may satisfy an interface
 		// without being named; main and init are called by the runtime.
-		Public:     short != "" && short[0] >= 'A' && short[0] <= 'Z',
+		Public:     source.Capitalized(short),
 		Dispatched: owner != "",
 		External:   owner == "" && (short == "main" || short == "init"),
 	}, true
 }
+
+// PackageName returns the name a Go file's package clause gives, or "",
+// read as Go reads it, whatever spaces, semicolon or comment surround it.
+func PackageName(src []byte) string {
+	var name string
+	_ = syntax.Parse(language, src, func(root *sitter.Node) {
+		for i := uint(0); i < root.NamedChildCount(); i++ {
+			if n := root.NamedChild(i); n.Kind() == "package_clause" && n.NamedChildCount() > 0 {
+				name = n.NamedChild(0).Utf8Text(src)
+				return
+			}
+		}
+	})
+	return name
+}
+
+// linkedNames returns the names a file's cgo export comments (//export
+// Name) and linkname directives (//go:linkname name target) give code
+// outside the Go source: a function of one is called by its name.
+func linkedNames(src []byte) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(string(src), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && (fields[0] == "//export" || fields[0] == "//go:linkname") {
+			out[fields[1]] = true
+		}
+	}
+	return out
+}
+
+// Reach returns where a Go file's words reach (see unit.Reach): the words
+// outside the code every build compiles, those of its comments, or all of
+// a test file's or of one with build constraints (see constrained).
+func Reach(path string, src []byte) unit.Reach {
+	if IsTestPath(path) || constrained(path, src) {
+		return unit.Reach{AllOptional: true}
+	}
+	out := map[string]int{}
+	_ = syntax.Parse(language, src, func(root *sitter.Node) {
+		var walk func(n *sitter.Node)
+		walk = func(n *sitter.Node) {
+			if n.Kind() == "comment" {
+				source.AddWords(out, n.Utf8Text(src))
+				return
+			}
+			for i := uint(0); i < n.ChildCount(); i++ {
+				walk(n.Child(i))
+			}
+		}
+		walk(root)
+	})
+	return unit.Reach{Optional: out}
+}
+
+// constrained reports whether some builds leave a Go file out: a build
+// constraint (//go:build, // +build) before its package clause, or an
+// operating system or architecture its name ends in (file_linux.go,
+// file_windows_amd64.go), not one inside it (cache_linux_backup.go).
+func constrained(path string, src []byte) bool {
+	// The Go parser reads the header as the go tool does: a byte order
+	// mark, block comments, the package clause.
+	if f, err := parser.ParseFile(token.NewFileSet(), "", src, parser.PackageClauseOnly|parser.ParseComments); err == nil {
+		for _, group := range f.Comments {
+			if group.Pos() > f.Package {
+				break
+			}
+			for _, c := range group.List {
+				if constraint.IsGoBuild(c.Text) || constraint.IsPlusBuild(c.Text) {
+					return true
+				}
+			}
+		}
+	}
+	// the name's last part only, after _test: x_linux.go, x_linux_amd64.go, x_amd64_test.go
+	parts := strings.Split(strings.TrimSuffix(strings.TrimSuffix(filepath.Base(path), ".go"), "_test"), "_")
+	last := parts[len(parts)-1]
+	return len(parts) > 1 && (goOS[last] || goArch[last])
+}
+
+// goOS and goArch are the operating systems and architectures a Go file
+// name may end in, as the go tool reads it (go/build's known lists).
+var (
+	goOS = map[string]bool{"aix": true, "android": true, "darwin": true, "dragonfly": true, "freebsd": true, "hurd": true,
+		"illumos": true, "ios": true, "js": true, "linux": true, "nacl": true, "netbsd": true, "openbsd": true, "plan9": true,
+		"solaris": true, "wasip1": true, "windows": true, "zos": true}
+	goArch = map[string]bool{"386": true, "amd64": true, "amd64p32": true, "arm": true, "armbe": true, "arm64": true, "arm64be": true,
+		"loong64": true, "mips": true, "mipsle": true, "mips64": true, "mips64le": true, "mips64p32": true,
+		"mips64p32le": true, "ppc": true, "ppc64": true, "ppc64le": true, "riscv": true, "riscv64": true, "s390": true,
+		"s390x": true, "sparc": true, "sparc64": true, "wasm": true}
+)
 
 // fieldNodes returns n's named children under a field name, in order: a
 // const spec or struct field can declare several names. The commas between
@@ -743,37 +843,60 @@ func fieldNodes(n *sitter.Node, field string) []*sitter.Node {
 	return out
 }
 
-// constants returns a const declaration's constants with written values,
-// each name paired with its value by position; iota and implicit values
-// have nothing to compare.
+// constants returns a const declaration's constants, each name paired
+// with its value by position. An iota or implicit value has nothing to
+// compare: its constant has no Value. A constant is Inseparable when its
+// lines cannot go alone: its group gives values by position (an iota, or
+// an implicit value, anywhere in it), or its spec names others too
+// (const a, b = 1, 2).
 func constants(n *sitter.Node, path string, src []byte, test bool) []unit.Const {
 	var out []unit.Const
+	positional := false
 	for i := uint(0); i < n.NamedChildCount(); i++ {
 		spec := n.NamedChild(i)
-		values := spec.ChildByFieldName("value")
-		if spec.Kind() != "const_spec" || values == nil {
+		if spec.Kind() != "const_spec" {
 			continue
 		}
-		for j, name := range fieldNodes(spec, "name") {
-			if j >= int(values.NamedChildCount()) { //nolint:gosec // a child count fits in int
-				break
+		values := spec.ChildByFieldName("value")
+		names := fieldNodes(spec, "name")
+		lines := spec // a lone spec's are its declaration's (const\n\tX = 1, const (\n\tX = 1\n))
+		if syntax.CountKind(n, "const_spec") == 1 {
+			lines = n
+		}
+		for j, name := range names {
+			c := unit.Const{File: path, Name: name.Utf8Text(src), Line: syntax.Line(lines.StartPosition()), EndLine: syntax.Line(lines.EndPosition()),
+				Nodes: syntax.CountNodes(name), Public: source.Capitalized(name.Utf8Text(src)), Test: test, Inseparable: len(names) > 1}
+			if values == nil || j >= int(values.NamedChildCount()) { //nolint:gosec // a child count fits in int
+				positional = true // an implicit value repeats the one before
+			} else if v := values.NamedChild(uint(j)); containsKind(v, "iota") {
+				positional = true
+			} else {
+				c.Literal = v.Kind() == "interpreted_string_literal" || v.Kind() == "raw_string_literal"
+				c.Value, c.Nodes = v.Utf8Text(src), syntax.CountNodes(v)
+				if !c.Literal {
+					c.Value = syntax.Compact(c.Value)
+				}
 			}
-			v := values.NamedChild(uint(j))
-			if v.Kind() == "iota" {
-				continue
-			}
-			literal := v.Kind() == "interpreted_string_literal" || v.Kind() == "raw_string_literal"
-			text := v.Utf8Text(src)
-			if !literal {
-				text = syntax.Compact(text)
-			}
-			out = append(out, unit.Const{
-				File: path, Name: name.Utf8Text(src), Value: text, Line: syntax.Line(spec.StartPosition()),
-				Nodes: syntax.CountNodes(v), Literal: literal, Test: test,
-			})
+			out = append(out, c)
 		}
 	}
+	for i := range out {
+		out[i].Inseparable = out[i].Inseparable || positional
+	}
 	return out
+}
+
+// containsKind reports whether n or a node inside it is of a kind.
+func containsKind(n *sitter.Node, kind string) bool {
+	if n.Kind() == kind {
+		return true
+	}
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		if containsKind(n.NamedChild(i), kind) {
+			return true
+		}
+	}
+	return false
 }
 
 // structs returns a type declaration's struct types. An embedded field is
@@ -1087,13 +1210,22 @@ func IsTestPath(path string) bool {
 // Internal reports whether a Go package can only be used by the analysed
 // code: it sits under an internal directory, which the go tool forbids
 // importing from outside its parent, or it is package main, which nothing
-// imports.
-func Internal(path, pkg string) bool {
+// imports, and executable, declaring func main. A main package without
+// it is a plugin's (go build -buildmode=plugin), whose host looks its
+// exported names up.
+func Internal(path, pkg string, executable bool) bool {
 	if pkg == "main" {
-		return true
+		return executable
 	}
 	parts := strings.Split(filepath.ToSlash(filepath.Dir(path)), "/")
 	return slices.Contains(parts, "internal")
+}
+
+// ExternalTest reports whether a Go file is an external test, a
+// _test.go file of package name_test, which is no part of its directory's
+// package. A plain file's package name may end in _test too.
+func ExternalTest(path, pkg string) bool {
+	return strings.HasSuffix(path, "_test.go") && strings.HasSuffix(pkg, "_test")
 }
 
 // InterfaceMethods returns the names of the methods the file's interfaces

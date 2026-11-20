@@ -162,3 +162,263 @@ func TestCheckReportsRustItemsOnlyTheirLibraryModulesUse(t *testing.T) {
 		"rust too-public [named/src/parts.rs named_inner]",
 	})
 }
+
+// A glob re-export (pub use module::*) exposes the module's items to
+// other crates, whether the module is a file, an inline module (its
+// constants too) or a file a #[path] attribute names under another name,
+// and with it the modules it declares and those inside them, by a longer
+// path too (pub use shapes::inner::*), from another module too
+// (crate::, super::, or a name imported for one) or an inline module, and
+// a file two #[path]s declare under either name, with the modules inside
+// it, each file #[cfg]-gated #[path]s give one name, and a path through
+// the crate's own alias (extern crate self as mycrate), and from a module a
+// #[path] file declares, whose files sit beside it as a mod.rs's do, or one
+// declared out of line inside an inline module (mod holder { mod held; });
+// a pub(crate) glob exposes nothing,
+// and nor does another crate's module of a local module's name.
+func TestCheckLeavesRustItemsAGlobReexportsPublic(t *testing.T) {
+	root := repo(t, map[string]string{
+		"app/Cargo.toml": "[package]\nname = \"app\"\npublish = false\n",
+		"app/src/lib.rs": `mod shapes_file;
+pub use shapes_file::*;
+
+mod inline_shapes {
+    pub fn inline_globbed() {}
+
+    pub const INLINE_LIMIT: u32 = 3;
+}
+pub use inline_shapes::*;
+
+#[path = "wire.rs"]
+mod wired;
+pub use wired::*;
+
+mod private_glob;
+pub(crate) use private_glob::*;
+
+mod same_name;
+pub use other_crate::same_name::*;
+
+mod deep_shapes {
+    pub mod deep_nested {
+        pub fn deep_inline() {}
+    }
+}
+pub use deep_shapes::*;
+
+mod path_shapes {
+    pub mod inner {
+        pub fn path_globbed() {}
+    }
+}
+pub use path_shapes::inner::*;
+
+pub mod scoped_facade {
+    mod scoped_shapes {
+        pub fn scoped_fn() {}
+    }
+    pub use scoped_shapes::*;
+    pub use super::up_inline::*;
+    use super::alias_inline as inline_alias;
+    pub use inline_alias::*;
+    #[cfg(unix)]
+    use super::unix_shapes as platform;
+    #[cfg(not(unix))]
+    use super::other_shapes as platform;
+    pub use platform::*;
+    use super::self_shapes::{self as self_alias};
+    pub use self_alias::*;
+
+    pub fn call() {
+        scoped_fn();
+        up_inline_fn();
+        alias_inline_fn();
+        unix_fn();
+        other_fn();
+        self_fn();
+        shared_fn();
+        nested_shared_fn();
+        imp_unix_fn();
+        imp_other_fn();
+        self_crate_fn();
+        placed_fn();
+        held_fn();
+    }
+}
+mod up_inline;
+mod alias_inline;
+mod unix_shapes;
+mod other_shapes;
+mod self_shapes;
+
+#[path = "shared.rs"]
+mod a_private_mod;
+#[path = "shared.rs"]
+pub mod public_mod;
+pub use public_mod::*;
+
+#[cfg(unix)]
+#[path = "imp_unix.rs"]
+mod imp;
+#[cfg(not(unix))]
+#[path = "imp_other.rs"]
+mod imp;
+pub use imp::*;
+
+#[path = "placed/lib_placed.rs"]
+mod placed;
+mod placed_shapes;
+pub use placed::child::*;
+
+mod holder {
+    pub(crate) mod held;
+}
+mod held_target;
+pub use holder::held::*;
+
+extern crate self as mycrate;
+mod self_crate_shapes;
+pub use mycrate::self_crate_shapes::*;
+
+pub mod facade;
+mod far_shapes;
+mod up_shapes;
+mod alias_shapes;
+
+pub fn api() {
+    file_globbed();
+    inline_globbed();
+    wired_fn();
+    crate_globbed();
+    nested_fn();
+    local_same_name();
+    deep_nested::deep_inline();
+    path_globbed();
+    far_fn();
+    up_fn();
+    alias_fn();
+    let _ = INLINE_LIMIT;
+}
+`,
+		"app/src/shapes_file.rs":          "pub mod nested;\n\npub fn file_globbed() {}\n",
+		"app/src/shapes_file/nested.rs":   "pub fn nested_fn() {}\n",
+		"app/src/same_name.rs":            "pub fn local_same_name() {}\n",
+		"app/src/wire.rs":                 "pub fn wired_fn() {}\n",
+		"app/src/private_glob.rs":         "pub fn crate_globbed() {}\n",
+		"app/src/facade.rs":               "use crate::alias_shapes as aliased;\n\npub use crate::far_shapes::*;\npub use super::up_shapes::*;\npub use aliased::*;\n",
+		"app/src/unix_shapes.rs":          "pub fn unix_fn() {}\n",
+		"app/src/other_shapes.rs":         "pub fn other_fn() {}\n",
+		"app/src/self_shapes.rs":          "pub fn self_fn() {}\n",
+		"app/src/shared.rs":               "pub mod nested_shared;\n\npub fn shared_fn() {}\n",
+		"app/src/shared/nested_shared.rs": "pub fn nested_shared_fn() {}\n",
+		"app/src/imp_unix.rs":             "pub fn imp_unix_fn() {}\n",
+		"app/src/imp_other.rs":            "pub fn imp_other_fn() {}\n",
+		"app/src/placed/lib_placed.rs":    "pub(crate) mod child;\n",
+		"app/src/placed/child.rs":         "pub use crate::placed_shapes::*;\n",
+		"app/src/placed_shapes.rs":        "pub fn placed_fn() {}\n",
+		"app/src/holder/held.rs":          "pub use crate::held_target::*;\n",
+		"app/src/held_target.rs":          "pub fn held_fn() {}\n",
+		"app/src/self_crate_shapes.rs":    "pub fn self_crate_fn() {}\n",
+		"app/src/alias_inline.rs":         "pub fn alias_inline_fn() {}\n",
+		"app/src/up_inline.rs":            "pub fn up_inline_fn() {}\n",
+		"app/src/far_shapes.rs":           "pub fn far_fn() {}\n",
+		"app/src/up_shapes.rs":            "pub fn up_fn() {}\n",
+		"app/src/alias_shapes.rs":         "pub fn alias_fn() {}\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+
+	testutil.Lines(t, "too public", candidateLines(decode(t, stdout), "too-public"), []string{
+		"rust too-public [app/src/private_glob.rs crate_globbed]",
+		"rust too-public [app/src/same_name.rs local_same_name]",
+	})
+}
+
+// An exported function or constant of a private TypeScript package that
+// only its own file uses needs no export. A use in another file, a test,
+// a whole import (import * as) or a framework config keeps it exported;
+// so does a default export, a framework export (a route option in an
+// export clause too) and a package that is not private. A comment, a
+// string, an export clause and the declaration are no use, so a name an
+// export clause exports is reported too, unless the clause renames it.
+// Neither is an overload or a method signature; a class method is called
+// through its class.
+func TestCheckReportsTypeScriptExportsOnlyTheirFileUses(t *testing.T) {
+	root := repo(t, map[string]string{
+		"package.json": `{"name": "app", "private": true}`,
+		"src/util.ts": `export function helper() {}
+
+export const LIMIT = 3;
+
+export function shared() {}
+
+export function tested() {}
+
+export function commented() {}
+
+export function quoted() {}
+
+export function clause() {}
+
+export function listed() {}
+
+function viaClause() {}
+
+function renamed() {}
+
+export function overloaded(a: string): void;
+export function overloaded(a: unknown) {}
+
+interface Probe {
+  signed(): void;
+}
+
+export function signed() {}
+
+export default function main() {
+  helper();
+  shared();
+  tested();
+  listed();
+  viaClause();
+  renamed();
+  return LIMIT;
+}
+
+export class Store {
+  reset() {}
+  run() {
+    this.reset();
+  }
+}
+
+// commented() is no use.
+const text = "quoted";
+
+export { clause, /* viaClause */ viaClause, renamed as alias };
+`,
+		"src/app.ts":        "import { alias, shared } from \"./util\";\n\nshared();\nalias();\n",
+		"src/util.test.ts":  "import { tested } from \"./util\";\n\ntested();\n",
+		"src/whole.ts":      "export function viaWhole() {}\n\nviaWhole();\n",
+		"src/reader.ts":     "import * as whole from \"./whole\";\n\nconsole.log(whole);\n",
+		"src/routes.ts":     "export function routed() {}\n\nrouted();\n",
+		"serverless.yml":    "functions:\n  routed: src/routes.routed\n",
+		"app/page.tsx":      "const runtime = \"edge\";\n\nconsole.log(runtime);\n\nexport { runtime };\n",
+		"app/b/page.tsx":    "const runtime = \"edge\";\n\nconsole.log(runtime);\n\nexport { runtime };\n",
+		"src/limits.ts":     "const MAX = 1;\n\nconsole.log(MAX);\n\nexport default MAX;\n",
+		"src/listed.ts":     "export { listed } from \"./util\";\n",
+		"open/package.json": `{"name": "open"}`,
+		"open/api.ts":       "export function api() {}\n\napi();\n",
+	})
+
+	_, stdout, _ := run("check", "--format", "json", root)
+	r := decode(t, stdout)
+
+	testutil.Lines(t, "too public", candidateLines(r, "too-public"), []string{
+		"typescript too-public [src/util.ts helper]",
+		"typescript too-public [src/util.ts viaClause]",
+		"typescript too-public [src/util.ts LIMIT]",
+	})
+	// A route option is the route's config, in an export clause too.
+	testutil.Lines(t, "duplicate constants", candidateLines(r, "duplicate-constant"), nil)
+}

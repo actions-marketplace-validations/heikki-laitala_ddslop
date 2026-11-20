@@ -11,10 +11,11 @@ it writes the next copy.**
 > `.cts`) it finds exact, renamed and near-miss copies, copied blocks,
 > types and constants declared again, wrappers that only pass their
 > parameters on, parameters passed together, strings switched on in
-> many functions, unused exports of private packages and
+> many functions, unused exports of private packages, exports only their
+> own file uses, directories depending on each other in a loop and
 > single-implementation interfaces, and `ddslop map` describes its
-> layers and shared helpers; feature flows and
-> idioms are in progress. Files in other languages are not analysed.
+> layers and shared helpers; feature flows and idioms are in progress.
+> Files in other languages are not analysed.
 
 Coding agents regenerate rather than reuse. Each session that cannot see
 the helper written in the last one writes it again, a little differently:
@@ -29,22 +30,26 @@ ddslop finds that slop and turns it into refactoring candidates written
 for the agent: exact file paths and line ranges, what differs between the
 copies, which differences become parameters, and the action to take.
 **No LLM, no embeddings, no API keys, no network calls.** It parses the
-code with tree-sitter, keeps an index on disk, and runs locally in about
-a second.
+code with tree-sitter, keeps an index on disk, and runs locally in
+seconds.
 
-**Measured on a 733k-line Rust workspace** (cold run 9.7 s, warm run 1.5 s
-on 12 cores), ddslop reported 713 candidates:
+**Measured on a 765k-line Rust workspace** (cold run 30.5 s, warm run
+3.1 s on 12 cores), ddslop reported 857 candidates:
 
 | What it found | Count | Example |
 | --- | ---: | --- |
-| Functions copied exactly or with renames | 226 | the same row loader in two services |
-| Near-miss families (copies that drifted) | 189 | eight handlers with one statement more or less each |
-| Blocks copied inside larger functions | 131 | a 46-node connection guard pasted into 27 methods |
-| Features running the same pipeline | 8 | endpoints repeating decode → authorise → store → respond step by step |
-| Structs with the same fields | 31 | one config type declared again in a second service |
-| Constants declared twice or written inline | 104 | a field name written out 25 times next to its constant |
-| Public functions nothing uses | 6 | helpers no file mentions anywhere else, checked with grep |
-| Wrappers that only forward their arguments | 15 | `find_user(id)` whose whole body is `load_user(id)` |
+| Functions copied exactly or with renames | 301 | the same row loader in two services |
+| Near-miss families (copies that drifted) | 177 | eight handlers with one statement more or less each |
+| Blocks copied inside larger functions | 97 | a connection guard pasted into dozens of methods |
+| Features running the same pipeline | 11 | endpoints repeating decode → authorise → store → respond step by step |
+| Structs with the same fields | 51 | one config type declared again in a second service |
+| Constants declared twice or written inline | 60 | a field name written out next to its constant |
+| Code straying from the codebase's conventions | 66 | one job done differently from the rest of the codebase |
+| Parameter groups, string switches and shared preambles | 27 | the same three parameters passed through four functions |
+| Module dependency cycles | 9 | two modules of a crate calling each other |
+| Public items only their own crate uses | 33 | an earlier version had 749; made `pub(crate)`, all of them still built |
+| Public functions and constants nothing uses | 6 | helpers no file mentions anywhere else, checked with grep |
+| Wrappers that only forward their arguments | 16 | `find_user(id)` whose whole body is `load_user(id)` |
 | Traits with a single implementation | 3 | a store trait implemented by one session type, no test double |
 
 Finding copies is half the job; the other half is not writing them.
@@ -94,6 +99,10 @@ replacing the binary, and is the only command that uses the network.
 `--version V` installs a particular release. A build from source is not
 replaced unless you add `--force`.
 
+A repository keeps the skill an earlier ddslop installed until you run
+`ddslop init` in it again. `ddslop check` and `ddslop status` say when it
+is out of date, and which `init` command updates it.
+
 ### Uninstall
 
 Remove ddslop from each repository you set it up in, then delete the
@@ -123,7 +132,7 @@ of candidate and when to leave copies alone.
 repository's health, to track a cleanup over time:
 
 ```text
-Duplication 7.6% (13502 of 177742 lines); 6 unused functions, 15 wrappers, 3 single-implementation traits, 8 parallel flows
+Duplication 4.6% (12481 of 273802 lines); 6 unused functions and constants, 16 wrappers, 3 single-implementation traits, 11 parallel flows
 ```
 
 The JSON `summary.health` has the same numbers. They always describe the
@@ -163,8 +172,8 @@ the check that stops an agent adding the next copy.
 | `convention-drift` | a job done differently from 90%+ of the codebase: one `err.Error() == "..."` among dozens of `errors.Is` | follow the convention |
 | `dependency-cycle` | Rust modules of a crate depending on each other in a loop, through calls or paths naming the other module: a constant, a type, a `use` (Go and Cargo forbid it between packages and crates); TypeScript directories whose files loop, through calls or imports, and a directory its subdirectories import back (`move-shared-down`) | remove one direction of the loop, or move the shared files below the directory |
 | **Code to simplify** | | |
-| `dead-code` | a public function nothing in the repository uses | delete it |
-| `too-public` | a Rust `pub` function or constant only its own crate's library uses | make it `pub(crate)` |
+| `dead-code` | a public function or constant nothing in the repository uses | delete it |
+| `too-public` | a Rust `pub` function or constant only its own crate's library uses, an exported Go function or constant only its own internal package uses, or a TypeScript export only its own file uses | make it `pub(crate)`, unexport it, or remove `export` |
 | `pass-through` | a wrapper that only forwards its parameters | call the target |
 | `single-impl-trait` | a trait or TypeScript interface with one implementation and no test double | drop the trait |
 
@@ -301,7 +310,8 @@ pub struct BillingRefusal { /* ... */ }
 ```
 
 A marker on its own line covers the item below it; after code, it covers
-that line's string literals.
+the item starting on that line (a constant, on any of its lines) and that
+line's string literals.
 
 ## Reference
 
@@ -358,6 +368,7 @@ make build   # bin/ddslop
 make test    # tests with the race detector
 make cover   # tests with an 80% coverage gate
 make lint    # golangci-lint and markdownlint
+make oracle  # too-public and dead-code against rustc, go vet and tsc on generated code
 ```
 
 Contributors and coding agents follow [AGENTS.md](AGENTS.md).

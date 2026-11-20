@@ -303,10 +303,11 @@ generated-file header rule (`// Code generated ... DO NOT EDIT.`) is
 shared. Go's package-level structs and constants feed the same detectors
 as Rust's: a multi-name field (`ID, Name string`) or constant
 (`a, b = "x", "y"`) gives one entry per name, an embedded field is named
-after its type as Go names it, and `iota` or implicit constant values have
-nothing to compare; the package directory plays the crate's part for
-inlined constants. Go calls are recorded too: `f(x)` is a free call, a
-selector on the method's receiver (`s.load(x)`) a call on self, one on an
+after its type as Go names it, and a constant with an `iota` or implicit
+value has none to compare, so it is in no copied group; the package
+directory plays the crate's part for inlined constants. Go calls are
+recorded too: `f(x)` is a free call, a selector on the method's
+receiver (`s.load(x)`) a call on self, one on an
 imported package name (`json.Marshal`, aliases and `/vN` suffixes
 understood) a path call, and any other selector a method call. The call
 graph splits Go names at the dot (`Store.Load`), resolves a package call
@@ -932,7 +933,8 @@ flowchart TB
   from the template.
 - `delete-dead`: a public function nothing uses (see below). Delete it.
 - `restrict-visibility`: a public function or constant only its own
-  library uses (see below). Make it `pub(crate)`.
+  library uses (see below). Make it `pub(crate)`, unexport it in Go, or
+  remove `export` in TypeScript.
 - `extract-pipeline`: produced by the flow layer (see below).
 - `inline-wrapper`: a function that only forwards its parameters; call
   its target directly.
@@ -1052,8 +1054,8 @@ Rust codebase before it was built.
 `internal/simplify` reports code that is not a copy but can be removed or
 flattened, the other half of cleaning up generated code:
 
-- **Dead code** (`dead-code`, `delete-dead`): a public function whose name
-  appears nowhere but in its own declaration. Every identifier-like word of
+- **Dead code** (`dead-code`, `delete-dead`): a public function or
+  constant whose name appears nowhere but in its own declaration. Every identifier-like word of
   every source file is counted, comments, strings, macros, generated and
   test files included, so a name mentioned anywhere (a call, a `use`, a
   `#[serde(default = "f")]`, a doc link) counts as used; this is
@@ -1065,11 +1067,22 @@ flattened, the other half of cleaning up generated code:
   are its API. Trait methods and functions with attributes that may call
   them from outside (`#[no_mangle]`, `#[tokio::main]`, route macros; lint,
   inline, doc, cfg and tracing attributes do not count) are left out. 6
-  candidates, each verified with grep. In Go, public means exported, and
+  candidates, each verified with grep. A constant is judged as a function
+  is: a Rust `pub const` or `pub static` outside an `impl`, an exported Go
+  constant, or an exported TypeScript constant (those of literal values,
+  the only ones recorded) but one a framework reads by name (`metadata`,
+  `prerender`). A constant whose lines cannot be deleted alone is left
+  out (`unit.Const.Inseparable`): one of a Go group giving values by
+  position (`iota`, or an implicit value anywhere in the group), whose
+  deletion would change the others' values, or one declared with others
+  (`const a, b = 1, 2`, `export const a = 1, b = 2`).
+  In Go, public means exported, and
   a package serves only the analysed code when it sits under an
   `internal` directory (which the go tool forbids importing from outside)
-  or is `package main`. Go methods are left out like trait methods, since
-  any method may satisfy an interface without its name being written
+  or is a `package main` declaring `func main` (one without it builds a
+  plugin, whose host looks its exported names up). Go methods are left
+  out like trait methods, since any method may satisfy an interface
+  without its name being written
   (`ServeHTTP`, `Error`); the unit model calls both "via interface". `main`
   and `init` are called by the runtime. On a 100-file Go service, the one
   exported function nobody mentioned was in a generated file, so none.
@@ -1085,7 +1098,12 @@ flattened, the other half of cleaning up generated code:
   outside the library also reaches it from the library's own files:
   through its doc tests and its `#[macro_export]` macros, which other
   crates compile, and through a `pub use`, which re-exports it; their
-  words count as outside, in generated files too. Doc tests are the code
+  words count as outside, in generated files too. A glob (`pub use
+  shapes::*`) re-exports a whole local module, so its items, and those of
+  the modules inside it, stay `pub`; the glob's path is resolved from the
+  module declaring it (`crate::`, `self::`, `super::` or a name it
+  imports); a path into an inline module keeps that module whole, and one
+  that leaves the crate's modules keeps nothing. Doc tests are the code
   blocks, fenced or indented, of `///` and `//!` lines, of `/** */` and
   `/*! */` comments, of `#[doc = "..."]` attributes and of the files a
   `#[doc = include_str!(...)]` attribute includes, such as a README. Of
@@ -1096,13 +1114,62 @@ flattened, the other half of cleaning up generated code:
   otherwise `pub(crate)` would make the compiler report the item unused in
   some builds, as `pub` does not. A declaration is no use either: two
   modules may each declare a constant of the name, or two types a method.
-  A module the walk cannot place, such as one declared in an inline
-  module, counts as outside. Trait methods and functions called from
+  The walk places a `#[path]` file's modules beside it, as a `mod.rs`'s,
+  and a module declared out of line inside inline modules under their
+  names (`mod holder { mod held; }` is `holder/held.rs`); one it cannot
+  place, under a `#[cfg]` or a `#[path]` inside an inline module, counts
+  as outside. Which items re-exports expose is checked against the
+  compiler: an opt-in test (`make oracle-rust`) generates crates whose modules
+  are all `pub(crate)`, with random re-exports (globs, named, aliases,
+  chains, `self::`, `super::`, `crate::`, inline and `#[path]` modules),
+  and fails when too-public reports an item rustc's `unreachable_pub`
+  lint finds reachable. Its first run found both placing gaps above,
+  which ten review rounds had missed. Trait methods and functions called from
   outside the source are left out as for dead code (an impl block's
   attributes count too: `#[wasm_bindgen] impl`), and so are crates without
   a library (a binary's `pub` items are never seen outside it). Associated
-  constants are left out. Rust only, and no types: a type must stay `pub`
-  while a `pub` signature names it.
+  constants are left out. No types: a type must stay `pub` while a `pub`
+  signature names it.
+  In Go, the library is a package under `internal/`, which serves only
+  the analysed code: its directory's files, but not those of its external
+  tests (`package text_test` in a `_test.go` file), a package of their
+  own whose use keeps a name exported. A `package main` is left out,
+  unlike for dead code: any may also be built as a plugin, whose host
+  looks its exported names up. An exported function or constant (an
+  `iota` one too) only its own package names can be unexported. The
+  words of its comments, of its own tests (`_test.go`) and of files with
+  build constraints (`//go:build`, a `_linux` or `_amd64` file name) are
+  optional (`golang.Reach`), so a name only they use besides is not
+  reported, and a declaration is no use, as in Rust. Methods are left
+  out, as they may satisfy an interface, and so are functions code
+  outside the Go source calls by name (a cgo `//export`, a
+  `//go:linkname`). Unexporting is a rename: the lower case name may
+  already be taken (`MaxRetries` beside a `maxRetries` variable), and another is
+  then needed. On a 100-file Go service, 12 candidates; unexporting all
+  of them (one under another name) built, vetted and compiled the tests
+  cleanly. On ddslop itself, 7, which it unexports. The suggestions are
+  checked against the compiler: an opt-in test (`make oracle-go`)
+  generates modules whose internal packages export functions, constants
+  and iota groups used at random (from the package, a constrained file, its
+  own and its external tests, another package, `package main`, a
+  comment), unexports what too-public reports and deletes what dead code
+  reports, and fails unless `go vet` still accepts the module, tests
+  included, for linux, windows and darwin.
+  In TypeScript, the library is one file of a private package (see dead
+  code), and the suggestion is to remove `export`: a module's scope is its
+  file. A file another file imports whole (`import * as`, `import()`) is
+  left out, and so are default and framework exports, as for dead code.
+  The words of an export clause (`export { load }`), of comments and of
+  strings are no use, so a name a clause exports is reported too; remove
+  it from the clause. Neither is the name of an overload or an interface
+  method signature, which declares it. A clause that renames a name
+  (`export { load as fetch }`) exports it under another name, which is
+  left out as a default export is. Class methods are left out: their
+  visibility is the class's. As for Go, an opt-in test (`make oracle-ts`)
+  applies too-public's and dead code's suggestions to generated private
+  packages (exports used from their file, an import, a namespace import, an
+  `export *` barrel, an aliased re-export, a test file or a comment) and
+  fails unless `tsc`, strict and with `noUnusedLocals`, still accepts them.
 - **Pass-through wrappers** (`pass-through`, `inline-wrapper`): a function
   whose body is one call, possibly awaited, passing its parameters on in
   order, as is or borrowed. Constructors (`Self(x)`), delegation to a field
@@ -1256,18 +1323,18 @@ that crosses it.
   `config.rs`'s, and so is `acme::store::endpoint` from the crate's own
   binary or tests, its own name rooting the path as `crate::` does); a
   function the module's own scope imports by name
-  from another crate (`pub use lns_tls::provider`, a crate root's from
+  from another crate (`pub use acme_tls::provider`, a crate root's from
   `lib.rs` before `main.rs` but a root file's own for a call written
   there, `main.rs` or a target's a manifest places,
   a root or item alias the module imports read through its imports)
   is that crate's, in the module the path names
-  (`lns_tls::api::provider`) first, or none for an outside crate's,
+  (`acme_tls::api::provider`) first, or none for an outside crate's,
   and so is one in a module the path goes through that the module
   imports from another crate rather than declares (`pub use
-  lns_tls::inner` in `tls.rs`, called as `crate::tls::inner::provider()`,
-  is `lns_tls::inner::provider`, and `pub use lns_tls as inner` the
+  acme_tls::inner` in `tls.rs`, called as `crate::tls::inner::provider()`,
+  is `acme_tls::inner::provider`, and `pub use acme_tls as inner` the
   crate's root `provider`). A name the module's own scope
-  imports by neither comes from its globs (`pub use lns_tls::*`, read
+  imports by neither comes from its globs (`pub use acme_tls::*`, read
   through its aliases) when all of them leave the crate: the first to
   reach a workspace crate's function, as a named import does, else none
   (`pub use rustls::*`). One re-exported from elsewhere in the crate,
@@ -1276,7 +1343,7 @@ that crosses it.
   the crate's only one of that name. Without the import, a
   `crate::tls::provider()` call reached an unrelated `provider` of the
   caller's crate and reported a false cycle. An inline module's
-  re-export (`mod tls { pub use lns_tls::provider; }`) still falls
+  re-export (`mod tls { pub use acme_tls::provider; }`) still falls
   back: the adapter keeps only each file's own scope's imports. Before, a name several modules
   define (`plan`, `resolve`, `new`) stayed unresolved, or went to the
   caller's own file's: on the 739k-line workspace, naming the module
@@ -2364,7 +2431,8 @@ Every JSON candidate is self-contained:
   analysed lines (of the functions, structs and constants compared), the
   duplicated lines (every copy but one per duplication candidate, each
   line once, without lines only a near-miss member has) and their
-  percentage, and counts of unused functions, wrappers, single-
+  percentage, and counts of unused functions and constants
+  (`unused_functions`, named before constants counted), wrappers, single-
   implementation traits and parallel flows. Health always describes the
   whole analysed code, also in diff mode and with a baseline, so it can be
   tracked over time; it is comparable between runs of one ddslop version,
@@ -2402,7 +2470,7 @@ ddslop check [path]          analyse and report (default command)
 ddslop index [path]          build or refresh .ddslop/index.db
 ddslop init [path]           set ddslop up for coding agents
 ddslop stats [path]          describe the index without updating it
-ddslop status [path]         show what ddslop has installed in a project
+ddslop status [path]         show what ddslop has installed in a project, and what is out of date
 ddslop uninstall [path]      remove the agent integration (--purge: the index too)
 ddslop version               print the version
 ddslop baseline [path]       record current duplication in .ddslop-baseline.json

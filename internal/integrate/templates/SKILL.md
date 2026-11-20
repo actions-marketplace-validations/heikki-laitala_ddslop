@@ -245,16 +245,27 @@ What to do per `kind`:
   in the same crate. Replace the literals with the constant, widening its
   visibility (`pub(crate)`) if needed. Skip a literal that only happens to
   be spelled the same with another meaning.
-- `dead-code` (`delete-dead`): a public function of an unpublished crate
-  (Rust), or an exported function under `internal/` or in `package main`
-  (Go), whose name appears nowhere else in the repository. Delete it, and
-  anything only it used. Keep it if it is meant for code outside the
-  repository.
+- `dead-code` (`delete-dead`): a public function, constant or static of
+  an unpublished crate (Rust), an exported function or constant under
+  `internal/` or in `package main` (Go), or an export of a private
+  package (TypeScript), whose name appears nowhere else in the
+  repository. Delete it, with the doc comments and attributes above its
+  line range, and anything only it used. Keep it if it is meant for code
+  outside the repository.
 - `too-public` (`restrict-visibility`): a `pub` function, constant or
   static of an unpublished crate's library (Rust) that only that library
   uses: no other crate, test, binary, doc test, exported macro or
   `pub use` names it. Make it `pub(crate)`, then run `cargo check`,
   `cargo clippy` and `cargo test --doc`; revert it if any of them fails.
+  In Go, an exported function or constant of a package under `internal/`
+  that only its own package uses: unexport it, under a name the package
+  does not already declare (`MaxRetries` beside a `maxRetries` variable
+  needs another), then run `go build`, `go vet` and `go test`.
+  In TypeScript: an exported function or constant of a private package
+  that only its own file uses. Remove `export` (from its overload
+  signatures too, or its name from the `export { ... }` list), then run
+  the type check (`tsc --noEmit`) and the linter; revert it if either
+  fails.
 - `pass-through` (`inline-wrapper`): the function only passes its
   parameters to the `target`. Call the target directly and delete the
   wrapper, or rename the target if the wrapper's name is better. Keep
