@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -525,4 +527,67 @@ func TestExcludedFilesDoNotUseExports(t *testing.T) {
 	_, stdout, _ := run("check", "--format", "json", root)
 
 	testutil.Lines(t, "unused", candidateLines(decode(t, stdout), "dead-code"), []string{"typescript dead-code [src/main.ts forgotten]"})
+}
+
+// Routes an Express module registers are features: flows lists them, a
+// route reaching its middleware and its handler, named in another file, and check compares
+// inline handlers, which no named function held before.
+func TestTypeScriptRouteHandlersAreFeaturesCheckCompares(t *testing.T) {
+	handler := `router.%s("/%s/:id", async (req, res) => {
+  const id = req.params.id;
+  const row = await db.query.%s.findFirst({ where: (r, { eq }) => eq(r.id, id) });
+  if (!row) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+  const actor = await resolveActor(req, row.hotelId);
+  if (!actor) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  res.json(row);
+});
+`
+	root := repo(t, map[string]string{
+		"package.json": `{"name": "api", "private": true}`,
+		"src/routes.ts": "import { Router } from \"express\";\nimport { listUsers } from \"./users\";\n\nconst router = Router();\n\n" +
+			fmt.Sprintf(handler, "get", "orders", "orders") + "\n" + fmt.Sprintf(handler, "get", "rooms", "rooms") +
+			"\nrouter.get(\"/users\", requireAuth, listUsers);\nrouter.get(\"/me\", requireAuth, (req, res) => {\n  res.json(req.user);\n});\n\n" +
+			"function requireAuth(req, res, next) {\n  next();\n}\n\nexport default router;\n",
+		"src/users.ts":      "export async function listUsers(req, res) {\n  res.json(await loadUsers());\n}\n\nasync function loadUsers() {\n  return [];\n}\n",
+		"src/orders.ts":     "import { Router } from \"express\";\nimport { OrdersController } from \"./controller\";\n\nconst router = Router();\nconst orders = new OrdersController();\n\nrouter.post(\"/orders\", orders.create);\nrouter.post(\"/refunds\", OrdersController.refund);\n",
+		"src/controller.ts": "export class OrdersController {\n  async create(req, res) {\n    res.json(await saveOrder(req.body));\n  }\n\n  static async refund(req, res) {\n    res.json(await refundOrder(req.body));\n  }\n}\n\nasync function saveOrder(body) {\n  return body;\n}\n\nasync function refundOrder(body) {\n  return body;\n}\n",
+	})
+
+	stdout, _ := runCode(t, 0, "flows", "--format", "json", root)
+	wantContains(t, stdout, `"GET /orders/:id"`, `"GET /rooms/:id"`, `"GET /users"`)
+	// a route naming its handler reaches it, and what it calls, in another file
+	var flows struct {
+		Flows []struct {
+			Entry struct {
+				Name string `json:"name"`
+			} `json:"entry"`
+			Steps []struct {
+				Name string `json:"name"`
+			} `json:"steps"`
+		} `json:"flows"`
+	}
+	decodeInto(t, stdout, &flows)
+	want := map[string][]string{"GET /users": {"requireAuth", "listUsers", "loadUsers"}, "GET /me": {"requireAuth"}, "POST /orders": {"OrdersController.create", "saveOrder"},
+		"POST /refunds": {"OrdersController.refund", "refundOrder"}}
+	for _, f := range flows.Flows {
+		var names []string
+		for _, s := range f.Steps {
+			names = append(names, s.Name)
+		}
+		for _, w := range want[f.Entry.Name] {
+			if !slices.Contains(names, w) {
+				t.Errorf("%s reaches %v, want %s", f.Entry.Name, names, w)
+			}
+		}
+	}
+	_, stdout, _ = run("check", "--format", "json", root)
+	testutil.Lines(t, "copies", candidateLines(decode(t, stdout), "renamed-clone"), []string{
+		"typescript renamed-clone [src/routes.ts GET /orders/:id, src/routes.ts GET /rooms/:id]",
+	})
 }

@@ -781,3 +781,185 @@ import /* types */ { type Query } from "../db/query";
 		return fmt.Sprintf("%s %d", im.Module, im.Line)
 	}), []string{"../db/client 1", "../db 4", "./polyfill 5"})
 }
+
+// A function records how it checks and wraps errors: by its class or a
+// stable field (instanceof, err.code, err.name: one form), by its message (compared,
+// searched or matched), and wrapping with { cause } or into the message.
+// An error is a catch clause's parameter, err, error or a name ending in
+// Error or Err; an event's code is no error's, and a constructor not
+// named like an error wraps nothing.
+func TestUnitsRecordTheirErrorForms(t *testing.T) {
+	src := `export async function load(path: string, e: KeyboardEvent) {
+  try {
+    return await read(path);
+  } catch (failure) {
+    if (failure instanceof NotFoundError) return null;
+    if (failure.code === "ENOENT" || failure.name !== "AbortError") return null;
+    if ((failure as NodeJS.ErrnoException).code === "EACCES") return null;
+    if (failure.message === "closed" || failure.message.includes("busy")) return null;
+    if (/timeout/.test(failure.message)) return null;
+    if (e.code === "Enter" || e.key === "x") return null;
+    throw new LoadError("load " + path, { cause: failure });
+  }
+}
+
+export function wrap(err: unknown, fetchError: Error) {
+  if (fetchError instanceof TypeError) throw new Error(` + "`fetch: ${fetchError.message}`" + `);
+  const label = new Label(fetchError.message);
+  throw new HttpError("load: " + String(err));
+}
+
+export function rethrow(err: Error) {
+  reportError("rethrow: " + err);
+  throw Error("rethrow", { cause: err });
+}
+`
+	for name, want := range map[string][]string{
+		"load": {
+			"5 error-checks instanceof/code",
+			"6 error-checks instanceof/code",
+			"6 error-checks instanceof/code",
+			"7 error-checks instanceof/code",
+			"8 error-checks message",
+			"8 error-checks message",
+			"9 error-checks message",
+			"11 error-wrapping cause",
+		},
+		"rethrow": {
+			"23 error-wrapping cause",
+		},
+		"wrap": {
+			"16 error-checks instanceof/code",
+			"16 error-wrapping message",
+			"18 error-wrapping message",
+		},
+	} {
+		got := testutil.Format(unitNamed(t, "src/load.ts", src, name).Forms, func(f unit.Form) string {
+			return fmt.Sprintf("%d %s %s", f.Line, f.Concern, f.Form)
+		})
+		testutil.Lines(t, name+" forms", got, want)
+	}
+}
+
+// A route a module registers (router.get("/path", ...middleware, handler))
+// on a router or server (named like one, or made by Router(), express()
+// and their kin) is a unit named after it, an entry point; so is an HTTP
+// method a Next.js route file exports, under its own name or another
+// (export { handler as POST }, beside other names) or re-exports (export
+// { GET } from "@/auth": a unit calling it), which ALL is not, and
+// nor is a function named like one exported under another name or as
+// the default. A route naming its
+// handler (router.get("/users", listUsers)) is a unit calling it. A call that only
+// looks like one (a path-less key, a non-function last argument, a
+// client's request: $.get) is none, and nor is a route file's helper.
+func TestRouteHandlersAreEntryPoints(t *testing.T) {
+	src := `import { Router } from "express";
+
+const router = Router();
+
+router.get("/account/me", requireAuth, async (req, res) => {
+  const user = await load(req.user.id);
+  res.json(user);
+});
+
+router.post(` + "`/account/logout`" + `, (req, res) => {
+  res.end();
+});
+
+axios.get("/api/x", { timeout: 1 });
+cache.get("key", () => 1);
+$.get("/fragment", (data) => render(data));
+
+const api = express.Router();
+api.delete("/sessions/:id", (req, res) => {
+  res.end();
+});
+
+userRouter.put("/users/:id", (req, res) => {
+  res.end();
+});
+
+router.get("/users", requireAuth, listUsers);
+router.post("/orders", orders.create);
+
+export default router;
+`
+	units, _, err := Parse("src/routes/account.ts", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := testutil.Format(units, func(u unit.Unit) string {
+		return fmt.Sprintf("%s %d-%d entry=%v", u.Name, u.StartLine, u.EndLine, u.Entry)
+	})
+	testutil.Lines(t, "route units", got, []string{
+		"GET /account/me 5-8 entry=true",
+		"POST /account/logout 10-12 entry=true",
+		"DELETE /sessions/:id 19-21 entry=true",
+		"PUT /users/:id 23-25 entry=true",
+		"GET /users 27-27 entry=true",
+		"POST /orders 28-28 entry=true",
+	})
+	// A route naming its handler calls it, so its feature reaches it,
+	// however the module imports it.
+	for _, u := range units[4:] {
+		handler := map[string]string{"GET /users": "listUsers", "POST /orders": "create"}[u.Name]
+		if !slices.ContainsFunc(u.Calls, func(c unit.Call) bool { return c.Name == handler }) {
+			t.Errorf("%s calls %+v, want its handler %s", u.Name, u.Calls, handler)
+		}
+	}
+
+	next := "export async function GET(req: Request) {\n  return Response.json(await list());\n}\n\nexport function ALL() {\n  return 1;\n}\n\n" +
+		"async function handler() {\n  return 1;\n}\n\nfunction PUT() {\n  return 1;\n}\n\nfunction DELETE() {\n  return 1;\n}\n\n" +
+		"export { handler as POST, handler as helper, PUT as update };\nexport default DELETE;\n"
+	reexport := "export { GET, handler as POST, helper } from \"@/auth\";\n"
+	units, _, err = Parse("src/app/api/auth/route.ts", []byte(reexport))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = testutil.Format(units, func(u unit.Unit) string {
+		c := u.Calls[0]
+		return fmt.Sprintf("%s entry=%v calls %s %s", u.Name, u.Entry, c.Qualifier, c.Name)
+	})
+	testutil.Lines(t, "re-exported handlers", got, []string{"GET entry=true calls @/auth GET", "POST entry=true calls @/auth handler"})
+
+	factories := "const handler = NextAuth(options);\nexport { handler as GET };\nexport const POST = withAuth(save);\nconst helper = make();\nexport const PUT = save;\nexport const PATCH = withAuth(orders.update);\n\nfunction save() {\n  return 1;\n}\n"
+	units, _, err = Parse("src/app/api/auth/route.ts", []byte(factories))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = testutil.Format(units, func(u unit.Unit) string {
+		var calls []string
+		for _, c := range u.Calls {
+			calls = append(calls, c.Name)
+		}
+		return fmt.Sprintf("%s entry=%v calls %s", u.Name, u.Entry, strings.Join(calls, " "))
+	})
+	testutil.Lines(t, "handlers a factory makes", got, []string{"save entry=false calls ", "handler entry=true calls NextAuth", "POST entry=true calls save withAuth", "PUT entry=true calls save", "PATCH entry=true calls update withAuth"})
+
+	middleware := "import { Router } from \"express\";\nconst router = Router();\nrouter.get(\"/private\", (req, res, next) => authenticate(req, next), async (req, res) => render(res));\n"
+	units, _, err = Parse("src/routes/private.ts", []byte(middleware))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(units) != 1 || !slices.ContainsFunc(units[0].Calls, func(c unit.Call) bool { return c.Name == "authenticate" }) {
+		t.Errorf("a route with inline middleware = %+v, want one unit calling authenticate", units)
+	}
+
+	defaultNext := "export default function PATCH() {\n  return 1;\n}\n"
+	if units, _, _ := Parse("src/app/api/users/route.ts", []byte(defaultNext)); len(units) != 1 || units[0].Entry {
+		t.Errorf("a default-exported PATCH = %+v, want no entry point: the module exports only default", units)
+	}
+	for file, want := range map[string]string{
+		"src/app/api/users/route.ts": "GET entry=true; ALL entry=false; handler entry=true; PUT entry=false; DELETE entry=false",
+		"src/app/api/users/list.ts":  "GET entry=false; ALL entry=false; handler entry=false; PUT entry=false; DELETE entry=false",
+	} {
+		units, _, err := Parse(file, []byte(next))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := testutil.Format(units, func(u unit.Unit) string { return fmt.Sprintf("%s entry=%v", u.Name, u.Entry) })
+		if strings.Join(got, "; ") != want {
+			t.Errorf("%s: %s, want %s", file, strings.Join(got, "; "), want)
+		}
+	}
+}
